@@ -23,3 +23,19 @@ path = "fuzz_targets/secret_debug_redaction.rs"
 test = false
 doc = false
 bench = false
+
+# 攻击者可控输入面：二维码 / 剪贴板 / 手输链接都进这里。
+[[bin]]
+name = "uri_parse"
+path = "fuzz_targets/uri_parse.rs"
+test = false
+doc = false
+bench = false
+
+# 所有种子的必经之路：位对齐、尾部余数、填充校验。
+[[bin]]
+name = "base32_and_otp"
+path = "fuzz_targets/base32_and_otp.rs"
+test = false
+doc = false
+bench = false

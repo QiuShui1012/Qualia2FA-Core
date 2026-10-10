@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "qualia2fa-core"
 version = "0.1.0"
 edition = "2024"
@@ -11,6 +11,7 @@ description = "Qualia2FA 核心库：TOTP/HOTP 原语、加密保险库与设备
 license = "LGPL-3.0-or-later"
 
 # 真实仓库地址。本仓库预期被 UI 端以 git submodule 引入，
+# `cargo doc` 与未来的 `cargo publish`（当前 `publish = false`）都要用它。
 repository = "https://github.com/QiuShui1012/Qualia2FA-Core"
 readme = "README.md"
 keywords = ["2fa", "totp", "hotp", "otp", "authentication"]
@@ -18,9 +19,11 @@ categories = ["authentication", "cryptography"]
 publish = false
 
 [dependencies]
+form_urlencoded = "1.2"
 # 随机数只走 getrandom（OS CSPRNG），不经任何用户态 PRNG。
 # Android 上该 syscall 需 API 23；aarch64/arm/x86/x86_64 在更低版本有 /dev/urandom 回退。
 getrandom = "0.4.3"
+hmac = "0.13"
 
 # 秘密材料容器（`SecretBox` / `SecretSlice` / `SecretString` / `ExposeSecret`）。
 # 依赖审计（人工逐项核过，cargo-deny 不做依赖必要性判断）：
@@ -32,6 +35,9 @@ getrandom = "0.4.3"
 #     纯逻辑封装（无 unsafe、无 FFI）。库内**仅 src/secret.rs 接触它**，
 #     以便必要时整体替换。详见仓库外的 TODO.md §4.3。
 secrecy = "0.10.3"
+sha1 = "0.11"
+sha2 = "0.11"
+subtle = "2.6"
 
 # 库公共 API 的错误类型一律用 thiserror；`anyhow` 禁止进入库的对外签名。
 thiserror = "2.0.21"
@@ -45,4 +51,3 @@ thiserror = "2.0.21"
 # 基于属性的测试。用于验证「对任意输入都成立」的性质，
 # 与 fuzz（fuzz/ 目录，找 panic 与内存问题）分工不同，两者都要有。
 proptest = "1.12.0"
-

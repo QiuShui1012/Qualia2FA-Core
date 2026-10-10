@@ -29,13 +29,19 @@
 //!
 //! # 现状
 //!
-//! 目前仅有工程骨架（错误类型、秘密类型、版本号）。TOTP / HOTP 计算、密钥与
-//! 保险库（vault）管理、设备配对与同步尚未实现。
+//! 已完成工程地基与 M1 的 Base32 层；HOTP / TOTP 计算、`otpauth://` 解析、
+//! 保险库（vault）管理、设备配对与同步正在推进。
 //!
 //! # 用法
 //!
 //! ```
+//! // 版本号
 //! assert_eq!(qualia2fa_core::VERSION, env!("CARGO_PKG_VERSION"));
+//!
+//! // Base32 解码（RFC 4648），容忍小写、缺失填充与空白
+//! use qualia2fa_core::{base32, ExposeSecret};
+//! let seed = base32::decode("MZXW6YTBOI======").expect("合法 Base32");
+//! assert_eq!(seed.expose_secret(), b"foobar");
 //! ```
 //!
 //! # 许可
@@ -47,8 +53,11 @@
 #![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
 
+pub mod base32;
 mod error;
+pub mod otp;
 mod secret;
+pub mod uri;
 
 pub use error::{Error, Result};
 pub use secret::{

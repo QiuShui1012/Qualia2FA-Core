@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d140ab44d4aa4a7bd9e6ac26868bdc116b279e3b0e9f20229e6290ee6073abfc # shrinks to auth = OtpAuth { uri_type: Hotp, secret: "<redacted>", issuer: None, account: "\u{80}", algorithm: Sha1, digits: Six, period: 1, counter: Some(0) }
