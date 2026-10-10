@@ -1,0 +1,48 @@
+﻿[package]
+name = "qualia2fa-core"
+version = "0.1.0"
+edition = "2024"
+# MSRV 策略：1.89 是「最低支持」的声明，不是开发工具链版本。
+# 开发工具链由 rust-toolchain.toml 固定为 stable（当前 1.99）。
+# 1.89 的下限由后续要引入的 crypto 栈决定（最紧的是 aes 0.9.3）；
+# 本 crate 自身的代码用 1.85 即可编译，故意留出余量以便上游收紧时不被迫跳版。
+rust-version = "1.89"
+description = "Qualia2FA 核心库：TOTP/HOTP 原语、加密保险库与设备同步逻辑"
+license = "LGPL-3.0-or-later"
+
+# 真实仓库地址。本仓库预期被 UI 端以 git submodule 引入，
+repository = "https://github.com/QiuShui1012/Qualia2FA-Core"
+readme = "README.md"
+keywords = ["2fa", "totp", "hotp", "otp", "authentication"]
+categories = ["authentication", "cryptography"]
+publish = false
+
+[dependencies]
+# 随机数只走 getrandom（OS CSPRNG），不经任何用户态 PRNG。
+# Android 上该 syscall 需 API 23；aarch64/arm/x86/x86_64 在更低版本有 /dev/urandom 回退。
+getrandom = "0.4.3"
+
+# 秘密材料容器（`SecretBox` / `SecretSlice` / `SecretString` / `ExposeSecret`）。
+# 依赖审计（人工逐项核过，cargo-deny 不做依赖必要性判断）：
+#   - 唯一必需依赖是 `zeroize ^1.6`，与本 crate 原先所用版本同一 major，
+#     不会产生重复版本（`cargo tree` 实证全树只有一个 zeroize）。
+#   - 可选依赖 `serde ^1` 本 crate 不启用，故不进依赖树。
+#   - 上游 monorepo `iqlusioninc/crates` 活跃（未归档、近期有推送）；
+#     crate 本身自 2024-10 无新版本，属「成熟稳定」而非「废弃」，且实现为
+#     纯逻辑封装（无 unsafe、无 FFI）。库内**仅 src/secret.rs 接触它**，
+#     以便必要时整体替换。详见仓库外的 TODO.md §4.3。
+secrecy = "0.10.3"
+
+# 库公共 API 的错误类型一律用 thiserror；`anyhow` 禁止进入库的对外签名。
+thiserror = "2.0.21"
+
+# 刻意**不**直接依赖 `zeroize`：它已由 `secrecy` 传递引入，且 `secrecy`
+# 自行 `pub use zeroize`，需要用到 `Zeroize` trait 时从 `secrecy::zeroize` 取。
+# 避免直接依赖可防止与 secrecy 的版本要求各自漂移。若将来出现 secrecy 未覆盖
+# 的秘密类型（需自行实现 Drop 擦除），再显式加回并同时开启其 `derive` 特性。
+
+[dev-dependencies]
+# 基于属性的测试。用于验证「对任意输入都成立」的性质，
+# 与 fuzz（fuzz/ 目录，找 panic 与内存问题）分工不同，两者都要有。
+proptest = "1.12.0"
+

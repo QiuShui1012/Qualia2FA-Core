@@ -1,0 +1,97 @@
+# cargo-deny 配置。
+#
+# 本项目的依赖策略依据（见 TODO.md §4.1）：RustSec 库 2026 年新增 334 条公告，
+# 而上游每一次严重问题都是补丁/次版本修掉的。因此「依赖审计」是安全控制，不是杂事。
+#
+# 参考：https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# 按目标平台分别评估依赖，避免把 Linux 专有依赖算到 Windows 构建上。
+targets = [
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "aarch64-linux-android" },
+    { triple = "aarch64-apple-ios" },
+]
+# 开发依赖也要审：它们不进产物，但可能带着漏洞进 CI 环境。
+all-features = true
+
+[advisories]
+# 发现任何未处理的漏洞即失败。
+# 注意：`vulnerability` 是硬失败，不接受「先记账」。
+version = 2
+ignore = [
+    # 如有必须暂时接受的公告，在此列出并**附上理由与到期时间**，例如：
+    # { id = "RUSTSEC-0000-0000", reason = "无可利用路径，等上游 0.3.x 修复（复审：2026-12-31）" },
+]
+
+[licenses]
+version = 2
+# 本项目以 LGPL-3.0-or-later 发布。
+# 允许清单覆盖常见宽松许可证 + 与 LGPL 兼容的 copyleft 许可证。
+# 注意：**不包含** GPL-2.0-only / SSPL / BUSL 等与 LGPL-3.0 不兼容或非自由的许可证。
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "LGPL-3.0-or-later",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",        # Gobley 与 uniffi 均为 MPL-2.0（文件级 copyleft，与 LGPL 兼容）
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+# 遇到清单外的许可证时给出明确失败，而不是静默放过。
+confidence-threshold = 0.9
+
+# 白名单是**预先**为后续要引入的 crypto 栈（rustls/aws-lc-rs/p256 等）放行的，
+# 因此当前必然有一批许可证尚未被任何依赖用到。这不代表配置有问题，
+# 故把「白名单条目未命中」降级为允许，避免每次加依赖前都被噪音淹没。
+unused-allowed-license = "allow"
+
+# 若将来某个依赖的许可证无法被自动识别（例如自带 LICENSE 文件但 SPDX 声明缺失），
+# 在此逐条澄清它**实际**的许可证，而不是把可疑许可证整个加进 allow 清单：
+#
+# [[licenses.clarify]]
+# name = "某个crate"
+# expression = "MIT"
+# license-files = [{ path = "LICENSE", hash = 0x0000_0000 }]
+
+[bans]
+multiple-versions = "warn"
+# 同一依赖出现多个版本时给出警告（crypto crate 尤其重要：
+# 两个版本的 `aes` 可能意味着一个未打补丁）。
+wildcards = "deny"
+# 明确禁止的 crate 及其理由（见 TODO.md §4.2）。
+deny = [
+    # 上游 PQClean 已归档；RUSTSEC-2026-0164 标记为不再维护。
+    { name = "pqcrypto" },
+    { name = "pqcrypto-kyber" },
+    { name = "pqcrypto-dilithium" },
+    # AVX2 后端跳过 Fujisaki–Okamoto 隐式拒绝，破坏 CCA 证明。
+    { name = "pqc_kyber" },
+    { name = "cosmian_kyber" },
+    # 混合 KEM 为 pre-verification 且实现旧草案；10 个月 21 条公告。
+    { name = "libcrux-kem" },
+    { name = "libcrux-aesgcm" },
+    # CPace：Rust 生态无可用实现。
+    { name = "cpace" },
+    { name = "pake-cpace" },
+    # 已并入 `aes`。
+    { name = "aes-soft" },
+    { name = "aesni" },
+]
+
+# 说明：`anyhow` 不在禁令里。它是库 API 风格问题（库公共签名用 thiserror），
+# 由 code review 把关；写进依赖黑名单会波及开发依赖与构建脚本，得不偿失。
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# 允许 git 依赖留空：本项目当前不依赖任何 git 源。
+allow-git = []

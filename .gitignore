@@ -1,0 +1,20 @@
+# Rust 构建产物
+/target
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.iml
+
+# 操作系统
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# 说明：调研报告位于仓库根 (`Core/`) 之外的 `../research/`，按决定不入库。
+# 因为它在仓库目录树之外，git 本就不会跟踪它，无需在此写一条无效规则。
+
+# 本地环境与密钥（严禁提交任何 2FA 密钥材料）
+.env
+*.local.toml
+secrets/

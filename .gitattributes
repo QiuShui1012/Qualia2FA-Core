@@ -1,0 +1,20 @@
+# 统一按 LF 存入库、且在 Windows 上检出时也保持 LF，
+# 避免 LICENSE / COPYING.LESSER 等法律文本与官方原文行尾不一致。
+* text=auto eol=lf
+
+# 二进制文件不做行尾转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.pdf  binary
+*.exe  binary
+*.dll  binary
+*.lib  binary
+
+# Rust 源码：diff 时按 Rust 语法高亮
+*.rs diff=rust

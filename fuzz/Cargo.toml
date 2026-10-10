@@ -1,0 +1,25 @@
+# cargo-fuzz 目标 crate。
+#
+# 注意：本 crate **不是** `../Cargo.toml` 的 workspace 成员，cargo-fuzz 会独立处理它。
+# 因此 `cargo test` / `cargo clippy` 在 Core/ 下不会编译到本目录。
+
+[package]
+name = "qualia2fa-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# fuzz 目标把任意字节喂给库的公共解析入口。
+libfuzzer-sys = "0.4.13"
+qualia2fa-core = { path = ".." }
+
+[[bin]]
+name = "secret_debug_redaction"
+path = "fuzz_targets/secret_debug_redaction.rs"
+test = false
+doc = false
+bench = false

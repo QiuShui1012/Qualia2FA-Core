@@ -1,0 +1,10 @@
+# fuzz 产物不入库
+
+# libFuzzer 语料库与崩溃样本
+corpus/
+artifacts/
+coverage/
+
+# fuzz crate 自身的构建产物与锁文件
+target/
+Cargo.lock
