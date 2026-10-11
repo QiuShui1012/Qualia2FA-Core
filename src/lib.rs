@@ -108,7 +108,7 @@ pub use recovery::{KdfParams, export as export_recovery, import as import_recove
 /// 刻意**不**导出任何「按步骤拆开」的中间类型：调用方要么用 [`SyncSession`]，要么
 /// 自己组合 `sync` 里的零件。前者能保证顺序，后者不能。
 pub use transport::{
-    Recipient, Roster, SyncOutcome, SyncSession, Transport, TransportCapabilities,
+    Recipient, Roster, SharePlan, SyncOutcome, SyncSession, Transport, TransportCapabilities,
 };
 
 pub use secret::{

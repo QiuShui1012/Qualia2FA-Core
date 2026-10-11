@@ -270,6 +270,57 @@ impl fmt::Display for SyncOutcome {
     }
 }
 
+/// 在一条通道上分享当前状态时该走哪条路（D9 的「两种模式」）。
+///
+/// # 为什么需要一个「先问一问」的步骤
+///
+/// 二维码这条路上，「装不装得下」必须在**展示之前**就有答案：用户已经举着手机在扫了，
+/// 这时候才发现装不下，是最坏的时机。而 [`SyncSession::send`] 把「封装」与「发送」
+/// 一步做完，调用方没有机会先看一眼大小——等它报错时，码往往已经显示出来了。
+///
+/// 于是有了这个规划步骤：它做与发送**完全相同**的封装，只把结果分成两条路。
+///
+/// # 「装不下」不是失败，是**另一条路**
+///
+/// 装不下时该做的不是报错收场，而是先发一个**请求**（[`PayloadKind::Request`]，它没有
+/// 记录，因此比任何全量状态都小得多），把大载荷留给一条字节流通道——局域网，或者
+/// 用户改天再同步。把它表达成一个枚举而不是一个错误，是为了让「换条路」在类型上
+/// 就看得出来，而不是靠调用方去分辨错误的种类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharePlan {
+    /// 整份载荷装得下这条通道，直接发。
+    FullPayload {
+        /// 封装后的字节数。
+        len: usize,
+    },
+    /// 装不下：先发一个请求，再把载荷走别处送过去。
+    LinkEstablishment {
+        /// 载荷实际需要的字节数。
+        needed: usize,
+        /// 这条通道能装下的最大字节数。
+        limit: usize,
+    },
+}
+
+impl SharePlan {
+    /// 是否必须先建立一条字节流通道。
+    #[must_use]
+    pub const fn needs_link(self) -> bool {
+        matches!(self, Self::LinkEstablishment { .. })
+    }
+}
+
+impl fmt::Display for SharePlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::FullPayload { len } => write!(f, "整份载荷（{len} 字节）"),
+            Self::LinkEstablishment { needed, limit } => {
+                write!(f, "装不下：需要 {needed} 字节，上限 {limit} 字节")
+            }
+        }
+    }
+}
+
 /// 一次同步会话。
 ///
 /// # 它不持有传输通道
@@ -373,6 +424,41 @@ impl<'a> SyncSession<'a> {
         transport.capabilities().check_fits(sealed.len())?;
         transport.send(to, &sealed)?;
         Ok(payload.sync_id)
+    }
+
+    /// 规划这次分享走哪条路——**在把码显示出来之前**就要知道答案。
+    ///
+    /// # 它不发送任何东西
+    ///
+    /// 只做封装与比较。因此调用方可以在「用户还没确认」的时候先问一句，再决定要不要
+    /// 把码显示出来。
+    ///
+    /// # 它规划的是「把我的全量状态发过去」
+    ///
+    /// 请求（[`PayloadKind::Request`]）没有记录，因此总是很小，不需要规划。真正需要
+    /// 提前知道的是全量状态装不装得下。
+    ///
+    /// # 代价是一次完整的封装
+    ///
+    /// 逐条加密 + 压缩 + 外层 AEAD。M4 的性能实测里那一趟是毫秒级；若调用方随后真的
+    /// 走「全量提供」，它会再封装一次。**刻意不做缓存**：缓存意味着要在会话里保存一份
+    /// 明文状态的副本（或者一份密文与它的参数），而那份副本的失效条件（保险库改了、
+    /// 主密钥换了）比它省下的几毫秒贵得多。
+    ///
+    /// # 错误
+    ///
+    /// 与 [`SyncSession::send`] 的封装那一步完全相同，见 [`Payload::from_vault`] 与
+    /// [`Payload::seal`]。
+    pub fn plan_share(&self, transport: &dyn Transport) -> Result<SharePlan> {
+        let payload = Payload::from_vault(self.master, transport.local_device(), self.vault)?;
+        let sealed = payload.seal(self.master)?;
+        Ok(match transport.capabilities().max_message_len {
+            Some(limit) if sealed.len() > limit => SharePlan::LinkEstablishment {
+                needed: sealed.len(),
+                limit,
+            },
+            _ => SharePlan::FullPayload { len: sealed.len() },
+        })
     }
 
     /// 收一条消息，把里面的记录并进本地保险库。
@@ -1034,6 +1120,111 @@ mod tests {
         assert_eq!(vault_a.len(), 3, "A 应当有三条");
         assert_eq!(vault_b.len(), 3, "B 应当有三条");
         assert_eq!(vault_c.len(), 3, "C 应当有三条");
+    }
+
+    /// **规划与发送必须一致。**
+    ///
+    /// 规划的全部价值就在于「展示之前给出的答案」是对的。若规划说装得下、发送却报
+    /// 「装不下」，用户看到的是一张扫不出任何东西的码；若规划说装不下、发送却成功，
+    /// 我们就把一条本可以走二维码的同步推去了局域网。两条都靠这条测试挡住：
+    /// 判据只能是同一个 [`TransportCapabilities::check_fits`]。
+    #[test]
+    fn planning_and_sending_agree() {
+        let (id_a, master, mut vault_a) = a_device(1);
+        let (id_b, _, _) = a_device(2);
+        vault_a
+            .insert(sample_entry("条目", 1_700_000_000))
+            .expect("随机源可用");
+
+        // 一条宽裕的字节流通道，与一条只装得下 8 字节的「二维码」。
+        let roomy = MemoryTransport::new(id_a, TransportCapabilities::stream(Roster::TwoParty));
+        let tiny = MemoryTransport::new(id_a, TransportCapabilities::qr(1, 8));
+
+        let mut seen = SeenSyncIds::new();
+        let session = SyncSession::open(&master, &mut vault_a, &mut seen);
+
+        // ① 宽裕通道：规划说整份能发。
+        let len = match session.plan_share(&roomy).expect("规划") {
+            SharePlan::FullPayload { len } => len,
+            other => panic!("宽裕通道不该要求建链：{other}"),
+        };
+        assert!(len > 0, "一条条目的载荷不可能是空的");
+        session
+            .send(&roomy, Recipient::One(id_b), PayloadKind::Vault)
+            .expect("规划说装得下，发送就必须成功");
+
+        // ② 极小的通道：规划说装不下，且两个数字都要对得上。
+        let plan = session.plan_share(&tiny).expect("规划");
+        match plan {
+            SharePlan::LinkEstablishment { needed, limit } => {
+                assert_eq!(limit, 8, "上限应当来自通道的能力声明");
+                assert_eq!(
+                    needed, len,
+                    "两次规划给出的载荷大小不一致——那说明封装不是确定性的长度"
+                );
+            }
+            other => panic!("装不下时应当要求建链：{other}"),
+        }
+        let result = session.send(&tiny, Recipient::One(id_b), PayloadKind::Vault);
+        let is_too_large = matches!(result, Err(Error::TransportMessageTooLarge { .. }));
+        assert!(
+            is_too_large,
+            "规划说装不下，发送也必须报「装不下」：{result:?}"
+        );
+    }
+
+    /// 字节流通道没有上限，「建链」这条路对它永远用不上。
+    ///
+    /// 这条性质值得单独钉住：若 [`SharePlan`] 对字节流也报「装不下」，二维码那条路上
+    /// 的引导文案就会在局域网上也出现，把用户推向一个不存在的「另一条路」。
+    #[test]
+    fn a_stream_channel_never_needs_a_link() {
+        let (id_a, master, mut vault_a) = a_device(1);
+        for i in 0..64_u64 {
+            vault_a
+                .insert(sample_entry(&format!("条目 {i}"), 1_700_000_000 + i))
+                .expect("随机源可用");
+        }
+        let transport =
+            MemoryTransport::new(id_a, TransportCapabilities::stream(Roster::MultiParty));
+        assert!(
+            transport.capabilities().max_message_len.is_none(),
+            "字节流通道不该有单条上限"
+        );
+
+        let mut seen = SeenSyncIds::new();
+        let plan = SyncSession::open(&master, &mut vault_a, &mut seen)
+            .plan_share(&transport)
+            .expect("规划");
+        assert!(!plan.needs_link(), "字节流通道不该要求建链：{plan}");
+    }
+
+    /// **「建链」的第一步必须真的走得通。**
+    ///
+    /// 装不下全量状态时，我们告诉用户「先发个请求，数据走别处」。这条测试钉住那句话
+    /// 的前半截：**同一条装不下全量状态的通道，必须装得下请求**。否则引导文案指向的
+    /// 是一条同样走不通的路，而用户会以为是网络问题。
+    #[test]
+    fn a_request_fits_where_the_full_state_does_not() {
+        let (id_a, master, mut vault_a) = a_device(1);
+        let (id_b, _, _) = a_device(2);
+        for i in 0..8_u64 {
+            vault_a
+                .insert(sample_entry(&format!("条目 {i}"), 1_700_000_000 + i))
+                .expect("随机源可用");
+        }
+
+        // 一条小得多的「二维码」：全量状态装不下，请求装得下。
+        let transport = MemoryTransport::new(id_a, TransportCapabilities::qr(10, 200));
+        let mut seen = SeenSyncIds::new();
+        let session = SyncSession::open(&master, &mut vault_a, &mut seen);
+
+        let plan = session.plan_share(&transport).expect("规划");
+        assert!(plan.needs_link(), "全量状态应当装不下：{plan}");
+
+        session
+            .send(&transport, Recipient::One(id_b), PayloadKind::Request)
+            .expect("请求必须装得下——否则「建链」这条路的第一步就不成立");
     }
 
     /// 冲突会被如实报出来，而不是被静默选边。
