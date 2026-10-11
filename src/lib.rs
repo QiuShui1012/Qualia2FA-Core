@@ -57,6 +57,7 @@ pub mod base32;
 pub mod device;
 mod error;
 pub mod otp;
+pub mod pairing;
 mod secret;
 pub mod uri;
 pub mod vault;
@@ -69,6 +70,13 @@ pub use error::{Error, Result};
 /// 上、写进日志、在设备之间传播，所以在这里与秘密类型分开导出，让「哪些类型
 /// 可以随便打印」在导入列表里就看得出来。
 pub use device::{DeviceId, DevicePublicKey, DeviceSignature};
+
+/// 配对协议的公开类型。
+///
+/// 只导出「两端各自需要的东西」：二维码载荷、两个方向的会话、以及结果。内部的
+/// 会话密钥、确认标签计算等一律不导出——它们是协议不变量的一部分，不该被上层
+/// 组合出别的用法。
+pub use pairing::{Adoption, JoinerSession, NonceLog, PendingSession, QrPayload};
 
 pub use secret::{
     ExposeSecret, ExposeSecretMut, SecretBox, SecretBytes, SecretSlice, SecretString,

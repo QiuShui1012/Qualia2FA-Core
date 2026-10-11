@@ -66,9 +66,15 @@ hmac = "0.13"
 # `elliptic-curve/pem`，而我们的线格式只有 SEC1 未压缩点与原始 r||s 两种，
 # 都不需要 PEM。
 #
+# `ecdh` 用于 M3 的配对密钥协商（见 `src/pairing.rs`）。**刻意复用 P-256 而不是
+# 引入 X25519**：P-256 的余因子是 1，不存在小阶点，因此 ECDH 结果不像 X25519
+# 那样需要靠「检查输出是否全零」来防小阶点攻击——少一条容易漏掉的检查，也少一份
+# 需要额外审计的椭圆曲线实现。代价是标量乘法比 X25519 慢，而一次配对只做两次，
+# 完全可以忽略。
+#
 # 曲线选择见 `src/device.rs` 的模块文档：P-256 是两个移动平台上**唯一**能进
 # 硬件的签名算法，这是强约束而非偏好。
-p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdh", "ecdsa", "std"] }
 
 # 秘密材料容器（`SecretBox` / `SecretSlice` / `SecretString` / `ExposeSecret`）。
 # 依赖审计（人工逐项核过，cargo-deny 不做依赖必要性判断）：

@@ -260,6 +260,7 @@ dependencies = [
  "digest",
  "ff",
  "group",
+ "hkdf",
  "hybrid-array",
  "pkcs8",
  "rand_core",
