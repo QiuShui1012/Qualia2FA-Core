@@ -53,6 +53,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
 
+pub mod auth;
 pub mod base32;
 pub mod device;
 mod error;
@@ -63,6 +64,7 @@ mod secret;
 pub mod uri;
 pub mod vault;
 
+pub use auth::{Responder, Verified, Verifier};
 pub use error::{Error, Result};
 
 /// 设备身份的公开类型。
