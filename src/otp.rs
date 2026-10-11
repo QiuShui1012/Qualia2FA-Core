@@ -242,7 +242,12 @@ impl OtpSecret {
     }
 
     /// 借出种子字节，供计算使用。
-    fn expose(&self) -> &[u8] {
+    ///
+    /// `pub(crate)` 而非私有：保险库需要把种子序列化进密文（见
+    /// [`crate::vault::Entry`] 的持久化路径），而那是本 crate 内的另一个模块。
+    /// **对外仍然不公开**——外部只能通过 [`OtpSecret::to_base32`] 拿到可显示的
+    /// 表示，无法把种子当作普通字节流取走。
+    pub(crate) fn expose(&self) -> &[u8] {
         self.bytes.expose_secret()
     }
 

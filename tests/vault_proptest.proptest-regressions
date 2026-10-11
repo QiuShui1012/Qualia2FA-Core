@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 523d9b9acb871580e67617680cc68d24354233155b254933f5d3ace9fb2af912 # shrinks to (vault, master, _live) = (Vault { entries: {}, tombstones: {} }, MasterKey([REDACTED]), []), cut_seed = Index(17129119497016012215)
+cc 1320c845e55c60ce6ca3e3332156fdefae0af8b4ccc34b88bf0ee3e09971d49a # shrinks to (vault, master, live_ids) = (Vault { entries: {EntryId(41ce7ed093192161929461c8e727d082): Entry { name: "", issuer: None, account: "", secret: OtpSecret { len: 1, bytes: "<redacted>" }, algorithm: Sha1, digits: Six, period: 1, counter: None, note: "", created_at: 0, updated_at: 0 }, EntryId(7bb298e11af19bcb89e38a54f3888272): Entry { name: "", issuer: Some(""), account: "", secret: OtpSecret { len: 1, bytes: "<redacted>" }, algorithm: Sha1, digits: Six, period: 1, counter: None, note: "", created_at: 0, updated_at: 0 }}, tombstones: {} }, MasterKey([REDACTED]), [EntryId(41ce7ed093192161929461c8e727d082), EntryId(7bb298e11af19bcb89e38a54f3888272)])

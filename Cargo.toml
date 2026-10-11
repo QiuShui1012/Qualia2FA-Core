@@ -19,10 +19,36 @@ categories = ["authentication", "cryptography"]
 publish = false
 
 [dependencies]
+# ── 认证加密 ──────────────────────────────────────────────────────────────
+# 保险库条目用 XChaCha20-Poly1305（RFC 8439 的 192-bit nonce 变体）。
+#
+# 为什么必须是 192-bit nonce 而不是常见的 96-bit：多设备各自独立加密、彼此
+# 无中心协调，随机 nonce 是唯一现实选择。96-bit nonce 在随机取值下会撞生日界
+# （保险库规模下 `aes-gcm` 属于**不安全用法**）；192-bit 的随机 nonce 余量充足。
+# 另外 ChaCha 系列不依赖 AES-NI 硬件，在任何平台上行为一致。
+#
+# 推荐加密（RustCrypto 系），实现为纯 Rust，无 C/汇编依赖，交叉编译到
+# Android / iOS 不需要额外的工具链配置。
+chacha20poly1305 = "0.11.0"
+
 form_urlencoded = "1.2"
 # 随机数只走 getrandom（OS CSPRNG），不经任何用户态 PRNG。
 # Android 上该 syscall 需 API 23；aarch64/arm/x86/x86_64 在更低版本有 /dev/urandom 回退。
 getrandom = "0.4.3"
+
+# ── 子密钥派生 ────────────────────────────────────────────────────────────
+# HKDF-SHA256（RFC 5869），用于从主密钥派生用途分离的子密钥。
+#
+# 这里**刻意不用 blake3**：blake3 会为每个目标平台编译 C 与手写汇编，
+# 在 Android 的交叉编译矩阵上引入额外的构建风险，而本项目只需要一个标准 KDF。
+# `hkdf` 是纯 Rust，且与已有的 `hmac` 同属 RustCrypto、同为 0.13 系列，
+# 不会引入第二份 `digest`/`hmac` 版本。
+#
+# 派生子密钥而非直接用主密钥加密，是为了让主密钥**不出现在任何密文的密钥
+# 位置**：主密钥将来还要参与设备配对与恢复（M3/M4），用途分离能限制单点泄露
+# 的影响范围。
+hkdf = "0.13"
+
 hmac = "0.13"
 
 # 秘密材料容器（`SecretBox` / `SecretSlice` / `SecretString` / `ExposeSecret`）。

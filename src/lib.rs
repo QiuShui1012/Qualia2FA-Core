@@ -58,6 +58,7 @@ mod error;
 pub mod otp;
 mod secret;
 pub mod uri;
+pub mod vault;
 
 pub use error::{Error, Result};
 pub use secret::{

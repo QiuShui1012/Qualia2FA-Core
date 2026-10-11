@@ -19,9 +19,9 @@ Qualia2FA 的核心库。承载双因素认证（2FA）的全部核心逻辑：T
 | 许可证 | `LGPL-3.0-or-later` |
 
 已实现：HOTP（RFC 4226）、TOTP（RFC 6238）、Base32（RFC 4648，宽容与严格两种
-模式）、`otpauth://` 解析与序列化、Steam Guard。
+模式）、`otpauth://` 解析与序列化、Steam Guard、加密保险库（本地存储格式）。
 
-**尚未实现**：加密保险库、设备配对、条目同步合并。这些是当前的开发重点。
+**尚未实现**：设备配对与条目同步合并。这些是当前的开发重点。
 
 ## 用法
 
@@ -62,6 +62,52 @@ use qualia2fa_core::otp;
 // 便于据此校准该条目的时钟偏差。比较是常量时间的。
 let offset = otp::verify_with_drift(&secret, counter, 1, algorithm, digits, &user_input);
 ```
+
+### 加密保险库
+
+一条 `otpauth://` 配置存进保险库后就变成一条**逐条加密**的条目：每条有自己的
+128-bit 随机 ID 与 XChaCha20-Poly1305 密文，文件里除了那些 ID 之外没有任何明文
+语义——连「这是 TOTP 还是 HOTP」都看不出来。
+
+```rust
+use qualia2fa_core::vault::{self, Entry, VaultFile};
+
+// 从扫码结果建条目。时间由调用方传入（本库不读时钟）。
+let parsed = qualia2fa_core::uri::parse("otpauth://totp/GitHub:alice?secret=JBSWY3DPEHPK3PXP&issuer=GitHub")?;
+let entry = vault::entry_from_parsed_uri(&parsed, now)?;
+
+let mut file = VaultFile::create()?;              // 生成新的随机主密钥
+let id = file.vault_mut().insert(entry)?;
+
+let bytes = file.serialize()?;
+vault::write_file_atomically(std::path::Path::new("vault.q2fa"), &bytes)?;
+```
+
+读回来需要**主密钥**——文件里不含它，也不含任何能用来验证它的东西：
+
+```rust
+use qualia2fa_core::vault::{self, MasterKey};
+
+let master: MasterKey = load_from_platform_keystore()?;   // 例如 Windows TPM
+let file = vault::read_file(master, std::path::Path::new("vault.q2fa"))?;
+for (id, entry) in file.vault().iter() {
+    println!("{id} {}", entry.name);
+}
+```
+
+几件需要知道的事：
+
+- **主密钥丢失 = 数据永久无法解密。** 没有服务端、没有账号密码，也就没有找回
+  途径。把主密钥存进平台硬件密钥库（Windows TPM、Android Keystore、iOS Secure
+  Enclave）是计划中的做法，但那属于上层；本库只负责生成、派生与保管它。
+- **文件可以被攻击者随意改写。** 任何一个字节被改动都会导致解密失败，而不是
+  悄悄解出一份被篡改的数据。你自己实现存储层时也应当如此。
+- **落盘请用 `write_file_atomically`。** 直接 `fs::write` 在断电时可能留下一个
+  被截断的文件，而那意味着全部条目损坏。
+- **删除会留下墓碑**（同样加密，只有 ID 与时间戳），这样「另一台设备还有这条」
+  才可裁决。墓碑不设过期，每条 45 字节。
+- 密文长度会泄露备注、账号名的**长短**。这是已知的、有意的取舍：掩盖它需要填充
+  到定长块，代价是文件变大数倍。
 
 ## 设计约定
 
@@ -167,11 +213,12 @@ cargo install cargo-fuzz --locked
 cd fuzz
 cargo +nightly fuzz list
 cargo +nightly fuzz run uri_parse -- -max_total_time=300
+cargo +nightly fuzz run vault_parse -- -max_total_time=300
 ```
 
-`otpauth://` 解析器与 Base32 解码是**攻击者可控**的输入面，改动它们时必须跑
-fuzz。历史崩溃样本固化在 `fuzz/regressions/`，CI 每轮都会跑到。详见
-[`fuzz/README.md`](fuzz/README.md)。
+`otpauth://` 解析器、Base32 解码与保险库文件解析都是**攻击者可控**的输入面，
+改动它们时必须跑 fuzz。历史崩溃样本固化在 `fuzz/regressions/`，CI 每轮都会跑到。
+详见 [`fuzz/README.md`](fuzz/README.md)。
 
 ### MSRV 策略
 

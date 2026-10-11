@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc d140ab44d4aa4a7bd9e6ac26868bdc116b279e3b0e9f20229e6290ee6073abfc # shrinks to auth = OtpAuth { uri_type: Hotp, secret: "<redacted>", issuer: None, account: "\u{80}", algorithm: Sha1, digits: Six, period: 1, counter: Some(0) }
+cc bb9241f518684ca502e87de58eca2019cdf450a9550df1b3104847a38d417028 # shrinks to data = []
+cc f5df3c15ce3075245e598a83445c8b97ea6dd417e452a7cfd4d983b345692036 # shrinks to data = []

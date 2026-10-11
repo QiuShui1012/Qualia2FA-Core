@@ -44,6 +44,25 @@ fn arb_bytes() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(any::<u8>(), 0..=2048)
 }
 
+/// 生成**非空**字节串，用于「编码 → 解码」这类往返性质。
+///
+/// # 为什么不能复用 `arb_bytes`
+///
+/// `arb_bytes` 允许空串，而**空输入不是合法的 Base32**：`base32::decode("")`
+/// 会返回 [`Error::SecretTooShort`]（见 `src/base32.rs` 的
+/// `rejects_empty_and_padding_only`，那是刻意的行为——空种子会让所有验证码
+/// 相同，必须拒绝）。
+///
+/// 于是「编码再解码必须还原」这条性质对空输入**本来就不成立**，而 `arb_bytes`
+/// 迟早会生成它。这是个潜伏的测试缺陷：它一直在随机地等着被触发，一旦触发，
+/// proptest 会把 `data = []` 写进 `proptest-regressions` 文件，此后每次运行都
+/// 稳定失败。
+///
+/// 「空输入被拒绝」这件事由上面的单元测试覆盖，往返性质只需要管非空输入。
+fn arb_nonempty_bytes() -> impl Strategy<Value = Vec<u8>> {
+    prop::collection::vec(any::<u8>(), 1..=2048)
+}
+
 proptest! {
     /// 性质：从 `Vec<u8>` 构造后取用，必须原样返回，不截断、不填充、不改写。
     #[test]
@@ -141,8 +160,10 @@ proptest! {
     ///
     /// 这条覆盖全部 5 种合法尾部余数（0/2/4/5/7 位）。随机字节长度会均匀
     /// 命中它们，因此不需要为每种余数单独写测试。
+    ///
+    /// 输入限定非空——空输入不是合法 Base32，见 [`arb_nonempty_bytes`]。
     #[test]
-    fn base32_encode_decode_roundtrips(data in arb_bytes()) {
+    fn base32_encode_decode_roundtrips(data in arb_nonempty_bytes()) {
         let encoded = base32::encode(&data);
         // 编码结果只能是字母表内字符与填充符。
         prop_assert!(
@@ -157,8 +178,10 @@ proptest! {
     }
 
     /// 性质：无填充形式的编码同样可解码（真实世界绝大多数种子无填充）。
+    ///
+    /// 输入同样限定非空：空串去掉填充还是空串，仍然非法。
     #[test]
-    fn base32_unpadded_encoding_also_decodes(data in arb_bytes()) {
+    fn base32_unpadded_encoding_also_decodes(data in arb_nonempty_bytes()) {
         let padded = base32::encode(&data);
         let unpadded = padded.trim_end_matches('=');
         let decoded = base32::decode(unpadded)

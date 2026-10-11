@@ -39,3 +39,12 @@ path = "fuzz_targets/base32_and_otp.rs"
 test = false
 doc = false
 bench = false
+
+# 攻击者可控输入面：保险库文件会被同步到不受控的位置（网盘、二维码、另一台
+# 设备），因此每个长度字段都由对手决定。
+[[bin]]
+name = "vault_parse"
+path = "fuzz_targets/vault_parse.rs"
+test = false
+doc = false
+bench = false
