@@ -19,6 +19,24 @@ categories = ["authentication", "cryptography"]
 publish = false
 
 [dependencies]
+# ── 恢复密钥的口令派生 ────────────────────────────────────────────────────
+# Argon2id（RFC 9106），用于把用户口令变成恢复文件的加密密钥。
+#
+# 为什么是 Argon2id 而不是 PBKDF2/scrypt：恢复文件会被用户存进网盘、U 盘、
+# 邮件附件，必须假设攻击者拿得到文件本身，唯一的防线就是口令强度。PBKDF2
+# 是纯计算型，GPU 并行破解的收益极高；scrypt 内存硬但参数组合（N/r/p）容易
+# 被配成「看起来贵其实不贵」；Argon2id 是密码哈希竞赛的获胜者、RFC 9106 推荐，
+# 且同时抵抗 GPU 与侧信道（id 变体混合了数据相关与数据无关的内存访问）。
+#
+# `password-hash` 无法关闭：argon2 0.6 的 lib.rs 无条件 `use password_hash::...`，
+# 该 feature 是实质必选项（尽管 Cargo.toml 把它列为可选）。它只带来 base64ct
+# 与一个小工具 crate，代价可接受。
+#
+# 开启 `zeroize`：让库内部的工作区（Argon2 的内存块）在析构时被擦除。默认参数
+# 一次要分配 64 MiB，不擦除等于把口令的派生中间态留在堆上。
+#
+# 不开 `parallel`：并行度固定为 1，理由见 src/recovery.rs 的 PARALLELISM。
+argon2 = { version = "0.6.0", features = ["zeroize"] }
 # ── 认证加密 ──────────────────────────────────────────────────────────────
 # 保险库条目用 XChaCha20-Poly1305（RFC 8439 的 192-bit nonce 变体）。
 #

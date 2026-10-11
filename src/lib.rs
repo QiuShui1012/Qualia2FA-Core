@@ -58,6 +58,7 @@ pub mod device;
 mod error;
 pub mod otp;
 pub mod pairing;
+pub mod recovery;
 mod secret;
 pub mod uri;
 pub mod vault;
@@ -77,6 +78,9 @@ pub use device::{DeviceId, DevicePublicKey, DeviceSignature};
 /// 会话密钥、确认标签计算等一律不导出——它们是协议不变量的一部分，不该被上层
 /// 组合出别的用法。
 pub use pairing::{Adoption, JoinerSession, NonceLog, PendingSession, QrPayload};
+
+/// 恢复密钥的公开类型。
+pub use recovery::{KdfParams, export as export_recovery, import as import_recovery};
 
 pub use secret::{
     ExposeSecret, ExposeSecretMut, SecretBox, SecretBytes, SecretSlice, SecretString,
