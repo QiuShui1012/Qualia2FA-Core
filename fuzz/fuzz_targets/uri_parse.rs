@@ -111,7 +111,6 @@ fn check(text: &str) {
         !leaked_as_secret_field,
         "Debug 的 secret 字段泄露了 Base32 种子：{debug}"
     );
-    assert!(!debug.contains("secret: Some"), "secret 字段不应被包在 Some 里");
 
     // `issuer` / `account` 必须被截断——它们是攻击者可控的无界输入，
     // 且可能含隐私（真实场景里是邮箱）。这条防止日志被恶意二维码放大。

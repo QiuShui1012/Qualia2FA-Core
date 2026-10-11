@@ -14,11 +14,14 @@ Desktop.ini
 # 说明：调研报告位于仓库根 (`Core/`) 之外的 `../research/`，按决定不入库。
 # 因为它在仓库目录树之外，git 本就不会跟踪它，无需在此写一条无效规则。
 
-# cargo-fuzz 的运行时产物。
+# cargo-fuzz 的产物分三类，处置不同（语料库规则见 fuzz/.gitignore）：
 #
-# `corpus/` 单独列出而非整个忽略：**语料库值得入库**——它是长期 fuzz 积累的
-# 覆盖成果，入库后 CI 的 fuzz-smoke 能从这些种子出发，比从零开始有效得多。
-# 而 `artifacts/` 里放的是崩溃输入，只在调查期间有用，属于临时产物。
+#   fuzz/target/          构建产物，永不入库
+#   fuzz/artifacts/       崩溃输入，只在调查期间有用，属临时产物
+#   fuzz/corpus/<目标>/   跑 fuzz 时机器生成的种子，不入库；但它是一个会被
+#                         反复覆盖的目录，入库只会让每次 fuzz 都产生上百个
+#                         无意义的文件改动。值得长期保留的样本改为手工放进
+#                         fuzz/regressions/<目标>/，那个目录是入库的。
 /fuzz/target
 /fuzz/artifacts
 

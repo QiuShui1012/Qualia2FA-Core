@@ -56,20 +56,33 @@ cargo +nightly fuzz run secret_debug_redaction -- -max_total_time=300
 cargo +nightly fuzz run secret_debug_redaction artifacts/secret_debug_redaction/<crash-file>
 ```
 
-`corpus/`、`artifacts/`、`coverage/` 均不入库（见 `.gitignore`）。
+`corpus/`、`artifacts/`、`coverage/` 均不入库（见 `.gitignore`）。自动生成的
+`corpus/` 每次跑都会增长，入库只会让 `git status` 永远脏。
+
+**值得长期保留的样本放进 `regressions/<目标>/`，那个目录是入库的。** 放进去的
+样本会被 CI 在跑 fuzz 前先喂进语料库（见 `.github/workflows/ci.yml`），因此它们
+每一轮都会被真正执行到——这是防止同一个缺陷复发的唯一持久化手段，也是把崩溃
+调小后固化成回归用例的地方。
 
 ## 现有目标
 
 | 目标 | 覆盖的输入面 | 检查的性质 |
 |---|---|---|
 | `secret_debug_redaction` | `SecretBytes`（秘密处理路径） | 不 panic、`new`→`expose` 透明、`Debug` 不泄露明文（十进制与十六进制两种表示） |
+| `uri_parse` | `otpauth://` URI 解析器 | 不 panic、`Debug` 的 `secret` 字段恒为脱敏标记、超长 `issuer` 被截断、解析出的配置自洽、序列化往返幂等 |
+| `base32_and_otp` | Base32 编解码 + OTP 计算 | 编解码精确往返（含有/无填充）、宽容模式与严格模式一致、验证码长度与取值范围正确、Steam 字母表正确 |
 
-## 待补（M1）
+## 写断言时的陷阱
 
-`otpauth://` URI 解析器与 Base32 解码是**真正攻击者可控**的输入面，实现后必须
-补上对应目标：
+fuzz 断言里的**字符串包含检查**极易写出假阳性：只要断言检查「输出里是否含某串」，
+fuzzer 就会构造出把该串放进**别的字段**的输入。本仓库已经踩过两次：
 
-- `uri_parse`：任意字节串喂给 URI 解析器，不得 panic。
-- `base32_decode`：任意字节串喂给 Base32 解码器，不得 panic、不得越界。
+- 「`Debug` 里出现了种子的 Base32」——结果 fuzzer 把种子串放进了 `issuer`，
+  两个无关字段恰好同值，并非泄露。改为结构性地断言 `secret` 字段恒为
+  `<redacted>`。
+- 「`Debug` 里出现了 `secret: Some`」——结果 fuzzer 把这段文本整段放进了
+  `issuer`，于是子串命中了那个**字段名**，而不是任何实际字段。该断言本身也是
+  多余的：`OtpAuth.secret` 的类型就是 `OtpSecret` 而非 `Option<OtpSecret>`，
+  结构上不可能被包在 `Some` 里，且上一条已断言 `secret` 字段恒为脱敏标记。
 
-在此之前，`secret_debug_redaction` 是秘密处理路径唯一的自动化防线，不要删除。
+结论：断言要**绑定到具体字段的结构**，不要做全局子串搜索。

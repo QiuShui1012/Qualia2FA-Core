@@ -117,6 +117,15 @@ jobs:
           set -euo pipefail
           for target in $(cargo +nightly fuzz list); do
             echo "::group::fuzz $target"
+            # 先把入库的回归样本喂进语料库。
+            #
+            # 这些是历史上真实触发过崩溃（或断言失败）的输入，必须每轮都跑到，
+            # 否则同一个缺陷会在后续改动里悄悄复发。自动生成的 corpus/ 不入库，
+            # 所以它是每次从零开始的；regressions/ 是唯一的持久化保证。
+            if [ -d "regressions/$target" ]; then
+              mkdir -p "corpus/$target"
+              cp -n "regressions/$target"/* "corpus/$target"/ 2>/dev/null || true
+            fi
             cargo +nightly fuzz run "$target" -- -max_total_time=60 -rss_limit_mb=2048
             echo "::endgroup::"
           done

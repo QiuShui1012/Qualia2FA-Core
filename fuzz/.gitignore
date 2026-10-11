@@ -1,7 +1,15 @@
 # fuzz 产物不入库
 
-# libFuzzer 语料库与崩溃样本
-corpus/
+# libFuzzer 自动生成的语料库。它会被每次 fuzz 覆盖式增长（本地跑一轮就可能
+# 多出上百个种子），入库只会让 `git status` 永远脏。
+#
+# 值得长期保留的样本请手工放进 `regressions/<目标>/` —— 那个目录是入库的，
+# 且 CI 会在跑 fuzz 前先把它们喂进语料库（见 .github/workflows/ci.yml）。
+#
+# 注意这里写 `corpus/*/` 而不是 `corpus/`：忽略整个 `corpus/` 会让 git 不再
+# 向下遍历该目录，从而**无法**再对其中任何子路径写反向规则（gitignore 的
+# 「不能重新包含已被排除目录内的文件」规则）。保留一层遍历才留得住扩展余地。
+corpus/*/
 artifacts/
 coverage/
 
