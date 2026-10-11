@@ -34,7 +34,8 @@ use proptest::prelude::*;
 use qualia2fa_core::ExposeSecret;
 use qualia2fa_core::otp::{Algorithm, Digits, OtpSecret};
 use qualia2fa_core::vault::{
-    self, Entry, EntryId, FORMAT_VERSION, MAGIC, MasterKey, Tombstone, Vault, VaultFile,
+    self, Entry, EntryId, FORMAT_VERSION, MAGIC, MasterKey, READABLE_VERSIONS, Tombstone, Vault,
+    VaultFile,
 };
 
 /// 生成任意字节秘密。
@@ -342,11 +343,15 @@ proptest! {
     ///
     /// 具体地说，魔数与版本号都必须参与判定。这条性质保证「把别的文件改名成
     /// .q2fa」不会被当成保险库读进来。
+    ///
+    /// 版本号的生成从 `FORMAT_VERSION + 1` 起：**当前版本与所有可读的旧版本都必须
+    /// 被接受**（那是「用户的旧文件还能打开」这条承诺），因此不能拿它们当「未知
+    /// 版本」的样本。
     #[test]
     fn wrong_magic_or_version_is_rejected(
         (vault, master, _live) in arb_vault(),
         magic_flip in any::<bool>(),
-        version in 2_u8..=255,
+        version in (FORMAT_VERSION + 1)..=255,
     ) {
         let mut file = VaultFile::with_master_key(clone_key(&master));
         for (id, entry) in vault.iter() {
@@ -426,9 +431,18 @@ fn clone_entry(entry: &Entry) -> Entry {
 #[test]
 fn file_format_constants_are_stable() {
     assert_eq!(MAGIC, b"Q2FAVLT\0", "魔数是对外契约");
-    assert_eq!(FORMAT_VERSION, 1, "版本号参与 AAD，改动会让旧文件解不开");
+    assert_eq!(
+        FORMAT_VERSION, 2,
+        "版本号参与 AAD，改动会让所有旧文件解不开"
+    );
+    assert_eq!(
+        READABLE_VERSIONS,
+        &[1, 2],
+        "可读版本只增不减：移除一个会让用户手里的旧文件突然打不开"
+    );
     assert_eq!(vault::MASTER_KEY_LEN, 32, "主密钥长度");
     assert_eq!(vault::NONCE_LEN, 24, "XChaCha20 的 nonce 长度");
     assert_eq!(vault::TAG_LEN, 16, "Poly1305 标签长度");
+    assert_eq!(vault::KEY_CHECK_LEN, 32, "主密钥检查值长度");
     assert_eq!(EntryId::LEN, 16, "128-bit 条目标识");
 }

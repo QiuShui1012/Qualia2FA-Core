@@ -37,6 +37,7 @@ use chacha20poly1305::aead::{AeadInOut, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
+use subtle::ConstantTimeEq as _;
 
 /// 主密钥的字节长度。
 ///
@@ -180,7 +181,7 @@ const HKDF_SALT: [u8; 32] = [0_u8; 32];
 /// 从主密钥派生用于条目加密的子密钥。
 ///
 /// 每次调用都重新派生而不缓存：HKDF 的代价是两次 HMAC-SHA256，在 30 秒一次的
-/// 验证码场景下完全可以忽略，而缓存意味着子密钥要在内存里多活一段时间。
+/// 验证码场景下完全可以忽略，而缓存意味着子密钥要在内存里多留一段时间。
 fn entry_key(master: &MasterKey) -> Result<[u8; 32]> {
     let hkdf = Hkdf::<Sha256>::new(Some(&HKDF_SALT), master.expose());
     let mut key = [0_u8; 32];
@@ -189,6 +190,77 @@ fn entry_key(master: &MasterKey) -> Result<[u8; 32]> {
     hkdf.expand(HKDF_INFO_ENTRY, &mut key)
         .map_err(|_| Error::VaultDecryptionFailed)?;
     Ok(key)
+}
+
+/// 主密钥检查值的字节长度。
+pub const KEY_CHECK_LEN: usize = 32;
+
+/// 主密钥检查值派生用的 HKDF 上下文串。
+///
+/// 与 [`HKDF_INFO_ENTRY`] 不同：域分离靠的就是这一串不同。若两者共用，检查值就
+/// 等于条目子密钥，而检查值是**明文写在文件里**的——那等于把主密钥的子密钥公开。
+const HKDF_INFO_KEY_CHECK: &[u8] = b"Qualia2FA vault v1 master key check";
+
+/// 派生「这个文件是用哪把主密钥写的」的检查值。
+///
+/// # 它解决什么问题
+///
+/// 主密钥原本只参与每条记录的 AEAD，而文件头里没有它的任何信息。于是**一个条目
+/// 为空的保险库文件对任何 32 字节密钥都能解析成功**——主密钥存错了要等用户加进
+/// 第一条条目、或同步进来第一条记录才暴露，而那时界面早已显示「打开成功」。
+/// 把检查值写进文件，`parse` 就能在**读第一条记录之前**判定密钥对错。
+///
+/// # 为什么固定值比「随机 salt + HKDF」更合适
+///
+/// 固定派生意味着**同一把主密钥在任何文件里都得到同一个检查值**，于是这一层不
+/// 提供任何「这两个文件是否来自同一把密钥」之外的关联能力——而那件事本来就能从
+/// 「记录能否解开」推出来。
+///
+/// # 它泄露了什么
+///
+/// 只有「猜测的主密钥对不对」这一个比特。这不构成新的攻击面：拿到文件的攻击者
+/// **本来**就能用同样的方式逐条试解（AEAD 标签就是现成的验证器），本函数没有给
+/// 他任何新能力，只是让诚实的调用方也能用上同一个判定。
+///
+/// 真正不可离线暴力破解的是**恢复密钥文件**：那里的主密钥由用户口令经 Argon2id
+/// 派生密钥加密，每次尝试都要付出 64 MiB / 3 次迭代的代价。保险库文件不含口令，
+/// 本来就不承担「抵抗离线暴力破解」的职责——它的前提是主密钥本身是 256-bit 均匀
+/// 随机、不可枚举的。
+#[must_use]
+pub fn key_check(master: &MasterKey) -> [u8; KEY_CHECK_LEN] {
+    let hkdf = Hkdf::<Sha256>::new(Some(&HKDF_SALT), master.expose());
+    let mut check = [0_u8; KEY_CHECK_LEN];
+    // 32 字节不可能让 `expand` 失败（上限是 255 * 32 字节），因此这里的
+    // `expect` 不可达。仍然不用 `unwrap`：本 crate 的 nopanic 约定不接受例外，
+    // 而这个函数返回数组、无从返回错误，只能显式失败。
+    hkdf.expand(HKDF_INFO_KEY_CHECK, &mut check)
+        .expect("HKDF 输出 32 字节不可能失败");
+    check
+}
+
+/// 校验文件里的主密钥检查值。
+///
+/// # 错误
+///
+/// 长度不对返回 [`Error::VaultBadKeyCheck`]（结构性）；长度对但值不符返回
+/// [`Error::VaultDecryptionFailed`]（认证失败）。
+///
+/// 两者刻意分开：前者说明文件被构造坏了，后者说明**主密钥不对或文件被改过**，
+/// 而端侧对这两种情况的处置完全不同。都归为 `VaultDecryptionFailed` 会让「文件
+/// 结构坏了」被误报成「密钥错了」，用户会去比对密钥，而问题不在那里。
+///
+/// # 为什么用常量时间比较
+///
+/// 检查值是明文，攻击者可以本地反复调用这个函数测时间。虽然本函数只回答「你猜的
+/// 密钥对不对」——而这本来就能从试解一条记录得到——但既然比较的代价一样，就没有
+/// 理由在这里留一个非常量时间的分支。
+pub fn verify_key_check(master: &MasterKey, stored: &[u8]) -> Result<()> {
+    let stored: &[u8; KEY_CHECK_LEN] = stored.try_into().map_err(|_| Error::VaultBadKeyCheck)?;
+    if key_check(master).ct_eq(stored).into() {
+        Ok(())
+    } else {
+        Err(Error::VaultDecryptionFailed)
+    }
 }
 
 /// 记录的种类，参与 AAD 构造。

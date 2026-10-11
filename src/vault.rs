@@ -28,17 +28,18 @@
 //! **长度本身仍会泄露信息**（用户备注的长短、账号名的长短）。要掩盖它需要
 //! 填充到定长块，代价是文件变大数倍。当前不做，但这是已知的、有意的取舍。
 //!
-//! # 文件格式 v1
+//! # 文件格式 v2
 //!
 //! 全部整数为**大端**。布局：
 //!
 //! ```text
 //! 偏移      长度   内容
 //! 0         8      魔数 "Q2FAVLT\0"
-//! 8         1      格式版本（当前 1）
+//! 8         1      格式版本（当前 2）
 //! 9         1      保留字节（必须为 0，拒绝非 0 以便将来扩展时不误读旧文件）
 //! 10        4      记录数（大端 u32）
 //! 14        ...    记录，紧邻排列
+//! 末尾      32     主密钥检查值
 //! ```
 //!
 //! 每条记录：
@@ -52,9 +53,20 @@
 //! 45        N           密文（含 16 字节认证标签）
 //! ```
 //!
-//! **记录尾部不做对齐填充**，也不在文件末尾放校验和——AEAD 的认证标签已经
-//! 覆盖了「这条记录是否完整、是否属于这个位置、是否属于这个版本」，再加一层
-//! 校验和只会增加出错面。
+//! **记录尾部不做对齐填充**，也不在记录之间放校验和——AEAD 的认证标签已经覆盖了
+//! 「这条记录是否完整、是否属于这个位置、是否属于这个版本」，再加一层校验和只会
+//! 增加出错面。文件末尾那 32 字节不是校验和：它是主密钥检查值，回答的是「这个
+//! 文件是不是用这把密钥写的」，而记录标签回答的是「这条记录有没有被改过」。
+//!
+//! ## 版本 1 的文件仍然可读
+//!
+//! 版本 1 没有末尾那 32 字节，解析时跳过检查值那一步即可，其余完全相同。这是
+//! 刻意的：用户升级应用之后，他原有的文件必须还能打开。
+//!
+//! **反向不成立。** 版本 1 的解析器会拒绝版本 2 的文件，因为它有一条「拒绝任何
+//! 尾部多余字节」的检查，而那 32 字节在它看来就是多余内容。补救它要解锁那条检查，
+//! 而解锁会让「文件被追加过内容」这个事实静默消失——代价比「旧版本打不开新文件」
+//! 更大。旧版本用户看到的是一个明确的错误，不是一份错乱的数据。
 //!
 //! # 密钥从哪里来
 //!
@@ -66,7 +78,10 @@ mod codec;
 mod crypto;
 mod entry;
 
-pub use crypto::{MASTER_KEY_LEN, MasterKey, NONCE_LEN, TAG_LEN, master_key_to_bytes};
+pub use crypto::{
+    KEY_CHECK_LEN, MASTER_KEY_LEN, MasterKey, NONCE_LEN, TAG_LEN, key_check, master_key_to_bytes,
+    verify_key_check,
+};
 pub use entry::{Entry, EntryId, Timestamp, entry_from_parsed_uri};
 
 use std::collections::BTreeMap;
@@ -82,10 +97,37 @@ pub const MAGIC: &[u8; 8] = b"Q2FAVLT\0";
 
 /// 当前写入的格式版本。
 ///
-/// 这个值参与 AAD 构造，因此**改它会让所有旧文件
-/// 解不开**。若将来需要不兼容的格式变更，正确做法是：新版本号 + 在解析时按
-/// 版本分派，而不是复用同一个号。
-pub const FORMAT_VERSION: u8 = 1;
+/// # 版本 2 与版本 1 的区别只有一处：文件末尾多了主密钥检查值
+///
+/// 目的是让「这个文件是用哪把主密钥写的」能在**读第一条记录之前**判定。版本 1
+/// 里主密钥只参与每条记录的 AEAD，于是**一个条目为空的文件对任何 32 字节密钥都
+/// 能解析成功**——密钥存错了要等到加进第一条条目才暴露，而那时界面早已显示
+/// 「打开成功」。
+///
+/// # 这个常量**同时**是记录 AAD 里的版本号
+///
+/// 因此它不能只表示「布局长什么样」：AAD 里换了号，旧记录的标签就全部验不过。
+/// 解析时用的**必须是被解析的那个文件自己声明的版本**，不能是这个常量——否则读
+/// 一个版本 1 的旧文件会全线认证失败。见 [`VaultFile::parse`] 里的 `version`。
+///
+/// # 版本 1 仍然可读
+///
+/// 版本 1 的文件没有检查值，`parse` 会跳过那一步校验，行为与从前一致（包括那条
+/// 已知限制）。反过来**不成立**：版本 1 的解析器会因为末尾多出的字节拒绝版本 2
+/// 的文件（它有一条「拒绝任何尾部多余字节」的检查），并报
+/// [`Error::VaultTrailingBytes`] 而不是版本不支持。这是版本 1 设计时没有为「更
+/// 丰富的未来版本」留出跳过路径的直接后果，无法在不解锁这个检查的前提下补救——
+/// 而解锁它等于让「文件被追加过内容」这个事实静默消失，代价更大。
+pub const FORMAT_VERSION: u8 = 2;
+
+/// 能解析的格式版本集合。
+///
+/// 只增不改：一个版本号一旦进入这个列表就不能移除，否则用户手里的旧文件会突然
+/// 打不开，而错误信息（「版本不支持」）会让人以为文件坏了。
+///
+/// 暴露出来是为了让「旧版本仍可读」这条承诺能被测试直接钉住，而不是靠测试去
+/// 复述一遍版本号——那样两边一起改就永远不会失败。
+pub const READABLE_VERSIONS: &[u8] = &[1, FORMAT_VERSION];
 
 /// 单条记录的密文长度上限。
 ///
@@ -456,18 +498,34 @@ impl VaultFile {
 
         for (id, entry) in &self.vault.entries {
             let plaintext = encode_entry(entry)?;
-            write_record(&mut out, &self.master, RecordKind::Entry, id, &plaintext)?;
+            write_record(
+                &mut out,
+                &self.master,
+                FORMAT_VERSION,
+                RecordKind::Entry,
+                id,
+                &plaintext,
+            )?;
         }
         for (id, tombstone) in &self.vault.tombstones {
             let plaintext = encode_tombstone(tombstone);
             write_record(
                 &mut out,
                 &self.master,
+                FORMAT_VERSION,
                 RecordKind::Tombstone,
                 id,
                 &plaintext,
             )?;
         }
+
+        // 主密钥检查值放在**末尾**而不是头部。
+        //
+        // 放头部要挤进那 14 字节的定长头，而那会让版本 1 的解析器从错误的偏移读
+        // 记录数（它按固定偏移读，不会看版本号之后的分支）。放末尾则版本 1 的解析器
+        // 会在读完记录后撞上尾部检查，报一个**明确**的 VaultTrailingBytes 而不是
+        // 解出一份错乱的保险库。
+        out.extend_from_slice(&crypto::key_check(&self.master));
         Ok(out)
     }
 
@@ -477,6 +535,18 @@ impl VaultFile {
     ///
     /// 任何结构问题（魔数不符、版本不支持、记录越界、长度超限）返回结构性错误；
     /// **任何认证失败返回 [`Error::VaultDecryptionFailed`]**，且不区分原因。
+    /// 版本 2 的文件里主密钥检查值不符也返回它——那与「第一条记录解不开」是同一件
+    /// 事的更早发现点。
+    ///
+    /// # 版本 1 的文件仍然可读
+    ///
+    /// 版本 1 没有检查值，因此这一步跳过，行为与从前完全一致。**这是刻意的**：
+    /// 用户升级应用之后，他原有的文件必须还能打开。
+    ///
+    /// # 版本 1 的文件仍然判定不了密钥对错
+    ///
+    /// 这不是回归，而是那份文件里确实没有可判定的信息。需要对密钥做权威确认时用
+    /// 挑战-应答（`auth` 模块），它不依赖文件内容。
     ///
     /// # 这个函数必须永不 panic
     ///
@@ -491,7 +561,7 @@ impl VaultFile {
         }
 
         let version = reader.u8().ok_or(Error::VaultTruncated)?;
-        if version != FORMAT_VERSION {
+        if !READABLE_VERSIONS.contains(&version) {
             return Err(Error::VaultUnsupportedVersion { version });
         }
 
@@ -521,6 +591,9 @@ impl VaultFile {
             }
             let ciphertext = reader.take(len).ok_or(Error::VaultTruncated)?;
 
+            // AAD 里的版本号必须是**这个文件自己声明的**版本，不能是
+            // `FORMAT_VERSION`：否则读一个版本 1 的旧文件会全线认证失败，而原因
+            // 会是「密钥不对」——一个把用户引向完全错误方向的诊断。
             let plaintext = crypto::open(&master, kind, &id, version, &nonce, ciphertext)?;
             match kind {
                 RecordKind::Entry => {
@@ -532,6 +605,19 @@ impl VaultFile {
                     vault.record_tombstone(tombstone);
                 }
             }
+        }
+
+        // 版本 2 末尾是主密钥检查值。放在记录之后读，于是「先判定密钥、再动记录」
+        // 对这个顺序做不到——记录已经解完了。但代价可以接受：密钥不对时第一条记录
+        // 就会失败，检查值的价值在于**空文件**（`count == 0`，循环一次都不进）。
+        //
+        // 之所以不为此改成「检查值放头部」：头部是定长的 14 字节，而版本 1 的解析器
+        // 按固定偏移读记录数，插进去会让它读出一份错乱的保险库而不是干净地拒绝。
+        if version >= 2 {
+            let stored = reader
+                .take(crypto::KEY_CHECK_LEN)
+                .ok_or(Error::VaultTruncated)?;
+            crypto::verify_key_check(&master, stored)?;
         }
 
         // 末尾多余字节一律拒绝：它意味着文件被追加过内容，而我们无法解释那
@@ -547,14 +633,18 @@ impl VaultFile {
 }
 
 /// 把一条记录追加到输出缓冲区。
+///
+/// `format_version` 显式传入而不是读 [`FORMAT_VERSION`]：它同时被写进 AAD，而
+/// 解析时必须能与文件里声明的版本对上。
 fn write_record(
     out: &mut Vec<u8>,
     master: &MasterKey,
+    format_version: u8,
     kind: RecordKind,
     id: &EntryId,
     plaintext: &[u8],
 ) -> Result<()> {
-    let (nonce, ciphertext) = crypto::seal(master, kind, id, FORMAT_VERSION, plaintext)?;
+    let (nonce, ciphertext) = crypto::seal(master, kind, id, format_version, plaintext)?;
     out.push(kind.as_byte());
     out.extend_from_slice(id.as_bytes());
     out.extend_from_slice(&nonce);
@@ -1315,7 +1405,11 @@ mod tests {
     fn empty_vault_roundtrips() {
         let file = VaultFile::create().expect("OS 随机源可用");
         let bytes = file.serialize().expect("可序列化");
-        assert_eq!(bytes.len(), 14, "空文件应只有文件头");
+        assert_eq!(
+            bytes.len(),
+            14 + crypto::KEY_CHECK_LEN,
+            "空文件应是文件头加主密钥检查值"
+        );
         let reopened = VaultFile::parse(
             MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("长度正确"),
             &bytes,
@@ -1323,6 +1417,160 @@ mod tests {
         .expect("可解析");
         assert!(reopened.vault().is_empty());
         assert_eq!(reopened.vault().tombstone_count(), 0);
+    }
+
+    /// **这个文件格式缺口的核心测试**：空的保险库也必须能判定主密钥对错。
+    ///
+    /// 版本 1 里这条是**做不到**的——主密钥只参与每条记录的 AEAD，而空文件没有
+    /// 记录，于是任何 32 字节密钥都能解析成功。用户看到「打开成功」，而真正的问题
+    /// （密钥存错了）要等到他加进第一条条目才浮现。
+    ///
+    /// 注意这里断言的是**空的**保险库。有内容的保险库在版本 1 下也能被拒绝，因此
+    /// 只测有内容的情形对这个缺口完全是盲的。
+    #[test]
+    fn an_empty_vault_detects_a_wrong_master_key() {
+        let file = VaultFile::create().expect("OS 随机源可用");
+        assert!(file.vault().is_empty(), "前提：这个保险库确实是空的");
+        let bytes = file.serialize().expect("可序列化");
+
+        // 一把不同的密钥——长度合法、随机，但不是写这份文件的那把。
+        let wrong = MasterKey::generate().expect("OS 随机源可用");
+        assert_ne!(
+            wrong.expose(),
+            file.master_key().expose(),
+            "两把密钥必须不同"
+        );
+
+        let err = VaultFile::parse(wrong, &bytes);
+        assert!(
+            matches!(err, Err(Error::VaultDecryptionFailed)),
+            "空保险库用错误的密钥也必须被拒绝，实际 ok={}",
+            err.is_ok()
+        );
+    }
+
+    /// 版本 1 的文件仍然必须能读——用户升级应用之后原有的文件不能打不开。
+    ///
+    /// 这里手工构造一份版本 1 的文件（版本号为 1、没有末尾的检查值、记录的 AAD
+    /// 版本也是 1），因为序列化现在总是写版本 2。手工构造是**刻意的**：一个「把
+    /// `FORMAT_VERSION` 临时改回 1」的测试会随常量一起漂移，而这里要钉的是**字节
+    /// 布局本身**。
+    #[test]
+    fn version_1_files_are_still_readable() {
+        let master = MasterKey::generate().expect("OS 随机源可用");
+        let id = EntryId::generate().expect("OS 随机源可用");
+        let entry = sample_entry("old-format");
+        let plaintext = encode_entry(&entry).expect("可编码");
+        // 版本 1 的 AAD 用的是版本号 1。
+        let (nonce, ciphertext) =
+            crypto::seal(&master, RecordKind::Entry, &id, 1, &plaintext).expect("可加密");
+
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.push(1);
+        out.push(0);
+        put_u32(&mut out, 1);
+        out.push(RecordKind::Entry.as_byte());
+        out.extend_from_slice(id.as_bytes());
+        out.extend_from_slice(&nonce);
+        put_u32(
+            &mut out,
+            u32::try_from(ciphertext.len()).expect("测试数据远小于 u32::MAX"),
+        );
+        out.extend_from_slice(&ciphertext);
+        // 没有主密钥检查值。
+
+        let reopened = VaultFile::parse(
+            MasterKey::from_bytes(master_key_to_bytes(&master)).expect("长度正确"),
+            &out,
+        )
+        .expect("版本 1 的文件必须仍可解析");
+        assert_eq!(reopened.vault().len(), 1, "条目应当被读出来");
+        assert_eq!(
+            reopened.vault().iter().next().expect("一条").1.name,
+            "old-format"
+        );
+
+        // 而且用**错误的**密钥读它仍然会失败——失败点是记录的 AEAD，不是检查值。
+        let wrong = MasterKey::generate().expect("OS 随机源可用");
+        assert!(
+            VaultFile::parse(wrong, &out).is_err(),
+            "有内容的版本 1 文件用错误密钥必须失败"
+        );
+    }
+
+    /// 版本 1 的文件判定不了密钥对错——这不是回归，而是那份文件里确实没有可判定
+    /// 的信息。把这条限制钉住，免得后人以为「修好了」。
+    #[test]
+    fn a_version_1_empty_file_still_cannot_detect_a_wrong_key() {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.push(1);
+        out.push(0);
+        put_u32(&mut out, 0);
+
+        let wrong = MasterKey::generate().expect("OS 随机源可用");
+        let parsed = VaultFile::parse(wrong, &out);
+        assert!(
+            parsed.is_ok(),
+            "版本 1 的空文件没有检查值，因此任何密钥都能解析——这是该格式的已知限制"
+        );
+    }
+
+    /// 检查值被改动必须被拒绝。
+    #[test]
+    fn a_tampered_key_check_is_rejected() {
+        let file = VaultFile::create().expect("OS 随机源可用");
+        let master =
+            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("长度正确");
+        let bytes = file.serialize().expect("可序列化");
+
+        for index in 0..crypto::KEY_CHECK_LEN {
+            let mut tampered = bytes.clone();
+            let last = tampered.len() - crypto::KEY_CHECK_LEN + index;
+            tampered[last] ^= 0x01;
+            let err = VaultFile::parse(
+                MasterKey::from_bytes(master_key_to_bytes(&master)).expect("长度正确"),
+                &tampered,
+            );
+            assert!(
+                matches!(err, Err(Error::VaultDecryptionFailed)),
+                "检查值第 {index} 字节被翻转却仍被接受"
+            );
+        }
+    }
+
+    /// 检查值被截断必须报**结构**错误，而不是「密钥不对」。
+    ///
+    /// 两者在界面上的处置完全不同：结构坏了要提示文件不可用，密钥不对要提示重新
+    /// 登录。合并它们会让用户去比对密钥，而问题不在那里。
+    #[test]
+    fn a_truncated_key_check_is_a_structural_error() {
+        let file = VaultFile::create().expect("OS 随机源可用");
+        let master =
+            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("长度正确");
+        let bytes = file.serialize().expect("可序列化");
+
+        // 只砍掉几个字节——`reader.take` 会失败，因此报的是「截断」。
+        let mut cut = bytes.clone();
+        cut.truncate(cut.len() - 3);
+        let err = VaultFile::parse(
+            MasterKey::from_bytes(master_key_to_bytes(&master)).expect("长度正确"),
+            &cut,
+        );
+        assert!(
+            matches!(err, Err(Error::VaultTruncated)),
+            "截断的检查值应报截断，实际 ok={}",
+            err.is_ok()
+        );
+
+        // 长度够但不是 32 字节时（多出来的会被尾部检查抓到）走的是另一条路。
+        // 直接调用校验函数覆盖长度不符那一条。
+        let err = crypto::verify_key_check(&master, &[0_u8; 8]);
+        assert!(
+            matches!(err, Err(Error::VaultBadKeyCheck)),
+            "长度不符应报 VaultBadKeyCheck"
+        );
     }
 
     /// 文件头布局是对外契约，锁住它。
