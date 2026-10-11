@@ -104,8 +104,19 @@ pub const SYNC_ID_LEN: usize = 32;
 /// 由发起方随机生成，用于**接收方**识别重复载荷。它不是秘密。
 pub type SyncId = [u8; SYNC_ID_LEN];
 
-/// 单条记录在载荷明文里的固定部分长度：种类 + entry_id + nonce + 密文长度。
-const RECORD_HEADER_LEN: usize = 1 + EntryId::LEN + NONCE_LEN + 4;
+/// 单条记录在载荷明文里的固定部分长度：`entry_id` + nonce + 密文长度。
+///
+/// # 为什么这里**没有**种类字节
+///
+/// 种类是内层 AAD 的一部分，但**不**在明文里——这是刻意的，让攻击者连「这次同步
+/// 带了几条删除」都看不出来。代价是解密时要按两种种类各试一次（见 [`record`] 的
+/// 模块文档）。
+///
+/// 这个常量曾经写成 `1 + EntryId::LEN + NONCE_LEN + 4`，那个 `1` 是从更早一版
+/// 「明文里写一个占位种类字节」的设计留下来的。它不会造成解析错误（解析器按长度
+/// 前缀读，不按这个常量），只会让 [`Record::encoded_len`] 每条多报一个字节——也
+/// 就是让任何按它算出来的载荷大小估计偏大。
+const RECORD_HEADER_LEN: usize = EntryId::LEN + NONCE_LEN + 4;
 
 /// 载荷里允许的记录数上限。
 ///
@@ -644,3 +655,415 @@ const _: () = {
     assert!(InnerRecordKind::SyncEntry.as_byte() != InnerRecordKind::Entry.as_byte());
     assert!(InnerRecordKind::SyncTombstone.as_byte() != InnerRecordKind::Tombstone.as_byte());
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::otp::{Algorithm, Digits, OtpSecret};
+    use crate::vault::{Entry as VaultEntry, RecordKind, Timestamp, Vault, master_key_to_bytes};
+
+    /// 造一条合法条目。
+    fn sample_entry(seed: u8) -> VaultEntry {
+        VaultEntry::new(
+            format!("服务 {seed}"),
+            Some("组织".into()),
+            format!("user{seed}@example.com"),
+            OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("合法 Base32"),
+            Algorithm::Sha1,
+            Digits::Six,
+            30,
+            None,
+            String::new(),
+            Timestamp::from(1_700_000_000_u64),
+            Timestamp::from(1_700_000_000_u64),
+        )
+        .expect("字段合法")
+    }
+
+    fn a_master_key() -> MasterKey {
+        MasterKey::generate().expect("OS 随机源可用")
+    }
+
+    /// 逐条解开载荷，交出每条的 `(标识, 是否是活条目)`。
+    ///
+    /// # 为什么需要它
+    ///
+    /// [`Payload::records`] 是按标识索引的、**不区分种类**的容器：一条记录可能是活
+    /// 条目，也可能是一条墓碑，而 `RecordSet::get` 两者都返回 `Some`。因此「这条活条目
+    /// 有没有被发出去」这个问题**只能**靠解密看种类来回答。
+    ///
+    /// 返回值带上标识，测试才能断言「发出的是哪一条」，而不只是「发了几条」。
+    fn opened_kinds(payload: &Payload, master: &MasterKey) -> Vec<(EntryId, bool)> {
+        payload
+            .open_records(master)
+            .expect("逐条解密")
+            .into_iter()
+            .map(|record| match record {
+                OpenedRecord::Entry { id, .. } => (id, true),
+                OpenedRecord::Tombstone(tombstone) => (tombstone.entry_id, false),
+            })
+            .collect()
+    }
+
+    /// 把 `seal` 的输出拆开，交出**真实的明文段**。
+    ///
+    /// # 为什么测试需要它
+    ///
+    /// [`Payload::open`] 只交出 `Payload`（记录仍然是**加密**的），因此从公开 API 看
+    /// 不到线格式的字节排布。而「记录长度常量算错了」这类 bug 恰恰只在字节层面可见
+    /// ——它曾经真实存在（见 `RECORD_HEADER_LEN` 的说明），而且当时那条自以为在盯着
+    /// 线格式的测试是恒等式，抓不到它。
+    ///
+    /// 这里按**格式文档**重做一遍解析，与 `Payload::open` 的实现是两份独立代码：
+    /// 校验的是排布，而不是内部一致性。
+    fn plaintext_of(sealed: &[u8], master: &MasterKey) -> Vec<u8> {
+        let mut reader = Reader::new(sealed);
+        assert_eq!(reader.take(MAGIC.len()), Some(&MAGIC[..]), "魔数");
+        let version = reader.u8_bare().expect("版本");
+        assert_eq!(version, FORMAT_VERSION, "版本");
+        let sync_id = reader.take(SYNC_ID_LEN).expect("sync_id");
+        let sender = reader.take(EntryId::LEN).expect("发送方");
+        let nonce = reader.take(NONCE_LEN).expect("nonce");
+        let ciphertext = reader.rest();
+        assert!(reader.is_empty(), "密文之后还有多余字节");
+
+        let sync_id = <[u8; SYNC_ID_LEN]>::try_from(sync_id).expect("长度正确");
+        let sender = EntryId::from_bytes(<[u8; EntryId::LEN]>::try_from(sender).expect("长度"));
+        let nonce = <[u8; NONCE_LEN]>::try_from(nonce).expect("长度正确");
+
+        let aad = header_aad(version, &sync_id, &sender);
+        let envelope_key = derive_envelope_key(master).expect("可派生");
+        let compressed = crate::vault::crypto::open_bytes(&envelope_key, &aad, &nonce, ciphertext)
+            .expect("外层应当解得开");
+        compress::decompress(&compressed).expect("应当解得开")
+    }
+
+    /// 按字节读明文里的记录段，返回每条的 `(entry_id, nonce, 密文长度)`。
+    fn parse_record_frames(plaintext: &[u8]) -> Vec<([u8; EntryId::LEN], [u8; NONCE_LEN], usize)> {
+        let mut reader = Reader::new(plaintext);
+        let count = reader.u32_bare().expect("记录数") as usize;
+        let mut frames = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id = reader.take(EntryId::LEN).expect("标识");
+            let nonce = reader.take(NONCE_LEN).expect("nonce");
+            let len = reader.u32_bare().expect("长度") as usize;
+            reader.take(len).expect("密文");
+            frames.push((
+                <[u8; EntryId::LEN]>::try_from(id).expect("长度"),
+                <[u8; NONCE_LEN]>::try_from(nonce).expect("长度"),
+                len,
+            ));
+        }
+        assert!(reader.is_empty(), "记录段之后还有多余字节");
+        frames
+    }
+
+    /// **线格式的字节排布必须与 `encoded_len` 一致。**
+    ///
+    /// 这是唯一一条真正读字节的测试。它存在的理由是具体的：`RECORD_HEADER_LEN` 曾经
+    /// 因为早先一版设计留下一个多余的 `+ 1`，而当时那条测试把同一个常量再加一遍，
+    /// 于是「断言」与「被断言的东西」是同一个错误，绿了很久。
+    #[test]
+    fn the_plaintext_record_framing_matches_encoded_len() {
+        let master = a_master_key();
+        let sender = EntryId::from_bytes([7; EntryId::LEN]);
+
+        // 三条条目 + 一条墓碑：两种记录都要出现在同一份载荷里。
+        let mut vault = Vault::new();
+        for seed in 0..3_u8 {
+            vault.insert(sample_entry(seed)).expect("随机源可用");
+        }
+        let doomed = vault.insert(sample_entry(9)).expect("随机源可用");
+        vault.remove(&doomed, Timestamp::from(1_700_000_100_u64));
+
+        let payload = Payload::from_vault(&master, sender, &vault).expect("打包");
+        let sealed = payload.seal(&master).expect("封装");
+
+        let plaintext = plaintext_of(&sealed, &master);
+        let frames = parse_record_frames(&plaintext);
+
+        assert_eq!(frames.len(), payload.len(), "记录数不一致");
+        assert_eq!(
+            frames.len(),
+            vault.len() + vault.tombstone_count(),
+            "载荷里的记录数应当等于条目数加墓碑数"
+        );
+
+        // 每一条的字节数必须与 `encoded_len` 报的一致。把 frame 还原成 `Record` 再比，
+        // 是为了走**同一个** `encoded_len`，而不是在测试里重算一遍公式。
+        for (id_bytes, nonce, len) in &frames {
+            let id = EntryId::from_bytes(*id_bytes);
+            let record = payload.records.get(&id).expect("载荷里应当有这条记录");
+            assert_eq!(record.nonce, *nonce, "nonce 对不上");
+            assert_eq!(record.ciphertext.len(), *len, "密文长度对不上");
+            assert_eq!(
+                record.encoded_len(),
+                EntryId::LEN + NONCE_LEN + 4 + len,
+                "encoded_len 与线格式的实际字节数不一致"
+            );
+        }
+
+        // 明文总长度 = 记录数 + 每条固定头 + 全部密文。这条把「常量算错」的误差按
+        // 记录数放大，因此比逐条断言更容易在回归时看出来。
+        let expected: usize = 4
+            + frames.len() * (EntryId::LEN + NONCE_LEN + 4)
+            + frames.iter().map(|f| f.2).sum::<usize>();
+        assert_eq!(plaintext.len(), expected, "明文总长度与线格式不一致");
+    }
+
+    /// 明文里**没有**种类字节。
+    ///
+    /// 这是刻意的设计（让攻击者看不出这次带了几条删除），而它也是 `RECORD_HEADER_LEN`
+    /// 那个多余 `+ 1` 的来源——所以值得有一条测试把它钉住，免得将来有人「顺手」
+    /// 把种类写回明文以简化解密逻辑。
+    #[test]
+    fn the_record_kind_is_not_in_the_plaintext() {
+        let master = a_master_key();
+        let sender = EntryId::from_bytes([7; EntryId::LEN]);
+
+        let mut vault = Vault::new();
+        let id = vault.insert(sample_entry(1)).expect("随机源可用");
+        vault.remove(&id, Timestamp::from(1_700_000_100_u64));
+
+        let payload = Payload::from_vault(&master, sender, &vault).expect("打包");
+        let sealed = payload.seal(&master).expect("封装");
+        let plaintext = plaintext_of(&sealed, &master);
+
+        // 明文 = 记录数(4) + 标识(16) + nonce(24) + 长度(4) + 墓碑密文。
+        // 距离记录数之后第 4 个字节就是标识，中间**没有**种类字节。
+        assert_eq!(
+            plaintext.len(),
+            4 + EntryId::LEN + NONCE_LEN + 4 + {
+                let frames = parse_record_frames(&plaintext);
+                frames[0].2
+            }
+        );
+        assert_eq!(
+            &plaintext[4..4 + EntryId::LEN],
+            id.as_bytes(),
+            "记录数之后紧接着的应当是标识，没有种类字节"
+        );
+
+        // 种类字节 0x82（SyncTombstone）不得出现在记录头的位置上。
+        assert_ne!(
+            RecordKind::SyncTombstone.as_byte(),
+            plaintext[3],
+            "第 4 字节是标识的一部分"
+        );
+    }
+
+    /// 域分离常量必须稳定：改掉它们会让所有既有的载荷打不开。
+    #[test]
+    fn the_domain_separation_constants_are_stable() {
+        assert_eq!(&HKDF_SALT_SYNC, b"Qualia2FA sync salt v1 (records)");
+        assert_eq!(HKDF_SALT_SYNC.len(), 32);
+        assert_eq!(MAGIC, b"Q2FASYNC");
+        assert_eq!(FORMAT_VERSION, 1);
+        // 载荷格式版本与文件格式版本是**两个**独立常量。
+        assert_ne!(FORMAT_VERSION, crate::vault::FORMAT_VERSION);
+    }
+
+    /// 载荷与保险库的密钥必须真的不同。
+    #[test]
+    fn the_sync_and_vault_keys_are_different() {
+        let master = a_master_key();
+        let record = derive_record_key(&master).expect("可派生");
+        let envelope = derive_envelope_key(&master).expect("可派生");
+        let vault_key = crate::vault::crypto::entry_key(&master).expect("可派生");
+
+        assert_ne!(record, envelope, "记录密钥与信封密钥撞上了");
+        assert_ne!(record, vault_key, "同步记录密钥与保险库条目密钥撞上了");
+        assert_ne!(envelope, vault_key, "信封密钥与保险库条目密钥撞上了");
+    }
+
+    /// 空保险库也能打包与拆包，且往返后仍是空的。
+    #[test]
+    fn an_empty_vault_roundtrips() {
+        let master = a_master_key();
+        let sender = EntryId::from_bytes([1; EntryId::LEN]);
+        let payload = Payload::from_vault(&master, sender, &Vault::new()).expect("打包");
+
+        assert!(payload.is_empty(), "空保险库不该产生记录");
+        assert_eq!(payload.len(), 0);
+
+        let sealed = payload.seal(&master).expect("封装");
+        let opened = Payload::open(&master, &sealed).expect("拆包");
+        assert!(opened.is_empty());
+        assert_eq!(opened.sender, sender);
+        assert_eq!(opened.sync_id, payload.sync_id);
+        assert!(
+            opened.open_records(&master).expect("逐条解密").is_empty(),
+            "空载荷不该解开出任何记录"
+        );
+    }
+
+    /// 每次打包都应当是一个**新的**载荷标识，否则重放防护无处落脚。
+    #[test]
+    fn every_payload_gets_a_fresh_sync_id() {
+        let master = a_master_key();
+        let sender = EntryId::from_bytes([1; EntryId::LEN]);
+        let mut vault = Vault::new();
+        vault.insert(sample_entry(1)).expect("随机源可用");
+
+        let first = Payload::from_vault(&master, sender, &vault).expect("打包");
+        let second = Payload::from_vault(&master, sender, &vault).expect("打包");
+        assert_ne!(
+            first.sync_id, second.sync_id,
+            "两次打包拿到了同一个载荷标识"
+        );
+        assert_eq!(first.len(), second.len(), "两次打包的记录数应当相同");
+    }
+
+    /// 同一份保险库打包两次的密文必须不同（nonce 每次随机）。
+    ///
+    /// 若相同，说明 nonce 被复用了——那是 XChaCha20-Poly1305 最严重的一类误用，
+    /// 而它在功能测试里完全看不出来（一切照常工作）。
+    #[test]
+    fn sealing_the_same_vault_twice_produces_different_bytes() {
+        let master = a_master_key();
+        let sender = EntryId::from_bytes([1; EntryId::LEN]);
+        let mut vault = Vault::new();
+        vault.insert(sample_entry(1)).expect("随机源可用");
+
+        let first = Payload::from_vault(&master, sender, &vault).expect("打包");
+        let second = Payload::from_vault(&master, sender, &vault).expect("打包");
+
+        let a = first.seal(&master).expect("封装");
+        let b = second.seal(&master).expect("封装");
+        assert_ne!(a, b, "两次封装的字节完全相同，nonce 很可能被复用了");
+
+        // 记录密钥相同，因此内层密文也必须因 nonce 不同而不同。
+        let ra = plaintext_of(&a, &master);
+        let rb = plaintext_of(&b, &master);
+        let fa = parse_record_frames(&ra);
+        let fb = parse_record_frames(&rb);
+        assert_eq!(fa.len(), fb.len());
+        for (x, y) in fa.iter().zip(fb.iter()) {
+            assert_eq!(x.0, y.0, "同一条目");
+            assert_ne!(x.1, y.1, "同一条记录的 nonce 被复用了");
+        }
+    }
+
+    /// 保险库里同时有活条目与它的墓碑时，**只**发墓碑。
+    ///
+    /// # 这个状态是怎么出现的
+    ///
+    /// **不是** [`Vault::remove`] 造成的：它按设计既删条目也留墓碑，因此不会留下
+    /// 「条目与墓碑并存」。并存只来自同步本身——[`crate::vault::Vault::record_tombstone`]
+    /// 的文档写得很明确：「若该 ID 的活条目存在，**不会**被删除，调用方需要自己决定
+    /// D2 的裁决结果」。也就是说，对端发来墓碑而本机不愿意自动采纳时，就会停在这个
+    /// 状态上等用户裁决。
+    ///
+    /// 而这个状态是**真实且常见**的：两台设备各有一条同名同 ID 的条目、其中一台删了，
+    /// 另一台在裁决界面弹出期间就是这个样子。广播那份活条目会让每次同步都在对端触发
+    /// 同一个冲突，用户每同步一次就要看一次同样的裁决界面。
+    #[test]
+    fn an_entry_with_a_tombstone_is_not_sent() {
+        let master = a_master_key();
+        let sender = EntryId::from_bytes([1; EntryId::LEN]);
+
+        let mut vault = Vault::new();
+        let kept = vault.insert(sample_entry(1)).expect("随机源可用");
+        let disputed = vault.insert(sample_entry(2)).expect("随机源可用");
+
+        // 对端说这条被删了，本机先记下来但**不**采纳——裁决未完成。
+        vault.record_tombstone(crate::vault::Tombstone {
+            entry_id: disputed,
+            deleted_at: Timestamp::from(1_700_000_100_u64),
+            deleted_by: None,
+        });
+
+        // 前提：条目与墓碑并存。这才是本测试要覆盖的状态。
+        assert_eq!(vault.len(), 2, "前提不成立：两条活条目都应当还在");
+        assert_eq!(vault.tombstone_count(), 1, "前提不成立：应当有墓碑");
+        assert!(
+            vault.get(&disputed).is_some(),
+            "前提不成立：`record_tombstone` 不该删掉活条目"
+        );
+
+        let payload = Payload::from_vault(&master, sender, &vault).expect("打包");
+        assert_eq!(payload.len(), 2, "应当只有「保留的条目 + 墓碑」两条记录");
+        assert!(payload.records.get(&kept).is_some(), "保留的条目应当被发出");
+
+        // # 为什么不能靠 `records.get(&disputed).is_none()` 判断
+        //
+        // `RecordSet` 是按 `entry_id` 索引的，**不区分记录种类**——因此那条墓碑的
+        // 记录用的正是 `disputed` 这个 ID。`get(&disputed)` 会返回 `Some`，而那是
+        // 墓碑，不是被发出去了的活条目。（第一版测试就是这么写的，于是它错了。）
+        //
+        // 判断「发出去的是条目还是墓碑」只能靠逐条解开看种类。
+        let records = opened_kinds(&payload, &master);
+        let mut entries = Vec::new();
+        let mut tombstones = Vec::new();
+        for (id, is_entry) in records {
+            if is_entry {
+                entries.push(id);
+            } else {
+                tombstones.push(id);
+            }
+        }
+        assert_eq!(
+            entries,
+            vec![kept],
+            "应当只发出一条活条目，而且是保留的那条"
+        );
+        assert_eq!(tombstones, vec![disputed], "应当只发出一条墓碑");
+        assert!(
+            !entries.contains(&disputed),
+            "有墓碑的活条目被当成条目发出了"
+        );
+    }
+
+    /// 记录数上限在**循环之外**检查。
+    ///
+    /// 否则一个声称有 40 亿条记录的载荷能让我们先分配一个 40 亿项的容器再发现不对。
+    /// 这里只能做结构性验证：构造一份声称超限的明文，确认它被拒绝而不是被分配。
+    #[test]
+    fn an_absurd_record_count_is_rejected_before_allocating() {
+        let master = a_master_key();
+        // 明文 = 一个声称有一条记录的载荷，但把记录数改成 u32::MAX。
+        let mut vault = Vault::new();
+        vault.insert(sample_entry(1)).expect("随机源可用");
+        let payload = Payload::from_vault(&master, EntryId::from_bytes([1; EntryId::LEN]), &vault)
+            .expect("打包");
+
+        // 手工构造：记录数写成 u32::MAX，后面附上真实的记录字节（不压缩，直接进
+        // 底层 AEAD——`decompress` 对未压缩输入会失败，因此这里改走 compress 之后
+        // 再改字节不可行）。改为直接验证常量与解析顺序：构造一段「记录数超限」的
+        // 明文，用 `compress` 压一下再封进信封。
+        let mut plaintext = u32::MAX.to_be_bytes().to_vec();
+        plaintext.extend_from_slice(&[0_u8; 64]);
+        let compressed = compress::compress(&plaintext).expect("可压缩");
+
+        let envelope_key = derive_envelope_key(&master).expect("可派生");
+        let aad = header_aad(FORMAT_VERSION, &payload.sync_id, &payload.sender);
+        let (nonce, ciphertext) =
+            crate::vault::crypto::seal_bytes(&envelope_key, &aad, &compressed).expect("可加密");
+
+        let mut sealed = Vec::new();
+        sealed.extend_from_slice(MAGIC);
+        sealed.push(FORMAT_VERSION);
+        sealed.extend_from_slice(&payload.sync_id);
+        sealed.extend_from_slice(payload.sender.as_bytes());
+        sealed.extend_from_slice(&nonce);
+        sealed.extend_from_slice(&ciphertext);
+
+        let result = Payload::open(&master, &sealed);
+        assert!(
+            matches!(result, Err(Error::SyncTooManyRecords { .. })),
+            "超限的记录数未被拒绝，实际 {result:?}"
+        );
+    }
+
+    /// 主密钥的字节要走公开 API 拿，避免测试自己拼。
+    #[test]
+    fn the_master_key_roundtrips_through_bytes() {
+        let master = a_master_key();
+        let copy = MasterKey::from_bytes(master_key_to_bytes(&master)).expect("长度正确");
+        assert_eq!(
+            derive_record_key(&master).expect("可派生"),
+            derive_record_key(&copy).expect("可派生"),
+            "同一把主密钥的副本应当派生出同一把记录密钥"
+        );
+    }
+}

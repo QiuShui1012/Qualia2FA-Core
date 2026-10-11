@@ -563,15 +563,24 @@ mod tests {
     }
 
     /// 记录长度是「固定头 + 密文」，用于让上层预估载荷大小。
+    ///
+    /// # 这条测试**只**覆盖 `record` 这一侧
+    ///
+    /// 它断言的是「同一条记录自己的长度 = 常量 + 自己的密文长度」，那是个恒等式，
+    /// 抓不到常量本身算错。也就是说：`RECORD_HEADER_LEN` 里多了一个字节，这条测试
+    /// 照样绿——它确实绿了很久。
+    ///
+    /// 真正盯住线格式的是 `sync` 那边的
+    /// `the_plaintext_record_framing_matches_encoded_len`：它把封装好的载荷拆开，
+    /// 按字节读真实明文，与 `encoded_len` 对账。这里保留这条是为了覆盖
+    /// 「`encoded_len` 确实把 nonce 与密文都算进去了」这个下限。
     #[test]
     fn encoded_len_matches_the_wire_format() {
         let id = EntryId::from_bytes([14; EntryId::LEN]);
         let record = seal_entry(&key(), &id, &sample_entry()).expect("可加密");
-        // 固定头 = 种类 1 + 标识 16 + nonce 24 + 长度 4；密文已含认证标签。
-        assert_eq!(
-            record.encoded_len(),
-            1 + 16 + 24 + 4 + record.ciphertext.len()
-        );
+        // 固定头 = 标识 16 + nonce 24 + 长度 4；密文已含认证标签。**没有**种类字节：
+        // 种类在内层 AAD 里，不在明文里。
+        assert_eq!(record.encoded_len(), 16 + 24 + 4 + record.ciphertext.len());
     }
 
     #[test]
