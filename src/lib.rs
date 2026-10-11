@@ -54,6 +54,7 @@
 #![warn(clippy::missing_docs_in_private_items)]
 
 pub mod base32;
+pub mod device;
 mod error;
 pub mod otp;
 mod secret;
@@ -61,6 +62,14 @@ pub mod uri;
 pub mod vault;
 
 pub use error::{Error, Result};
+
+/// 设备身份的公开类型。
+///
+/// `DevicePublicKey` 与 `DeviceSignature` **不是秘密**——它们本来就要印在二维码
+/// 上、写进日志、在设备之间传播，所以在这里与秘密类型分开导出，让「哪些类型
+/// 可以随便打印」在导入列表里就看得出来。
+pub use device::{DeviceId, DevicePublicKey, DeviceSignature};
+
 pub use secret::{
     ExposeSecret, ExposeSecretMut, SecretBox, SecretBytes, SecretSlice, SecretString,
 };

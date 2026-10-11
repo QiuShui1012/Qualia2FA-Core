@@ -51,6 +51,25 @@ hkdf = "0.13"
 
 hmac = "0.13"
 
+# ── 设备身份（ECDSA P-256 验签） ──────────────────────────────────────────
+# 只用于**验签**，不用于签名：设备私钥住在平台硬件里，签名由
+# `qualia2fa-keystore` 发起。验证则必须能被任何设备执行，包括那些自己根本不
+# 持有硬件密钥的设备，所以它属于核心库。
+#
+# 版本必须留在 0.14。它的 `ecdsa` feature 依赖 `sha2 ^0.11`，与本库**同代**，
+# 因而不产生第二份 SHA-2。`p256 0.13`（例如 `hardware-enclave` 用的那个）依赖
+# `sha2 ^0.10`，一旦混用，二进制里就会出现两份 SHA-2 与两套互不兼容的 P-256
+# 类型。那不只是体积问题：两份实现意味着「常量时间」这类性质要在两处分别论证，
+# 而我们无法对其中任何一处给出保证。
+#
+# 关掉 default features 再显式开 `ecdsa`：默认集里的 `pem` 会拉进 `pkcs8` 与
+# `elliptic-curve/pem`，而我们的线格式只有 SEC1 未压缩点与原始 r||s 两种，
+# 都不需要 PEM。
+#
+# 曲线选择见 `src/device.rs` 的模块文档：P-256 是两个移动平台上**唯一**能进
+# 硬件的签名算法，这是强约束而非偏好。
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
+
 # 秘密材料容器（`SecretBox` / `SecretSlice` / `SecretString` / `ExposeSecret`）。
 # 依赖审计（人工逐项核过，cargo-deny 不做依赖必要性判断）：
 #   - 唯一必需依赖是 `zeroize ^1.6`，与本 crate 原先所用版本同一 major，
