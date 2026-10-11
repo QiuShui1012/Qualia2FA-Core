@@ -283,6 +283,37 @@ impl Vault {
         Ok(())
     }
 
+    /// 用新内容替换一条**已存在**的条目，标识不变，且**不留下墓碑**。
+    ///
+    /// # 为什么必须有这个入口，而不能用「删掉再插入」
+    ///
+    /// 标识是设备之间谈论「同一条条目」的唯一依据。若修改走「删掉 + 用新标识插入」
+    /// 的路子，另一台设备在同步时会把它读成「删了一条、又加了一条」，于是那条条目
+    /// 的历史与墓碑全部错位——用户看到的是改名之后条目变成了两条，或者原来的被删掉。
+    ///
+    /// 走「先用 [`Vault::remove`] 再 [`Vault::insert_with_id`]」也不行：`remove`
+    /// 会**按设计**留下墓碑，而一次改名不是删除。墓碑一旦留下就会被同步出去，另一
+    /// 端可能据此把条目真的删掉。
+    ///
+    /// # 调用方的责任
+    ///
+    /// 创建时间（`created_at`）由调用方决定保不保留。经验做法是**保留**：它记录的
+    /// 是「用户什么时候把这条加进来的」，改一次名字就变掉会让界面上的排序跳位。
+    ///
+    /// # 错误
+    ///
+    /// 该 ID 没有活条目时返回 [`Error::VaultEntryNotFound`]。这是拒绝而不是退化成
+    /// 「新增」：调用方以为自己在改一条已有的条目（例如用户在编辑界面点了保存），
+    /// 而它其实已经不在了（另一端删掉了），此时应当提示用户刷新，而不是凭空把它
+    /// 加回去。
+    pub fn replace(&mut self, id: EntryId, entry: VaultEntry) -> Result<()> {
+        if !self.entries.contains_key(&id) {
+            return Err(Error::VaultEntryNotFound);
+        }
+        self.entries.insert(id, entry);
+        Ok(())
+    }
+
     /// 删除一条条目，留下墓碑。
     ///
     /// 返回被删掉的条目（若存在），以便调用方实现撤销。
@@ -1238,6 +1269,45 @@ mod tests {
         // `insert_with_id` 失败后不得留下半个条目。
         assert_eq!(vault.len(), 1);
         assert_eq!(vault.get(&id).expect("条目存在").name, "a");
+    }
+
+    /// 用 `replace` 改名：标识不变、不留墓碑、创建时间由调用方保住。
+    ///
+    /// 这三条正是「删掉再插入」做不到的，而任何一条做不到都会被同步解读成
+    /// 「这条被删了」或「又来了一条新的」。
+    #[test]
+    fn replace_keeps_the_id_and_leaves_no_tombstone() {
+        let mut vault = Vault::new();
+        let id = vault.insert(sample_entry("original")).expect("可插入");
+        let created = vault.get(&id).expect("条目存在").created_at;
+
+        let mut renamed = sample_entry("renamed");
+        renamed.created_at = created;
+        vault.replace(id, renamed).expect("替换应当成功");
+
+        let entry = vault.get(&id).expect("标识必须仍然指向该条目");
+        assert_eq!(entry.name, "renamed");
+        assert_eq!(entry.created_at, created, "创建时间应当被保留");
+        assert_eq!(vault.len(), 1, "替换不该多出一条");
+        assert_eq!(
+            vault.tombstone_count(),
+            0,
+            "改名不是删除，不该留下墓碑——墓碑会被同步出去，另一端可能据此真的删掉条目"
+        );
+    }
+
+    /// 替换一条不存在的条目必须报错，而不是悄悄变成「新增」。
+    ///
+    /// 退化成新增的后果是：用户在编辑界面点了保存，而那条已经在另一端被删掉了，
+    /// 于是它又「复活」回两台设备上——一次本该提示用户刷新列表的操作变成了
+    /// 数据回流。
+    #[test]
+    fn replace_of_a_missing_entry_is_rejected() {
+        let mut vault = Vault::new();
+        let missing = EntryId::from_bytes([0x5A; EntryId::LEN]);
+        let err = vault.replace(missing, sample_entry("ghost"));
+        assert!(matches!(err, Err(Error::VaultEntryNotFound)));
+        assert!(vault.is_empty(), "失败不得凭空插入条目");
     }
 
     /// 空保险库的往返。
