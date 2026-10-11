@@ -27,7 +27,7 @@ Qualia2FA 的核心库。承载双因素认证（2FA）的全部核心逻辑：T
 
 ```toml
 [dependencies]
-qualia2fa-core = { git = "https://github.com/QiuShui1012/Qualia2FA-Core" }
+qualia2fa-core = { git = "https://github.com/Qualia2FA/Qualia2FA-Core" }
 ```
 
 计算验证码：
@@ -170,7 +170,7 @@ Unix 秒传入。** 这不是洁癖：只有时间作为参数传入，RFC 6238 
 作为 submodule 引入：
 
 ```powershell
-git submodule add https://github.com/QiuShui1012/Qualia2FA-Core core
+git submodule add https://github.com/Qualia2FA/Qualia2FA-Core core
 git submodule update --init --recursive
 ```
 
@@ -183,7 +183,7 @@ qualia2fa-core = { path = "core" }
 
 > ⚠️ 若你用 **Gobley + uniffi** 做 Kotlin 绑定，注意 Gobley 当前强制
 > `uniffi = "0.29.4"`。**不要把 uniffi 加进本库**——绑定应放在宿主侧或独立的
-> FFI crate（例如 [`Qualia2FA-FFI`](https://github.com/QiuShui1012/Qualia2FA-FFI)），
+> FFI crate（例如 [`Qualia2FA-FFI`](https://github.com/Qualia2FA/Qualia2FA-FFI)），
 > 以保持本库的依赖面干净、且不受绑定生成器的版本锁定牵连。
 
 ## 参与贡献

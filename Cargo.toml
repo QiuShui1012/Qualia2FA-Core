@@ -12,7 +12,7 @@ license = "LGPL-3.0-or-later"
 
 # 真实仓库地址。本仓库预期被 UI 端以 git submodule 引入，
 # `cargo doc` 与未来的 `cargo publish`（当前 `publish = false`）都要用它。
-repository = "https://github.com/QiuShui1012/Qualia2FA-Core"
+repository = "https://github.com/Qualia2FA/Qualia2FA-Core"
 readme = "README.md"
 keywords = ["2fa", "totp", "hotp", "otp", "authentication"]
 categories = ["authentication", "cryptography"]
