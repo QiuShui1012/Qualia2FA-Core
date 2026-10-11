@@ -168,7 +168,70 @@ pub struct Entry {
     pub updated_at: Timestamp,
 }
 
+impl PartialEq for Entry {
+    /// 逐字段比较，其中秘密那一项走恒定时间比较。
+    ///
+    /// # 顺序是刻意的
+    ///
+    /// 先比**廉价且几乎必然不同**的字段（名字、账号、时间戳），最后才比种子。种子那一
+    /// 项是恒定时间的（见 [`OtpSecret`](crate::otp::OtpSecret) 的 `PartialEq`），意味着
+    /// 它总是比较全部字节；放在最后，那些名字就不同的条目对在第一个字段就被排除了，
+    /// 不会付出那个代价。
+    ///
+    /// 这不是「优化」而是让恒定时间比较的代价可控：同步的合并循环要对成千上万对条目
+    /// 做这个判断，而其中绝大多数连名字都不一样。
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.issuer == other.issuer
+            && self.account == other.account
+            && self.note == other.note
+            && self.created_at == other.created_at
+            && self.updated_at == other.updated_at
+            && self.algorithm == other.algorithm
+            && self.digits == other.digits
+            && self.period == other.period
+            && self.counter == other.counter
+            && self.secret == other.secret
+    }
+}
+
+impl Eq for Entry {}
+
 impl Entry {
+    /// 复制一份内容完全相同的条目。
+    ///
+    /// # 为什么需要它，而 `Clone` 又是刻意不给的
+    ///
+    /// [`OtpSecret`](crate::otp::OtpSecret) 刻意不实现 `Clone`，理由是「克隆会让同一
+    /// 密钥在内存中多存一份、各自独立擦除，增加泄露面」。那个理由在**一般**情况下
+    /// 成立，但同步有两个绕不开的需要：
+    ///
+    /// 1. **把对端的版本与本地版本同时呈现给裁决界面。** 冲突的本质就是「有两个不同
+    ///    的版本」，只给一个就没法裁决。
+    /// 2. **把对端那一版原样收进本地保险库。** 接收到的条目要落盘，而它同时也被记在
+    ///    冲突记录里。
+    ///
+    /// 因此这里提供一个**显式**的复制入口，而不是给 `Entry` 派生 `Clone`：调用点必须
+    /// 写下 `duplicate()`，从而在代码审查中可见「这里又复制了一份密钥材料」。派生
+    /// `Clone` 会让复制在无数地方静默发生。
+    ///
+    /// # 实现
+    ///
+    /// 走一遍编解码往返，而不是逐字段复制。这样**新增字段时不需要记得改这里**——逐字段
+    /// 复制的版本漏掉一个新字段，症状是「同步之后新字段全空了」，一个很容易漏过测试的
+    /// 静默数据损失。代价是一次编解码，而复制发生在用户手动触发的同步路径上，不在任何
+    /// 热路径里。
+    ///
+    /// # 错误
+    ///
+    /// 只有当条目本身违反格式约束时才会失败（例如某个字段超过
+    /// [`Entry::MAX_FIELD_LEN`]）。能构造出这样一个条目就已经是 bug 了。
+    pub fn duplicate(&self) -> Result<Self> {
+        // `super` 是 `vault` 模块，编解码函数是那里的私有项。
+        let encoded = super::encode_entry(self)?;
+        super::decode_entry(&encoded)
+    }
+
     /// 索引上限：单个可变长字段的最大字节数。
     ///
     /// # 为什么要有上限

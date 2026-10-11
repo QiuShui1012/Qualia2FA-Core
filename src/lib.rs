@@ -62,6 +62,7 @@ pub mod otp;
 pub mod pairing;
 pub mod recovery;
 mod secret;
+pub mod sync;
 pub mod uri;
 pub mod vault;
 

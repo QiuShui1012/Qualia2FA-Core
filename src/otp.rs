@@ -250,7 +250,6 @@ impl OtpSecret {
     pub(crate) fn expose(&self) -> &[u8] {
         self.bytes.expose_secret()
     }
-
     /// 把种子导出为 Base32 字符串（**无填充**大写形式）。
     ///
     /// 供 URI 序列化与二维码生成使用。之所以提供这个方法而不是公开 `expose`，
@@ -275,6 +274,31 @@ impl core::fmt::Debug for OtpSecret {
             .finish()
     }
 }
+
+impl PartialEq for OtpSecret {
+    /// 恒定时间比较种子字节。
+    ///
+    /// # 为什么不是派生出来的比较
+    ///
+    /// 派生的 `PartialEq` 会在第一个不同的字节处提前返回，于是比较耗时泄露了「猜对
+    /// 了前几个字节」。种子是秘密，而这个比较会出现在认证路径上（判断两个条目是否
+    /// 是同一条），因此必须走 [`subtle::ConstantTimeEq`]。
+    ///
+    /// # 代价
+    ///
+    /// 恒定时间意味着**总是**比较全部字节，即使第一个字节就不同。同步的合并循环要对
+    /// 成千上万对条目做这个判断，因此 [`crate::vault::Entry`] 的 `PartialEq` 刻意先比
+    /// 那些廉价的字段（名字、账号、时间戳），只有它们全部相同才走到这里——名字不同的
+    /// 一对条目在第一个字段就被排除了，不会付出恒定时间的代价。
+    fn eq(&self, other: &Self) -> bool {
+        use subtle::ConstantTimeEq as _;
+        // 长度不同时 `ct_eq` 直接返回 `false`——长度本身不是秘密（它明文存在于
+        // 密文长度里），因此这条早退不泄露任何东西。
+        self.expose().ct_eq(other.expose()).into()
+    }
+}
+
+impl Eq for OtpSecret {}
 
 /// 返回该算法建议的最小种子长度（字节），供 UI 告警使用。
 #[must_use]

@@ -78,7 +78,7 @@
 //! 永久无法解密**，这是「无中心、无账号密码」设计的必然代价。
 
 mod codec;
-mod crypto;
+pub(crate) mod crypto;
 mod entry;
 
 pub use crypto::{
@@ -86,13 +86,18 @@ pub use crypto::{
     verify_key_check,
 };
 pub use entry::{Entry, EntryId, Timestamp, entry_from_parsed_uri};
+// `Tombstone` 必须导出：`Vault::record_tombstone`、`Vault::get_tombstone` 与
+// `Vault::iter_tombstones` 都是公开的，它们的参数与返回值里都有这个类型。不导出会让
+// 「能调用但无法命名类型」成为一种荒谬的 API 状态——调用方拿到了 `get_tombstone` 的
+// 返回值，却写不出它的类型名。
+
+pub(crate) use crypto::RecordKind;
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::{Error, Result, otp};
 use codec::{Reader, put_bytes, put_u32};
-use crypto::RecordKind;
 use entry::Entry as VaultEntry;
 
 /// 文件魔数。8 字节，末尾的 NUL 让它在十六进制编辑器里就能认出来。
@@ -607,6 +612,13 @@ impl VaultFile {
                     let tombstone = decode_tombstone(id, &plaintext)?;
                     vault.record_tombstone(tombstone);
                 }
+                // 同步的两个种类**到不了这里**：上面那行 `RecordKind::from_byte` 不认
+                // 它们的取值，因此 `kind` 永远不可能是它们。写出来而不是用通配 `_`，
+                // 是为了让「给 `RecordKind` 加了一种记录」这件事**在这里编译失败**，
+                // 而不是静默走进一个 `unreachable!`。
+                RecordKind::SyncEntry | RecordKind::SyncTombstone => {
+                    return Err(Error::VaultUnknownRecordKind { value: kind_byte });
+                }
             }
         }
 
@@ -666,7 +678,7 @@ fn write_record(
 ///
 /// 统一格式后，「跳过未知节点」只有一条路径：读标签、读 u32 长度、跳过那么多
 /// 字节。这条路径被 fuzz 目标 `vault_parse` 反复敲打。
-fn encode_entry(entry: &VaultEntry) -> Result<Vec<u8>> {
+pub(crate) fn encode_entry(entry: &VaultEntry) -> Result<Vec<u8>> {
     let mut out = Vec::new();
 
     put_node(&mut out, tag::NAME, entry.name.as_bytes());
@@ -708,7 +720,7 @@ fn put_node(out: &mut Vec<u8>, tag: u8, payload: &[u8]) {
 /// 序列化一条墓碑的明文。
 ///
 /// 与条目用同一套节点编码，因而同样支持「跳过未知节点」。
-fn encode_tombstone(tombstone: &Tombstone) -> Vec<u8> {
+pub(crate) fn encode_tombstone(tombstone: &Tombstone) -> Vec<u8> {
     let mut out = Vec::new();
     put_node(
         &mut out,
@@ -722,7 +734,7 @@ fn encode_tombstone(tombstone: &Tombstone) -> Vec<u8> {
 }
 
 /// 解析一条条目的明文。
-fn decode_entry(data: &[u8]) -> Result<VaultEntry> {
+pub(crate) fn decode_entry(data: &[u8]) -> Result<VaultEntry> {
     /// 解析期间累积的字段。用 `Option` 逐个填写，最后统一检查必填项。
     #[derive(Default)]
     struct Fields {
@@ -839,7 +851,7 @@ fn decode_entry(data: &[u8]) -> Result<VaultEntry> {
 }
 
 /// 解析一条墓碑的明文。
-fn decode_tombstone(id: EntryId, data: &[u8]) -> Result<Tombstone> {
+pub(crate) fn decode_tombstone(id: EntryId, data: &[u8]) -> Result<Tombstone> {
     let mut reader = Reader::new(data);
     let mut deleted_at = None;
     let mut deleted_by = None;

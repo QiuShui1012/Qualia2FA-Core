@@ -60,3 +60,13 @@ path = "fuzz_targets/login_handshake.rs"
 test = false
 doc = false
 bench = false
+
+# 攻击者可控输入面：同步载荷。它比保险库文件更宽——**同一个局域网里任何一台设备**
+# 都能主动把字节送过来，不需要用户做任何事。目标同时覆盖外层信封、解压上限与解压后
+# 的变长明文解析。
+[[bin]]
+name = "sync_payload"
+path = "fuzz_targets/sync_payload.rs"
+test = false
+doc = false
+bench = false

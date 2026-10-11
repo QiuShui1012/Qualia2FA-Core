@@ -182,14 +182,109 @@ const HKDF_SALT: [u8; 32] = [0_u8; 32];
 ///
 /// 每次调用都重新派生而不缓存：HKDF 的代价是两次 HMAC-SHA256，在 30 秒一次的
 /// 验证码场景下完全可以忽略，而缓存意味着子密钥要在内存里多留一段时间。
-fn entry_key(master: &MasterKey) -> Result<[u8; 32]> {
-    let hkdf = Hkdf::<Sha256>::new(Some(&HKDF_SALT), master.expose());
+///
+/// `pub(crate)` 而非私有：同步层需要**验证**它与自己那把不同（域分离的核心断言，见
+/// `crate::sync::record` 的测试）。那个断言只能拿这里给出的值来做——如果同步层自己
+/// 抄一遍保险库的派生，它验证的就只是「我抄的那份与我自己不同」，毫无意义。
+pub(crate) fn entry_key(master: &MasterKey) -> Result<[u8; 32]> {
+    derive_key(master, HKDF_INFO_ENTRY)
+}
+
+/// 用一段上下文串从主密钥派生 32 字节子密钥。
+///
+/// # 域分离全靠 `info`
+///
+/// 同一个主密钥派生出的每把子密钥**必须**有不同的 `info`。两处共用一串的后果不是
+/// 「稍微弱一点」而是彻底的域混淆：一个域里合法的密文在另一个域里也合法，于是
+/// 「把同步载荷里的密文塞进保险库文件」这类搬运会通过认证。
+///
+/// 单独抽出来是因为 [`crate::sync`] 也要派生自己的密钥，而那里的派生规则必须与
+/// 这里**同源**——两处各自手写一遍 HKDF 调用，迟早会有一处的 salt 或输出长度
+/// 悄悄不同，而那种错误在功能上完全看不出来（两边各用各的密钥，各自都能解自己的
+/// 密文），只在互操作时炸。
+pub(crate) fn derive_key(master: &MasterKey, info: &[u8]) -> Result<[u8; 32]> {
+    derive_key_with_salt(master, &HKDF_SALT, info)
+}
+
+/// 用指定的 salt 与上下文串从主密钥派生 32 字节子密钥。
+///
+/// # 为什么 salt 也要能指定
+///
+/// [`crate::sync`] 的记录与保险库文件的记录**可能拥有逐字节相同的 AAD**——两者都是
+/// 「一个种类字节 + 一个 16 字节标识 + 一个版本字节」。AAD 相同就意味着两个域的密文
+/// 可以互换，而那是真实的攻击：把一份同步载荷的内容当成保险库文件喂进来，AEAD 会
+/// 认证通过。
+///
+/// 靠「把种类字节排得不一样」来防是脆弱的——它依赖两处实现永远保持这个巧合。用不同
+/// 的 salt 则是**结构性**的：两个域的子密钥在 HKDF-Extract 阶段就分开了，与 AAD 怎么
+/// 排无关。
+///
+/// # 错误
+///
+/// 只有输出长度超限（255 × HashLen）才会失败，32 字节不可能触发；仍然返回 `Result`
+/// 以遵守「库内不 panic」的约定。
+pub(crate) fn derive_key_with_salt(
+    master: &MasterKey,
+    salt: &[u8],
+    info: &[u8],
+) -> Result<[u8; 32]> {
+    let hkdf = Hkdf::<Sha256>::new(Some(salt), master.expose());
     let mut key = [0_u8; 32];
-    // `expand` 只在输出长度超过 255 * HashLen 时失败，32 字节不可能触发。
-    // 仍然不 `unwrap`：库内「任何输入都不得 panic」的约定不允许例外。
-    hkdf.expand(HKDF_INFO_ENTRY, &mut key)
+    hkdf.expand(info, &mut key)
         .map_err(|_| Error::VaultDecryptionFailed)?;
     Ok(key)
+}
+
+/// 内层同步记录用的 HKDF 上下文串。
+///
+/// 与保险库用的 [`HKDF_INFO_ENTRY`] 不同。**两处刻意用同一个字符串**——域分离由
+/// salt 承担（见 [`derive_key_with_salt`]），info 描述的是「这是什么用途的记录」，
+/// 而「条目加密」这个用途在两个域里是同一件事。这样命名比「vault entry」/「sync
+/// entry」两个近义串更难写错：写错一个字符的后果是两个域都用同一把密钥，而字符串
+/// 只差一个词时没人会注意到。
+pub(crate) const HKDF_INFO_SYNC_RECORD: &[u8] = HKDF_INFO_ENTRY;
+
+/// 外层信封用的 HKDF 上下文串。
+pub(crate) const HKDF_INFO_SYNC_ENVELOPE: &[u8] = b"Qualia2FA sync v1 envelope";
+
+/// 用一个已派生好的密钥加密一段**不参与记录格式**的字节（同步载荷的信封层）。
+///
+/// 与 [`seal_with_key`] 的区别：那个把「种类 + 条目 ID + 版本」绑进 AAD，这个把调用方
+/// 给的任意 AAD 原样绑进去。信封的 AAD 是整个明文头，不是记录的三元组。
+///
+/// # 错误
+///
+/// 只可能因随机源不可用而失败。
+pub(crate) fn seal_bytes(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<(Nonce, Vec<u8>)> {
+    let cipher = XChaCha20Poly1305::new(&Key::from(*key));
+    let nonce = random_nonce()?;
+    let mut buffer = plaintext.to_vec();
+    cipher
+        .encrypt_in_place(&XNonce::from(nonce), aad, &mut buffer)
+        .map_err(|_| Error::VaultDecryptionFailed)?;
+    Ok((nonce, buffer))
+}
+
+/// [`seal_bytes`] 的逆操作。
+///
+/// # 错误
+///
+/// 认证失败一律返回 [`Error::VaultDecryptionFailed`]，不区分原因。这**不是**同步层
+/// 暴露给调用方的错误——[`crate::sync::Payload::open`] 会把它翻译成
+/// [`Error::SyncAuthenticationFailed`]，因为端侧对「文件打不开」与「这次同步不可信」
+/// 的处置完全不同。
+pub(crate) fn open_bytes(
+    key: &[u8; 32],
+    aad: &[u8],
+    nonce: &Nonce,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>> {
+    let cipher = XChaCha20Poly1305::new(&Key::from(*key));
+    let mut buffer = ciphertext.to_vec();
+    cipher
+        .decrypt_in_place(&XNonce::from(*nonce), aad, &mut buffer)
+        .map_err(|_| Error::VaultDecryptionFailed)?;
+    Ok(buffer)
 }
 
 /// 主密钥检查值的字节长度。
@@ -270,31 +365,80 @@ pub fn verify_key_check(master: &MasterKey, stored: &[u8]) -> Result<()> {
 /// 「活条目」与「墓碑」用的是同一个密钥、同一种 AEAD。若种类不进 AAD，
 /// 攻击者可以把一条墓碑记录的密文搬到活条目的位置，让一个条目凭空消失
 /// （或反过来，把已删除的条目复活）。两者都是合法密文，AEAD 不会察觉。
+///
+/// # 同步记录的种类在这里，但不在保险库文件的取值范围内
+///
+/// 前四个种类是**两套**用途：`Entry`/`Tombstone` 用于保险库文件，
+/// `SyncEntry`/`SyncTombstone` 用于同步载荷。它们共用一把子密钥，靠种类字节与
+/// 格式版本两层分开。
+///
+/// 取值刻意落在高半区（`0x80` 起），与文件里会出现的值（`0x01`/`0x02`）隔开一大段：
+/// 将来若给文件格式加种类，会从低半区往上排，不会撞上同步那几个。更重要的是
+/// [`RecordKind::from_byte`] **不认**同步种类——保险库解析器因此会把一条混进文件的
+/// 同步记录报成 [`crate::Error::VaultUnknownRecordKind`]，而不是当成合法记录收下。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecordKind {
-    /// 活条目。
+    /// 活条目（保险库文件）。
     Entry,
-    /// 墓碑（删除记录）。
+    /// 墓碑（保险库文件）。
     Tombstone,
+    /// 活条目，出现在**同步载荷**里。
+    SyncEntry,
+    /// 墓碑，出现在**同步载荷**里。
+    SyncTombstone,
 }
 
 impl RecordKind {
     /// 写入文件与参与 AAD 的字节值。
+    ///
+    /// **这个值是对外契约**：它同时进 AAD，改动会让所有既有密文解不开。
     pub(crate) const fn as_byte(self) -> u8 {
         match self {
             Self::Entry => 0x01,
             Self::Tombstone => 0x02,
+            Self::SyncEntry => 0x81,
+            Self::SyncTombstone => 0x82,
         }
     }
 
-    /// 从文件读到的字节还原种类。
+    /// 从**保险库文件**里读到的字节还原种类。
     ///
     /// 未知值一律拒绝（返回 `None`）而不是当作活条目处理：把未知种类当成
     /// 「大概是个条目」会让一个未来版本写出的墓碑被旧版本当成活条目复活。
+    ///
+    /// 同步种类刻意不在这里——它们只出现在同步载荷里，而那一层的解析器按种类试解密
+    /// （见 [`crate::sync::record`] 的模块文档）。让一个函数同时认两套取值，就等于让
+    /// 「文件里出现同步记录」这件事变成合法的。
     pub(crate) const fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             0x01 => Some(Self::Entry),
             0x02 => Some(Self::Tombstone),
+            _ => None,
+        }
+    }
+
+    /// 从**同步载荷**里读到的字节还原种类。
+    ///
+    /// # 当前没有生产调用点，但它是承重的
+    ///
+    /// 载荷的解析器不靠这个函数选种类（它按种类试解密），因此它在正常路径上没有调用
+    /// 者。保留它是因为它定义了「哪些字节值是合法的同步记录种类」这一事实，而
+    /// `crate::sync` 里的编译期断言与单元测试都依赖它——没有它，那两个断言就只能拿
+    /// 字面量 `0x81` / `0x82` 去比，而那是把契约抄了两遍。
+    ///
+    /// 与 [`RecordKind::from_byte`] 严格互斥：一台设备把同步载荷解成「条目集合」之后
+    /// 才能去改自己的保险库，因此两层之间不该有同一个记录种类同时合法的位置。
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "契约定义，供 sync 的编译期断言与测试使用；载荷解析按种类试解密，不走这里"
+        )
+    )]
+    pub(crate) const fn from_sync_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0x81 => Some(Self::SyncEntry),
+            0x82 => Some(Self::SyncTombstone),
             _ => None,
         }
     }
@@ -345,7 +489,26 @@ pub(crate) fn seal(
     plaintext: &[u8],
 ) -> Result<(Nonce, Vec<u8>)> {
     let key = entry_key(master)?;
-    let cipher = XChaCha20Poly1305::new(&Key::from(key));
+    seal_with_key(&key, kind, entry_id, format_version, plaintext)
+}
+
+/// 用一把**已经派生好的**子密钥加密。
+///
+/// 单独抽出来是为了让「一次同步只派生一次子密钥」成为可能：同步载荷里有成百上千条
+/// 记录，逐条重新派生 HKDF 会把两次 HMAC-SHA256 乘以条目数。派生一次然后传给这个
+/// 函数，代价从 O(n) 次派生降到 1 次。
+///
+/// # 错误
+///
+/// 只可能因随机源不可用而失败（[`Error::RandomnessUnavailable`]）。
+pub(crate) fn seal_with_key(
+    key: &[u8; 32],
+    kind: RecordKind,
+    entry_id: &EntryId,
+    format_version: u8,
+    plaintext: &[u8],
+) -> Result<(Nonce, Vec<u8>)> {
+    let cipher = XChaCha20Poly1305::new(&Key::from(*key));
     let nonce = random_nonce()?;
     let aad = build_aad(kind, entry_id, format_version);
     let mut buffer = plaintext.to_vec();
@@ -373,7 +536,24 @@ pub(crate) fn open(
     ciphertext: &[u8],
 ) -> Result<Vec<u8>> {
     let key = entry_key(master)?;
-    let cipher = XChaCha20Poly1305::new(&Key::from(key));
+    open_with_key(&key, kind, entry_id, format_version, nonce, ciphertext)
+}
+
+/// 用一把**已经派生好的**子密钥解密。理由同 [`seal_with_key`]。
+///
+/// # 错误
+///
+/// 认证失败一律返回 [`Error::VaultDecryptionFailed`]，**不区分**「密钥不对」
+/// 「密文被篡改」「AAD 不匹配」三种原因。
+pub(crate) fn open_with_key(
+    key: &[u8; 32],
+    kind: RecordKind,
+    entry_id: &EntryId,
+    format_version: u8,
+    nonce: &Nonce,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>> {
+    let cipher = XChaCha20Poly1305::new(&Key::from(*key));
     let aad = build_aad(kind, entry_id, format_version);
     let mut buffer = ciphertext.to_vec();
     cipher
