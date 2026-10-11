@@ -127,16 +127,19 @@ p256 = { version = "0.14", default-features = false, features = ["ecdh", "ecdsa"
 # 它也承担了「整个项目里唯一允许 `unsafe` 的地方」这个角色——平台 FFI 调用本质上
 # 就是 unsafe，而本 crate 有 `#![forbid(unsafe_code)]`。
 #
-# # 为什么现在写的是**路径**而不是版本号
+# # 为什么是版本号而不是路径
 #
-# 它还没有发布到 crates.io（发布由该仓库的 `publish.yml` 在打 `v*` 标签时执行）。
-# 写成 `qualia-dik = { path = "../QualiaDeviceIdentityKit" }` 让本地与 CI 都能构建，
-# 且**不需要** `[patch]`——`[patch]` 只能覆盖「本该从某个源取」的依赖，一份直接的
-# 路径依赖没有可覆盖的东西。
+# 它已经发布到 crates.io（`qualia-dik 0.1.0`，之后由它自己的 `publish.yml` 在打
+# `v*` 标签时更新）。
 #
-# 发布之后这一行换成 `qualia-dik = "0.1"` 即可，其余不动。这条路径**不带** URL 或
-# 其它源，因此 cargo 会以路径为准，不会去 registry 找。
-qualia-dik = { path = "../QualiaDeviceIdentityKit" }
+# 版本号是**唯一**能让本地、CI 与第三方消费者看到同一份源码的写法：路径依赖会让
+# 同一个物理目录在不同仓库里被不同的相对路径引用，Cargo 于是把它们当成两个包
+# （`package collision in the lockfile`）；而把上游检出到工作区**之外**的
+# `../Xxx` 在 GitHub Actions 上会被 `actions/checkout` 直接拒绝。
+#
+# 本地要改这个库的代码时，用 `[patch.crates-io]` 临时指到同级目录即可——那是
+# `[patch]` 的正当用途，且它只影响本工作区。
+qualia-dik = "0.1"
 
 # 秘密材料容器（`SecretBox` / `SecretSlice` / `SecretString` / `ExposeSecret`）。
 # 依赖审计（人工逐项核过，cargo-deny 不做依赖必要性判断）：
