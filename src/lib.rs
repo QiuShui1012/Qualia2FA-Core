@@ -55,7 +55,6 @@
 
 pub mod auth;
 pub mod base32;
-pub mod device;
 mod error;
 pub mod flow;
 pub mod otp;
@@ -79,10 +78,16 @@ pub use flow::{DeviceKeys, Joiner, Login, Registered, SecureStore};
 
 /// 设备身份的公开类型。
 ///
+/// # 它们为什么是**再导出**而不是本 crate 定义的
+///
+/// 设备身份住在 [`qualia_dik`] 里——那是一个独立可复用的 crate，任何需要「平台硬件
+/// 里的一对 P-256 身份密钥」的项目都能用它，不需要接受本 crate 的保险库格式或同步
+/// 协议。这里再导出是为了让下游不必同时依赖两个 crate。
+///
 /// `DevicePublicKey` 与 `DeviceSignature` **不是秘密**——它们本来就要印在二维码
 /// 上、写进日志、在设备之间传播，所以在这里与秘密类型分开导出，让「哪些类型
 /// 可以随便打印」在导入列表里就看得出来。
-pub use device::{DeviceId, DevicePublicKey, DeviceSignature};
+pub use qualia_dik::{DeviceId, DevicePublicKey, DeviceSignature};
 
 /// 配对协议的公开类型。
 ///

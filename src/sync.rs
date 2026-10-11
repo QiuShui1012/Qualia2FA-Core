@@ -52,7 +52,7 @@
 //! 一条记录是「活条目」还是「墓碑」只写在**内层 AAD** 里，不在载荷明文里。这样做的
 //! 代价是解密时要按两种种类各试一次（见 [`record`]），换来的是**连「这次同步带了几条
 //! 删除」都看不出来**——而删除的存在本身就是敏感信息。这条设计曾经留下一个真实的 bug：
-//! [`RECORD_HEADER_LEN`] 里多算了一个种类字节，而当时那条「盯着线格式」的测试是恒等式，
+//! 记录头长度的常量里多算了一个种类字节，而当时那条「盯着线格式」的测试是恒等式，
 //! 于是它绿了很久。
 //!
 //! # 为什么内层还要逐条认证（外层不是已经整体认证了吗）
@@ -74,13 +74,13 @@ mod merge;
 pub mod record;
 mod seen;
 
-use crate::device::{DEVICE_ID_LEN, DeviceId};
 use crate::vault::crypto;
 use crate::vault::{EntryId, MasterKey, NONCE_LEN, TAG_LEN};
 use crate::{Error, Result};
 pub use merge::{
     Conflict, ConflictKind, HasEntryId, MergeOutcome, MergedRecord, RecordSet, merge_into,
 };
+use qualia_dik::{DEVICE_ID_LEN, DeviceId};
 pub use record::{OpenedRecord, open as open_record, seal_entry, seal_tombstone};
 pub use seen::{MAX_SEEN_SYNC_IDS, SeenSyncIds};
 

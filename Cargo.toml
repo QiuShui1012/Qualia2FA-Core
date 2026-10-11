@@ -107,9 +107,36 @@ miniz_oxide = "0.9.1"
 # 需要额外审计的椭圆曲线实现。代价是标量乘法比 X25519 慢，而一次配对只做两次，
 # 完全可以忽略。
 #
-# 曲线选择见 `src/device.rs` 的模块文档：P-256 是两个移动平台上**唯一**能进
-# 硬件的签名算法，这是强约束而非偏好。
+# 曲线选择见 `qualia-dik` 的 `device` 模块文档：P-256 是两个移动平台上**唯一**
+# 能进硬件的签名算法，这是强约束而非偏好。
+#
+# 本 crate 直接用到 `p256` 的只有配对协议里的 ECDH（`ecdh` feature）；设备身份的
+# 公钥解析与验签**已经搬到 `qualia-dik`**，由它自己声明 `p256`。两边的版本必须一致，
+# 否则一个二进制里会出现两条 P-256 实现。
 p256 = { version = "0.14", default-features = false, features = ["ecdh", "ecdsa", "std"] }
+
+# 设备身份：公钥表示、指纹、验签，以及平台硬件密钥库。
+#
+# # 为什么它是一个独立的、发布到 crates.io 的 crate
+#
+# 它做的是「在平台硬件里生成一对 P-256 身份密钥」以及「表示与验证这种身份」，两者
+# 都与本 crate 的保险库格式、同步协议、配对流程**无关**。任何需要硬件设备身份的项目
+# 都能直接用它，不需要接受 Qualia2FA 的任何设计。因此依赖方向是它 ← 本 crate，
+# 而不是反过来。
+#
+# 它也承担了「整个项目里唯一允许 `unsafe` 的地方」这个角色——平台 FFI 调用本质上
+# 就是 unsafe，而本 crate 有 `#![forbid(unsafe_code)]`。
+#
+# # 为什么现在写的是**路径**而不是版本号
+#
+# 它还没有发布到 crates.io（发布由该仓库的 `publish.yml` 在打 `v*` 标签时执行）。
+# 写成 `qualia-dik = { path = "../QualiaDeviceIdentityKit" }` 让本地与 CI 都能构建，
+# 且**不需要** `[patch]`——`[patch]` 只能覆盖「本该从某个源取」的依赖，一份直接的
+# 路径依赖没有可覆盖的东西。
+#
+# 发布之后这一行换成 `qualia-dik = "0.1"` 即可，其余不动。这条路径**不带** URL 或
+# 其它源，因此 cargo 会以路径为准，不会去 registry 找。
+qualia-dik = { path = "../QualiaDeviceIdentityKit" }
 
 # 秘密材料容器（`SecretBox` / `SecretSlice` / `SecretString` / `ExposeSecret`）。
 # 依赖审计（人工逐项核过，cargo-deny 不做依赖必要性判断）：

@@ -33,6 +33,23 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// 设备身份库报出的失败。
+    ///
+    /// # 为什么是包装而不是把它的变体抄一遍
+    ///
+    /// 设备身份（公钥表示、指纹、验签，以及平台密钥库）住在
+    /// [`qualia_dik`](https://docs.rs/qualia-dik) 里，那是一个独立可复用的 crate。
+    /// 本 crate 需要的是**同一批**失败分类，而不是另一套长得像的。
+    ///
+    /// 抄一遍的代价是**两处枚举会漂移**：那边加一个 `HardwareUnavailable`，这边忘掉，
+    /// 于是「没有 TPM」在 Core 的调用方看来会掉进 `_ =>` 通配分支——而通配分支是
+    /// 静默的。包装则让编译器在升级依赖时把每个需要处理的新变体都指出来。
+    ///
+    /// `source()` 链上也因此看得出「这是设备身份库说的」，而不是被拍平成一个本地的
+    /// `reason` 字符串。
+    #[error(transparent)]
+    Device(#[from] qualia_dik::Error),
+
     /// Base32 输入含字母表外的字符。
     ///
     /// 只报告**位置**，不报告该位置上的字符，避免把（可能来自密钥的）输入

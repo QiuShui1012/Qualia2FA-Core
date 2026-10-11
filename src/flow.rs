@@ -16,7 +16,7 @@
 //! 注册与登录这两条**用户旅程**的编排。
 //!
 //! 前面几个模块各自解决一个问题：[`crate::vault`] 管加密的条目、[`crate::pairing`]
-//! 管带外引导的密钥交换、[`crate::device`] 管设备身份、[`crate::recovery`] 管
+//! 管带外引导的密钥交换、[`qualia_dik::device`] 管设备身份、[`crate::recovery`] 管
 //! 口令备份。本模块把它们按用户实际会走的两条路串起来：
 //!
 //! ```text
@@ -75,13 +75,13 @@
 
 use secrecy::{ExposeSecret as _, SecretString};
 
-use crate::device::{self, DeviceId, DevicePublicKey, DeviceSignature};
 use crate::error::{Error, Result};
 use crate::pairing::{self, Adoption, JoinerSession, NonceLog, PendingSession, QrPayload};
 use crate::recovery::{self, KdfParams};
 use crate::secret::SecretBytes;
 use crate::vault::MasterKey;
 use crate::vault::{Timestamp, Vault, VaultFile};
+use qualia_dik::{DeviceId, DevicePublicKey, DeviceSignature};
 
 /// 设备身份的来源。
 ///
@@ -114,7 +114,7 @@ pub trait DeviceKeys {
 
     /// 用设备身份对**消息本身**签名。
     ///
-    /// 传入的是消息，不是摘要：哈希计算恰好有一个所有者（见 [`crate::device::verify`]）。
+    /// 传入的是消息，不是摘要：哈希计算恰好有一个所有者（见 [`qualia_dik::device::verify`]）。
     /// 实现方**不要**自行先哈希再签名，那会导致验签侧再哈希一次从而必然失败。
     fn sign(&mut self, label: &str, message: &[u8]) -> Result<DeviceSignature>;
 }
@@ -787,26 +787,33 @@ pub fn expect_device(
 
 /// 校验一段消息确实由某个设备身份签过。
 ///
-/// 这是 [`crate::device::verify`] 的同义包装，存在的意义是让编排层与调用方有一个
-/// **统一的入口**去验签，而不是各自 `device::verify(...)`——后者会让「怎么算通过」
-/// 在多个地方各有一份判断。
+/// # 它为什么是一个包装，以及它包了什么
+///
+/// 设备身份验签的**实现**在 `qualia-dik` 里——那是一个独立可复用的 crate，任何需要
+/// 硬件设备身份的项目都能用它。本函数在它之上只做一件事：把失败**翻译成本 crate 的
+/// 错误类型**（[`Error::Device`]）。
+///
+/// 这样做的意义是让调用方有一个**统一的入口**，而不是各自去调
+/// `qualia_dik::device::verify`——后者会让「失败是什么类型」在多个地方各有一份判断，
+/// 而下游（FFI、UI）需要的是本 crate 的错误枚举。
 ///
 /// # 错误
 ///
-/// 签名不匹配或格式错误时返回 [`Error::DeviceSignatureInvalid`]。
+/// 签名不匹配或格式错误时返回 [`Error::Device`]（内层是设备身份库的
+/// `DeviceSignatureInvalid`）。
 pub fn verify_device(
     public_key: &DevicePublicKey,
     message: &[u8],
     signature: &DeviceSignature,
 ) -> Result<()> {
-    device::verify(public_key, message, signature)
+    Ok(qualia_dik::device::verify(public_key, message, signature)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::SIGNATURE_LEN;
     use p256::ecdsa::{SigningKey, signature::Signer as _};
+    use qualia_dik::device::SIGNATURE_LEN;
     use std::collections::HashMap;
 
     /// 一个纯内存的 [`DeviceKeys`] 实现，用来把编排逻辑与平台隔开。
@@ -845,13 +852,14 @@ mod tests {
             }
             let key = &self.keys[label];
             let point = key.verifying_key().to_sec1_point(false);
-            DevicePublicKey::from_sec1_bytes(point.as_bytes())
+            // `?` 把设备身份库的错误经 `Error::Device` 转换过来。
+            Ok(DevicePublicKey::from_sec1_bytes(point.as_bytes())?)
         }
 
         fn sign(&mut self, label: &str, message: &[u8]) -> Result<DeviceSignature> {
             let key = self.keys.get(label).ok_or(Error::DeviceKeyMissing)?;
             let signature: p256::ecdsa::Signature = key.sign(message);
-            DeviceSignature::from_bytes(&signature.to_bytes())
+            Ok(DeviceSignature::from_bytes(&signature.to_bytes())?)
         }
     }
 

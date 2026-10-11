@@ -44,8 +44,9 @@ use std::collections::HashMap;
 
 use p256::ecdsa::signature::Signer as _;
 use p256::ecdsa::{Signature, SigningKey};
+use qualia_dik::device::{DevicePublicKey, DeviceSignature};
 use qualia2fa_core::auth;
-use qualia2fa_core::device::{self, DevicePublicKey, DeviceSignature};
+use qualia2fa_core::flow::verify_device;
 use qualia2fa_core::flow::{self, DeviceKeys, Joiner, Login, SecureStore};
 use qualia2fa_core::pairing::{
     self, MSG1_LEN, MSG2_LEN, NONCE_LEN, NonceLog, PUBLIC_KEY_LEN, QrPayload,
@@ -121,7 +122,7 @@ impl DeviceKeys for SoftwareKeys {
             self.keys.insert(label.to_owned(), Device::new(scalar));
         }
         let device = &self.keys[label];
-        DevicePublicKey::from_sec1_bytes(&device.public)
+        Ok(DevicePublicKey::from_sec1_bytes(&device.public)?)
     }
 
     fn sign(&mut self, label: &str, message: &[u8]) -> Result<DeviceSignature, Error> {
@@ -474,19 +475,27 @@ fn forged_device_public_key_is_rejected() {
     let attacker = Device::new(4);
 
     let signature = attacker.sign(message);
-    let error = device::verify(
+    // 走本 crate 的 `verify_device` 而不是 `qualia_dik::device::verify`：前者才代表
+    // 调用方看到的错误类型，而「验签失败长什么样」正是这条测试要盯住的东西。
+    let error = verify_device(
         &DevicePublicKey::from_sec1_bytes(&real.public).expect("合法公钥"),
         message,
         &signature,
     )
     .expect_err("攻击者签的名不该验过");
+    // 验签失败现在由设备身份库报出，经 `Error::Device` 包装过来。断言链上的**内层**
+    // 变体，而不是 Core 那一层的名字——「是验签不过」这个事实属于设备身份库，
+    // 包装只是把它带上来。
     assert!(
-        matches!(error, Error::DeviceSignatureInvalid { .. }),
+        matches!(
+            error,
+            Error::Device(qualia_dik::Error::DeviceSignatureInvalid { .. })
+        ),
         "实际是 {error:?}"
     );
 
     // 合法签名仍然能过——否则「什么都拒绝」也能让上面那条绿。
-    device::verify(
+    verify_device(
         &DevicePublicKey::from_sec1_bytes(&real.public).expect("合法公钥"),
         message,
         &real.sign(message),

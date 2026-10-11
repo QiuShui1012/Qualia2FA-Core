@@ -90,7 +90,7 @@
 //!
 //! tag 证明的是「对方持有主密钥」——但**任何**持有主密钥的设备都能算出它。若调用方
 //! 需要知道「现在回答的是哪一台设备」，就必须叠加设备身份签名（ECDSA P-256，见
-//! [`crate::device`]）。两者证明的事情不同，因此都要有：
+//! [`qualia_dik::device`]）。两者证明的事情不同，因此都要有：
 //!
 //! - tag → 「你确实有主密钥」（**不可伪造**，即使攻击者控制了信道）
 //! - 签名 → 「你是设备 X」（可由持有 X 私钥的一方伪造，而那正是 X 的定义）
@@ -107,7 +107,6 @@
 //! 3. **跨重启**：调用方可以把用过的 `sid` 记进 [`crate::pairing::NonceLog`]，
 //!    从而在进程重启后仍然认出「这次会话我处理过」。
 
-use crate::device::{DevicePublicKey, DeviceSignature};
 use crate::pairing::{CONFIRMATION_LEN, NONCE_LEN, PUBLIC_KEY_LEN, SESSION_ID_LEN};
 use crate::vault::MasterKey;
 use crate::{Error, Result};
@@ -117,6 +116,7 @@ use p256::PublicKey;
 use p256::ecdh::EphemeralSecret;
 use p256::elliptic_curve::Generate;
 use p256::elliptic_curve::sec1::ToSec1Point as _;
+use qualia_dik::{DevicePublicKey, DeviceSignature};
 use secrecy::zeroize::Zeroize;
 use sha2::{Digest, Sha256};
 
@@ -127,7 +127,7 @@ pub const CHALLENGE_LEN: usize = PUBLIC_KEY_LEN + NONCE_LEN;
 pub const RESPONSE_LEN: usize = PUBLIC_KEY_LEN + NONCE_LEN + PUBLIC_KEY_LEN + CONFIRMATION_LEN;
 
 /// 应答的完整字节长度（含设备签名）。
-pub const RESPONSE_SIGNED_LEN: usize = RESPONSE_LEN + crate::device::SIGNATURE_LEN;
+pub const RESPONSE_SIGNED_LEN: usize = RESPONSE_LEN + qualia_dik::device::SIGNATURE_LEN;
 
 /// 确认标签的字节长度。
 pub const CONFIRM_LEN: usize = CONFIRMATION_LEN;
@@ -263,7 +263,7 @@ impl Verifier {
             &responder_nonce,
             &tag,
         );
-        crate::device::verify(
+        qualia_dik::device::verify(
             &device_key,
             &message,
             &signature_of(&response[RESPONSE_LEN..])?,
@@ -396,7 +396,7 @@ impl Responder {
     ///   回调收到的是**消息本身**，不是摘要。因此平台实现若要对接只吃摘要的硬件
     ///   API（Windows CNG 的 `NCryptSignHash` 形参就叫 `pbHashValue`），应当自己
     ///   做一次 SHA-256 再走 `sign_digest`。哈希次数只能有一处归属：
-    ///   验证侧固定走 [`crate::device::verify`]，它在标准 ECDSA 模式下**自己哈希
+    ///   验证侧固定走 [`qualia_dik::device::verify`]，它在标准 ECDSA 模式下**自己哈希
     ///   一次**。签名侧若再多哈希一次，表现为每次握手都失败，而错误信息
     ///   （"签名与公钥或消息不匹配"）完全不指向真正的原因。
     ///
@@ -443,7 +443,7 @@ impl Responder {
         //
         // 早期版本在这里先算好 SHA-256 摘要再传出去，结果测试里 `p256` 又在摘要上
         // 哈希了一次——变成 `Sign(SHA256(SHA256(message)))`，而验证侧走
-        // `device::verify` 只哈希一次，于是每一次握手都以
+        // `qualia_dik::device::verify` 只哈希一次，于是每一次握手都以
         // `DeviceSignatureInvalid { reason: "签名与公钥或消息不匹配" }` 失败。
         // 传消息而不是摘要，让「哈希几次」这件事只有一个归属方。
         let signature = sign(&message)?;
@@ -681,7 +681,9 @@ fn signature_message(
 ///
 /// 走 [`DeviceSignature::from_bytes`] 而不是自己拼数组：长度校验只应有一处。
 fn signature_of(bytes: &[u8]) -> Result<DeviceSignature> {
-    DeviceSignature::from_bytes(bytes)
+    // `?` 把 `qualia_dik::Error` 经 `Error::Device` 转换过来——那一步由 `#[from]`
+    // 提供；不能直接返回 `Ok(..)` 之外的表达式，因为 `Ok` 的类型不会自动转换。
+    Ok(DeviceSignature::from_bytes(bytes)?)
 }
 
 /// 计算证明标签。
@@ -760,7 +762,7 @@ mod tests {
         let response = responder
             .respond(master, &device_public, |message| {
                 let signature: p256::ecdsa::Signature = signing.sign(message);
-                DeviceSignature::from_bytes(&signature.to_bytes())
+                signature_of(&signature.to_bytes())
             })
             .expect("生成应答");
         let verified = verifier.verify(&response, master).expect("验证应答");
@@ -806,7 +808,7 @@ mod tests {
             .respond(&wrong, &device_public, |digest| {
                 let (signing, _) = device(7);
                 let signature: p256::ecdsa::Signature = signing.sign(digest);
-                DeviceSignature::from_bytes(&signature.to_bytes())
+                signature_of(&signature.to_bytes())
             })
             .expect("签名本身会成功");
 
@@ -837,7 +839,7 @@ mod tests {
         let response = responder
             .respond(&master, &real_device, |message| {
                 let signature: p256::ecdsa::Signature = real_signing.sign(message);
-                DeviceSignature::from_bytes(&signature.to_bytes())
+                signature_of(&signature.to_bytes())
             })
             .expect("生成应答");
 
@@ -854,10 +856,14 @@ mod tests {
         }
         assert_ne!(attacker_device, real_device);
 
+        // 验签失败由设备身份库报出，经 `Error::Device` 包装上来。断言内层变体：
+        // 「是验签不过」这个事实属于设备身份库，包装只是把它带上来。
         assert!(
             matches!(
                 verifier.verify(&forged, &master),
-                Err(Error::DeviceSignatureInvalid { .. })
+                Err(Error::Device(
+                    qualia_dik::Error::DeviceSignatureInvalid { .. }
+                ))
             ),
             "被换成无效签名的应答却通过了"
         );
@@ -875,7 +881,7 @@ mod tests {
             let mut response = responder
                 .respond(&master, &device_public, |digest| {
                     let signature: p256::ecdsa::Signature = signing.sign(digest);
-                    DeviceSignature::from_bytes(&signature.to_bytes())
+                    signature_of(&signature.to_bytes())
                 })
                 .expect("生成应答");
             response[index] ^= 0x01;
@@ -926,7 +932,7 @@ mod tests {
         let mut response = responder
             .respond(&master, &device_public, |message| {
                 let signature: p256::ecdsa::Signature = signing.sign(message);
-                DeviceSignature::from_bytes(&signature.to_bytes())
+                signature_of(&signature.to_bytes())
             })
             .expect("生成应答");
         response[PUBLIC_KEY_LEN - 1] ^= 0x01;
@@ -1061,7 +1067,7 @@ mod tests {
         let response = responder
             .respond(&master, &device_public, |message| {
                 let signature: p256::ecdsa::Signature = signing.sign(message);
-                DeviceSignature::from_bytes(&signature.to_bytes())
+                signature_of(&signature.to_bytes())
             })
             .expect("生成应答");
         // `Debug` 字符串必须在 `verify` 之前取：`verify` 收 `self`，会消耗 `verifier`。

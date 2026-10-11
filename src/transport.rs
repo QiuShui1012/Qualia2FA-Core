@@ -47,10 +47,10 @@
 
 use core::fmt;
 
-use crate::device::DeviceId;
 use crate::error::{Error, Result};
 use crate::sync::{self, MergedRecord, Payload, PayloadKind, SeenSyncIds, SyncId};
 use crate::vault::{MasterKey, Vault};
+use qualia_dik::DeviceId;
 
 /// 一次同步里有几方。
 ///

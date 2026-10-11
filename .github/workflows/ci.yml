@@ -31,6 +31,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `qualia-dik` 与 Core 分属两个仓库，而 Core 以
+      # `path = "../QualiaDeviceIdentityKit"` 依赖它。因此 CI 必须把它检出到
+      # **同级**目录——`actions/checkout` 默认只检出当前仓库。
+      #
+      # 为什么用路径依赖而不是版本号：它还没发布到 crates.io。发布之后这一行可以
+      # 换成 `path: Core` 之外的做法（例如干脆去掉这一步、让 cargo 从 registry 取），
+      # 但**不要**换成 git 依赖：那会让每次 CI 都要按 URL 抓一份源码，而 `--locked`
+      # 也就锁不住它了。
+      - name: 取出 qualia-dik（满足 path = "../QualiaDeviceIdentityKit" 依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: Qualia2FA/QualiaDeviceIdentityKit
+          path: ../QualiaDeviceIdentityKit
+
       - name: 安装工具链（由 rust-toolchain.toml 决定 channel）
         run: rustup show
 
@@ -70,6 +84,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `qualia-dik` 与 Core 分属两个仓库，而 Core 以
+      # `path = "../QualiaDeviceIdentityKit"` 依赖它。因此 CI 必须把它检出到
+      # **同级**目录——`actions/checkout` 默认只检出当前仓库。
+      #
+      # 为什么用路径依赖而不是版本号：它还没发布到 crates.io。发布之后这一行可以
+      # 换成 `path: Core` 之外的做法（例如干脆去掉这一步、让 cargo 从 registry 取），
+      # 但**不要**换成 git 依赖：那会让每次 CI 都要按 URL 抓一份源码，而 `--locked`
+      # 也就锁不住它了。
+      - name: 取出 qualia-dik（满足 path = "../QualiaDeviceIdentityKit" 依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: Qualia2FA/QualiaDeviceIdentityKit
+          path: ../QualiaDeviceIdentityKit
+
       - name: 安装 1.89 工具链
         run: rustup toolchain install 1.89 --profile minimal
 
@@ -89,6 +117,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `qualia-dik` 与 Core 分属两个仓库，而 Core 以
+      # `path = "../QualiaDeviceIdentityKit"` 依赖它。因此 CI 必须把它检出到
+      # **同级**目录——`actions/checkout` 默认只检出当前仓库。
+      #
+      # 为什么用路径依赖而不是版本号：它还没发布到 crates.io。发布之后这一行可以
+      # 换成 `path: Core` 之外的做法（例如干脆去掉这一步、让 cargo 从 registry 取），
+      # 但**不要**换成 git 依赖：那会让每次 CI 都要按 URL 抓一份源码，而 `--locked`
+      # 也就锁不住它了。
+      - name: 取出 qualia-dik（满足 path = "../QualiaDeviceIdentityKit" 依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: Qualia2FA/QualiaDeviceIdentityKit
+          path: ../QualiaDeviceIdentityKit
+
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
@@ -103,6 +145,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # `qualia-dik` 与 Core 分属两个仓库，而 Core 以
+      # `path = "../QualiaDeviceIdentityKit"` 依赖它。因此 CI 必须把它检出到
+      # **同级**目录——`actions/checkout` 默认只检出当前仓库。
+      #
+      # 为什么用路径依赖而不是版本号：它还没发布到 crates.io。发布之后这一行可以
+      # 换成 `path: Core` 之外的做法（例如干脆去掉这一步、让 cargo 从 registry 取），
+      # 但**不要**换成 git 依赖：那会让每次 CI 都要按 URL 抓一份源码，而 `--locked`
+      # 也就锁不住它了。
+      - name: 取出 qualia-dik（满足 path = "../QualiaDeviceIdentityKit" 依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: Qualia2FA/QualiaDeviceIdentityKit
+          path: ../QualiaDeviceIdentityKit
 
       - name: 安装 nightly（cargo-fuzz 需要 -Zsanitizer）
         run: rustup toolchain install nightly --component rust-src

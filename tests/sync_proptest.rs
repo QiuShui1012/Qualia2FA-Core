@@ -35,8 +35,8 @@
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
+use qualia_dik::device::{DEVICE_ID_LEN, DeviceId};
 use qualia2fa_core::ExposeSecret as _;
-use qualia2fa_core::device::{DEVICE_ID_LEN, DeviceId};
 use qualia2fa_core::otp::{Algorithm, Digits, OtpSecret};
 use qualia2fa_core::sync::{self, MergedRecord, Payload, RecordSet, SeenSyncIds};
 use qualia2fa_core::vault::{Entry, MasterKey, Timestamp, Vault};
