@@ -415,9 +415,21 @@ impl Login {
 /// 与 [`Login`] 同理，本类型持有一次性的临时密钥。`request` 之后必须用**同一个
 /// 实例**调 [`Joiner::complete`]；新建一个实例去完成上次的登录必然失败，因为临时
 /// 密钥不同（见 [`crate::pairing`] 的会话绑定规则）。
+///
+/// # 为什么 `session` 是 `Option`
+///
+/// [`Joiner::complete`] 只需 `&self` 而不是 `self`，因此端侧把本类型包在
+/// `Arc<Mutex<..>>` 之类共享容器里也能用——绑定层与界面都要求共享引用。会话本身
+/// 仍然是**一次性**的：`complete` 用 [`Option::take`] 把它取走，第二次调用会拿到
+/// [`Error::PairingAuthenticationFailed`]，而不是重放一次。
+///
+/// 这与 [`Login`] 用 `Option<PendingSession>` + `take` 表达「一次登录只服务一个
+/// 请求」是同一个手法：**让「只能用一次」成为类型属性**，而不是靠调用方自觉维护
+/// 一个布尔标志。`Option::take` 需要 `&mut`，因此内部用
+/// [`std::sync::Mutex`] 提供内部可变性——与绑定层的用法一致。
 pub struct Joiner {
-    /// 本次登录的临时会话。
-    session: JoinerSession,
+    /// 本次登录的临时会话。`complete` 取走后为 `None`。
+    session: std::sync::Mutex<Option<JoinerSession>>,
     /// 设备身份标签，`complete` 时用来签名。
     label: String,
     /// 已经发出请求的会话标识。
@@ -448,7 +460,7 @@ impl Joiner {
     /// 载荷格式错误、版本不支持、或临时公钥不在曲线上时返回相应错误。
     pub fn new(payload: &QrPayload, label: &str) -> Result<Self> {
         Ok(Self {
-            session: pairing::join(payload)?,
+            session: std::sync::Mutex::new(Some(pairing::join(payload)?)),
             label: label.to_owned(),
             session_id: None,
             request: Vec::new(),
@@ -471,7 +483,15 @@ impl Joiner {
     pub fn request(&mut self, keys: &mut dyn DeviceKeys) -> Result<Vec<u8>> {
         if self.request.is_empty() {
             let identity = keys.get_or_create(&self.label)?;
-            let (message, session_id) = self.session.request(identity.as_sec1_bytes())?;
+            // 会话的借用必须在写 `self.request` 之前结束，否则编译器不允许对 `self`
+            // 的可变借用。用一个作用域块而不是手工 `drop`：它不依赖读者记住 guard
+            // 何时释放，而 `drop` 漏掉时的报错（E0506）指向的是赋值那一行，不容易
+            // 联想到是 guard 的生命周期问题。
+            let (message, session_id) = {
+                let session = self.session_guard();
+                let session = session.as_ref().ok_or(Error::PairingAuthenticationFailed)?;
+                session.request(identity.as_sec1_bytes())?
+            };
             self.request = message;
             self.session_id = Some(session_id);
         }
@@ -497,8 +517,19 @@ impl Joiner {
     ///
     /// **写入失败时主密钥不会被丢掉**——它随返回值一起消失，因此不会留下一个
     /// 「手里有密钥但没存住」的中间状态骗过调用方。调用方应当让用户重新走一次登录。
+    ///
+    /// # 只能用一次
+    ///
+    /// 会话被 [`Option::take`] 取走，因此重复调用返回
+    /// [`Error::PairingAuthenticationFailed`]——与「应答是伪造的」同一个错误，因为
+    /// 对调用方来说这两件事的处置方式相同（重新走一次登录）。刻意不单独报「已经用
+    /// 过了」：那等于告诉攻击者他的重放被认出来了。
+    ///
+    /// 收 `&self` 而不是 `self`，是为了让调用方能把本类型放进 `Arc<Mutex<..>>` 之类
+    /// 的共享容器——绑定层与界面都要求共享引用。一次性由内部的 `Option` 保证，不靠
+    /// 所有权。
     pub fn complete(
-        self,
+        &self,
         msg2: &[u8],
         keys: &mut dyn DeviceKeys,
         store: &mut dyn SecureStore,
@@ -506,15 +537,34 @@ impl Joiner {
         // 设备身份必须与发请求时是同一个。这里重新取一次而不是缓存 SEC1 字节：缓存
         // 会让「密钥库变了」这种情况被掩盖过去，而它恰恰是最需要立刻发现的问题。
         let identity = keys.get_or_create(&self.label)?;
-        let master = self.session.open(msg2, identity.as_sec1_bytes())?;
+        let session = self
+            .session_guard()
+            .take()
+            .ok_or(Error::PairingAuthenticationFailed)?;
+        let master = session.open(msg2, identity.as_sec1_bytes())?;
         store.store_master_key(&master)?;
         Ok(master)
     }
 
     /// 本设备在本次登录中使用的身份公钥。
+    ///
+    /// 会话被 [`Joiner::complete`] 取走之后返回 `None`——端侧要在完成之前把它显示给
+    /// 用户确认（用户要能看出「请求登录的是不是我想的那台设备」）。
     #[must_use]
-    pub const fn identity(&self) -> &[u8; pairing::PUBLIC_KEY_LEN] {
-        self.session.public_key()
+    pub fn identity(&self) -> Option<[u8; pairing::PUBLIC_KEY_LEN]> {
+        self.session_guard()
+            .as_ref()
+            .map(|session| *session.public_key())
+    }
+
+    /// 借用内部会话，忽略中毒。
+    ///
+    /// 中毒意味着某个持锁线程 panic 过。本锁只保护一个 `Option` 的取出，没有「改了
+    /// 一半」的中间状态，因此恢复使用比让整个登录流程永久失败更可取。
+    fn session_guard(&self) -> std::sync::MutexGuard<'_, Option<JoinerSession>> {
+        self.session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -997,6 +1047,42 @@ mod tests {
 
     /// 登录的完整往返：新设备拿到的主密钥必须**就是**老设备的那一把。
     ///
+    /// 一次登录只能完成一次。
+    ///
+    /// `Joiner::complete` 收 `&self`（好让调用方把它放进共享容器），一次性由内部的
+    /// `Option` 保证。这条测试钉住那个保证：第二次调用必须失败，而且**必须与
+    /// 「应答是伪造的」报同一个错误**——单独报「已经用过了」等于告诉攻击者他的重放
+    /// 被认出来了。
+    #[test]
+    fn a_login_can_only_be_completed_once() {
+        let (_old_keys, _old_store, account) = registered();
+        let master = account.vault.master_key();
+
+        let mut login = Login::new().expect("应当能开始登录");
+        let payload = login.payload().clone();
+        let mut keys = FakeKeys::new();
+        let mut joiner = Joiner::new(&payload, "new-device").expect("应当能开始扫码");
+        let request = joiner.request(&mut keys).expect("应当能发出请求");
+        let reply = login.authorize(&request, master).expect("应当能授权");
+
+        let mut store = FakeStore::default();
+        joiner
+            .complete(&reply, &mut keys, &mut store)
+            .expect("第一次应当成功");
+
+        // 第二次：同一条应答原样再交一次。
+        let error = joiner
+            .complete(&reply, &mut keys, &mut store)
+            .expect_err("第二次必须失败");
+        assert!(
+            matches!(error, Error::PairingAuthenticationFailed),
+            "必须与伪造应答报同一个错误，实际是 {error:?}"
+        );
+
+        // 完成后身份也取不到了——端侧只能在完成之前把它显示给用户确认。
+        assert!(joiner.identity().is_none());
+    }
+
     /// 只比较「没有报错」是不够的——一个把主密钥换成新随机值的实现同样不报错，
     /// 而用户要到同步时才发现条目一条都对不上。
     #[test]
