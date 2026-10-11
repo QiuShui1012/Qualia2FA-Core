@@ -16,6 +16,10 @@ cargo-fuzz = true
 # fuzz 目标把任意字节喂给库的公共解析入口。
 libfuzzer-sys = "0.4.13"
 qualia2fa-core = { path = ".." }
+# 设备身份类型（`DevicePublicKey` / `DeviceSignature`）住在 `qualia-dik` 里，
+# Core 只是**再导出**它们。fuzz 目标直接依赖原 crate 更清楚，也避免依赖一个
+# 只为便利而存在的再导出。
+qualia-dik = "0.1"
 # `login_handshake` 需要一条真实的设备身份（合法的 P-256 公钥与签名），而库刻意
 # 不导出「生成一把设备私钥」——那属于 `qualia2fa-keystore`，本目标用固定标量代替。
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }

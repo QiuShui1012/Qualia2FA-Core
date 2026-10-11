@@ -45,7 +45,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use qualia2fa_core::device::{DevicePublicKey, DeviceSignature};
+use qualia_dik::{DevicePublicKey, DeviceSignature};
 use qualia2fa_core::flow::{DeviceKeys, Joiner, Login};
 use qualia2fa_core::vault::MasterKey;
 use qualia2fa_core::{Error, Result};
@@ -80,7 +80,7 @@ impl FixedKeys {
 
 impl DeviceKeys for FixedKeys {
     fn get_or_create(&mut self, _label: &str) -> Result<DevicePublicKey> {
-        DevicePublicKey::from_sec1_bytes(&self.public)
+        Ok(DevicePublicKey::from_sec1_bytes(&self.public)?)
     }
 
     fn sign(&mut self, _label: &str, message: &[u8]) -> Result<DeviceSignature> {
@@ -90,7 +90,7 @@ impl DeviceKeys for FixedKeys {
             .expect("标量 1 必定合法");
         use p256::ecdsa::signature::Signer as _;
         let signature: p256::ecdsa::Signature = key.sign(message);
-        DeviceSignature::from_bytes(&signature.to_bytes())
+        Ok(DeviceSignature::from_bytes(&signature.to_bytes())?)
     }
 }
 
