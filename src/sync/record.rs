@@ -528,7 +528,7 @@ mod tests {
             0x82,
             "同步墓碑的种类字节变了"
         );
-        assert_eq!(FORMAT_VERSION, 1, "载荷格式版本变了");
+        assert_eq!(FORMAT_VERSION, 2, "载荷格式版本变了");
     }
 
     /// **两个域的记录种类字节必须不重叠，且解析器必须互不认账。**

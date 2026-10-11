@@ -36,9 +36,10 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use qualia2fa_core::ExposeSecret as _;
+use qualia2fa_core::device::{DEVICE_ID_LEN, DeviceId};
 use qualia2fa_core::otp::{Algorithm, Digits, OtpSecret};
 use qualia2fa_core::sync::{self, MergedRecord, Payload, RecordSet, SeenSyncIds};
-use qualia2fa_core::vault::{Entry, EntryId, MasterKey, Timestamp, Vault};
+use qualia2fa_core::vault::{Entry, MasterKey, Timestamp, Vault};
 
 /// 生成任意字节秘密。
 fn arb_secret_bytes() -> impl Strategy<Value = Vec<u8>> {
@@ -176,7 +177,7 @@ fn vault_contents(vault: &Vault) -> BTreeMap<String, String> {
 }
 
 /// 把一台设备的保险库打包成载荷。
-fn payload_of(vault: &Vault, master: &MasterKey, sender: EntryId) -> Payload {
+fn payload_of(vault: &Vault, master: &MasterKey, sender: DeviceId) -> Payload {
     Payload::from_vault(master, sender, vault).expect("打包应当成功")
 }
 
@@ -203,9 +204,9 @@ fn merge_payload(vault: &mut Vault, payload: &Payload, master: &MasterKey) -> sy
 }
 
 /// 生成一台「设备」：保险库 + 设备标识。主密钥另行生成，方便多台设备共用一把。
-fn arb_vault_and_sender() -> impl Strategy<Value = (Vault, EntryId)> {
-    (arb_vault(), any::<[u8; 16]>())
-        .prop_map(|(vault, sender)| (vault, EntryId::from_bytes(sender)))
+fn arb_vault_and_sender() -> impl Strategy<Value = (Vault, DeviceId)> {
+    (arb_vault(), any::<[u8; DEVICE_ID_LEN]>())
+        .prop_map(|(vault, sender)| (vault, DeviceId::from_bytes(sender)))
 }
 
 proptest! {
@@ -428,7 +429,7 @@ proptest! {
     #[test]
     fn a_different_master_key_cannot_open_a_payload(
         (vault, sender) in arb_vault_and_sender(),
-        other_seed in any::<[u8; 32]>(),
+        other_seed in any::<[u8; DEVICE_ID_LEN]>(),
     ) {
         let master = MasterKey::generate().expect("OS 随机源可用");
         // 生成的种子恰好与随机输入相同（概率 2^-256）时跳过：那不是性质不成立，而是
@@ -460,7 +461,7 @@ proptest! {
     /// 错误都要排除。
     #[test]
     fn the_seen_log_remembers_exactly_what_was_recorded(
-        ids in prop::collection::vec(any::<[u8; 32]>(), 0..=64),
+        ids in prop::collection::vec(any::<[u8; DEVICE_ID_LEN]>(), 0..=64),
     ) {
         let mut log = SeenSyncIds::new();
         let mut expected: Vec<[u8; 32]> = Vec::new();

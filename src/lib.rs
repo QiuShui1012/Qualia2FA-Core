@@ -63,6 +63,7 @@ pub mod pairing;
 pub mod recovery;
 mod secret;
 pub mod sync;
+pub mod transport;
 pub mod uri;
 pub mod vault;
 
@@ -92,6 +93,18 @@ pub use pairing::{Adoption, JoinerSession, NonceLog, PendingSession, QrPayload};
 
 /// 恢复密钥的公开类型。
 pub use recovery::{KdfParams, export as export_recovery, import as import_recovery};
+
+/// 传输层的公开类型。
+///
+/// 只有**协议**那一半：能力声明、通道契约、会话，以及它的结果类型。具体通道
+/// （局域网、二维码、热点）在端侧实现 [`Transport`]——它们都要 I/O 与平台 API，
+/// 而本 crate 不碰那些。
+///
+/// 刻意**不**导出任何「按步骤拆开」的中间类型：调用方要么用 [`SyncSession`]，要么
+/// 自己组合 `sync` 里的零件。前者能保证顺序，后者不能。
+pub use transport::{
+    Recipient, Roster, SyncOutcome, SyncSession, Transport, TransportCapabilities,
+};
 
 pub use secret::{
     ExposeSecret, ExposeSecretMut, SecretBox, SecretBytes, SecretSlice, SecretString,

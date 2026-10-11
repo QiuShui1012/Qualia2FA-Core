@@ -25,17 +25,19 @@
 //!
 //! ```text
 //! ┌─ 外层信封（明文头 + 整体 AEAD）──────────────────────────────────┐
-//! │  魔数 8 | 版本 1 | sync_id 32 | 设备 ID 16 | 长度 2 | 密文      │
-//! │                                                        ↑ 含标签 │
+//! │  魔数 8 | 版本 1 | 种类 1 | sync_id 32 | 设备 ID 32 | nonce 24   │
+//! │          | 密文（含认证标签）                                    │
 //! │  ┌─ 内层：压缩 ─────────────────────────────────────────────┐   │
 //! │  │  ┌─ 载荷明文 ────────────────────────────────────────┐  │   │
 //! │  │  │ 记录数 4 | 记录 × N                                │  │   │
-//! │  │  │   每条：种类 1 | entry_id 16 | nonce 24 | 长度 4  │  │   │
-//! │  │  │          | 密文（含标签）                          │  │   │
+//! │  │  │   每条：entry_id 16 | nonce 24 | 长度 4 | 密文     │  │   │
 //! │  │  └────────────────────────────────────────────────────┘  │   │
 //! │  └──────────────────────────────────────────────────────────┘   │
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! 明文头的其余部分（魔数、版本、种类、`sync_id`、设备 ID）整体充当外层 AAD，因此在
+//! 线格式里它们**只出现一次**。
 //!
 //! - **内层逐条 AEAD**（种类 + entry_id + 版本入 AAD）：挡住「把条目 A 的密文搬到
 //!   条目 B 的位置」「把墓碑当成条目」。这一层的密钥与保险库文件的**不是同一把**
@@ -44,6 +46,14 @@
 //!   无法发现这种拼接——每一条单独都是合法的。外层的 AAD 含整个明文头，因此任何
 //!   一条挪动都会让外层认证失败。
 //! - **压缩**不参与任何安全性质，只把字节变短。
+//!
+//! # 明文里为什么**没有**记录种类
+//!
+//! 一条记录是「活条目」还是「墓碑」只写在**内层 AAD** 里，不在载荷明文里。这样做的
+//! 代价是解密时要按两种种类各试一次（见 [`record`]），换来的是**连「这次同步带了几条
+//! 删除」都看不出来**——而删除的存在本身就是敏感信息。这条设计曾经留下一个真实的 bug：
+//! [`RECORD_HEADER_LEN`] 里多算了一个种类字节，而当时那条「盯着线格式」的测试是恒等式，
+//! 于是它绿了很久。
 //!
 //! # 为什么内层还要逐条认证（外层不是已经整体认证了吗）
 //!
@@ -64,15 +74,15 @@ mod merge;
 pub mod record;
 mod seen;
 
+use crate::device::{DEVICE_ID_LEN, DeviceId};
+use crate::vault::crypto;
+use crate::vault::{EntryId, MasterKey, NONCE_LEN, TAG_LEN};
+use crate::{Error, Result};
 pub use merge::{
     Conflict, ConflictKind, HasEntryId, MergeOutcome, MergedRecord, RecordSet, merge_into,
 };
 pub use record::{OpenedRecord, open as open_record, seal_entry, seal_tombstone};
 pub use seen::{MAX_SEEN_SYNC_IDS, SeenSyncIds};
-
-use crate::vault::crypto;
-use crate::vault::{EntryId, MasterKey, NONCE_LEN, TAG_LEN};
-use crate::{Error, Result};
 
 /// 载荷魔数。8 字节，与保险库文件一样留一个 NUL 让它能在十六进制编辑器里认出来。
 pub const MAGIC: &[u8; 8] = b"Q2FASYNC";
@@ -83,15 +93,108 @@ pub const MAGIC: &[u8; 8] = b"Q2FASYNC";
 /// 载荷的布局。两者各自演进，互不牵连——把「载荷格式变了」与「文件格式变了」绑成
 /// 一件事，会让任一处的改动都要求另一处跟着表态。
 ///
-/// 它参与**内层**记录的 AAD（作为那个「格式版本」字段），因此改它会让所有既有载荷
-/// 的内层记录解不开。这正是跨版本搬运要挡的东西：一个旧版本的内层记录不该被塞进
-/// 新版本的载荷。
-pub const FORMAT_VERSION: u8 = 1;
-
-/// 载荷明文头的长度：魔数 + 版本 + sync_id + 设备 ID + 密文长度。
+/// # 版本 1 → 2：外层 AAD 加了「载荷种类」
 ///
-/// 这里**没有**「发送方是谁」的明文——发送方标识在密文里。见 [`Payload::sender`]。
-pub const HEADER_LEN: usize = MAGIC.len() + 1 + SYNC_ID_LEN + EntryId::LEN + 2;
+/// 版本 1 的 AAD 只有 `魔数 || 版本 || sync_id || 发送方`，因此一份「请求对方把它的
+/// 保险库发过来」的载荷与一份「这是我全量状态」的载荷**在外层无法区分**。两者都是
+/// 空记录集时甚至字节结构完全相同，于是接收方只能靠约定猜——而猜错的方向是「把一份
+/// 空的全量状态当成请求」，那会让两端都等着对方先发。
+///
+/// 版本 2 在 [`PayloadKind`] 上把这件事说清楚，并把它绑进 AAD：种类因此是**被认证
+/// 的**，第三方改不了。
+///
+/// # 它同时参与**内层**记录的 AAD
+///
+/// 改它会让既有载荷的内层记录解不开。这正是跨版本搬运要挡的东西：一个旧版本的内层
+/// 记录不该被塞进新版本的载荷。
+pub const FORMAT_VERSION: u8 = 2;
+
+/// 只被版本 1 用过的载荷版本号。
+///
+/// **没有任何版本 1 的载荷存在于世上**：这个格式从未发布过。留着这个常量只有一个
+/// 用处——让「版本 1 的输入必须被明确拒绝」这件事有一个名字可指，从而能写一条测试
+/// 盯着它。刻意**不**提供按版本 1 还原 AAD 的路径：版本 1 与版本 2 的 AAD 不同长，
+/// 于是 `open` 里会出现「按输入版本选 AAD 长度」这种分支，而那条分支没有任何真实
+/// 输入能走到——它只会成为一个将来某次改动悄悄破坏掉、且没人会发现的地方。
+///
+/// 这与 [`crate::vault::READABLE_VERSIONS`] 的「只增不减」不矛盾：那条规则针对的是
+/// **用户文件**（用户手里有旧文件，必须一直能打开）。载荷是即时的，不落盘、不跨版本
+/// 存活。
+/// # 它为什么是 `#[cfg(test)]`
+///
+/// 生产代码**没有**任何理由提到这个版本号——它只会用来构造一份「版本 1」的输入以
+/// 验证那类输入被拒绝。写成 `#[cfg_attr(not(test), expect(dead_code, ...))]` 会失败：
+/// 一个 `pub(crate)` 常量在库构建里**不**触发 `dead_code`，于是那条 `expect` 永远
+/// 不被满足，而 `-D warnings` 把 `unfulfilled_lint_expectations` 变成错误。条件编译
+/// 才是这里正确的表达方式。
+#[cfg(test)]
+pub(crate) const LEGACY_FORMAT_VERSION_1: u8 = 1;
+
+/// 一份载荷**要对方做什么**。
+///
+/// # 为什么要与「记录种类」分开
+///
+/// `vault` 里那个表示「这一条记录是一条条目还是一条墓碑」的种类描述的是**载荷内部**。
+/// `PayloadKind` 说的是「这整份载荷是一次状态交换还是一次请求」——它描述**载荷本身**。
+/// 把两者合成一个字段会让「一个只装墓碑的请求」这种组合无法表达。
+///
+/// # 为什么它必须被认证
+///
+/// 种类决定接收方**要不要回一份载荷**。若不认证，第三方把一份全量状态改成「请求」，
+/// 就能让接收方把自己整份保险库发回去——一次由攻击者触发的、本不该发生的传输。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadKind {
+    /// 这是发送方的**全量状态**，收下并合并即可。
+    Vault,
+    /// 这是发送方的**请求**：请把你的全量状态发给我。
+    ///
+    /// # 请求的载荷里为什么没有记录
+    ///
+    /// 「我想要什么」是一个**集合**，而集合在真实使用里就是「全部」。因此请求不携带
+    /// 记录，接收方的回应用的是 [`Payload::from_vault`]。将来做增量同步时，这里会
+    /// 加上一个「我要这些 ID」的列表，而不是换一套格式——与
+    /// [`Payload::from_vault`] 的文档里说的是同一个约定。
+    ///
+    /// # 它为什么必须存在，而不是「空载荷就表示请求」
+    ///
+    /// 一台刚注册、没有任何条目的设备发起全量同步时，载荷**也是**空的。靠「空不空」
+    /// 区分这两件事会让新设备加入这条路径上多一个必然错的分支。
+    Request,
+}
+
+impl PayloadKind {
+    /// 线格式里的字节值。
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        match self {
+            Self::Vault => 0x01,
+            Self::Request => 0x02,
+        }
+    }
+
+    /// 从线格式的字节还原。
+    #[must_use]
+    pub const fn from_byte(value: u8) -> Option<Self> {
+        match value {
+            0x01 => Some(Self::Vault),
+            0x02 => Some(Self::Request),
+            _ => None,
+        }
+    }
+}
+
+/// 载荷明文头的长度：魔数 + 版本 + 种类 + sync_id + 发送方。
+///
+/// 这里**没有**「发送方是谁」之外的字段——发送方标识就在头里，因为它是外层 AAD 的
+/// 一部分（被认证但不是秘密，见 [`Payload::sender`]）。
+///
+/// # 发送方为什么是 32 字节
+///
+/// 它是 [`DeviceId`]（设备身份公钥的 SHA-256），不是 16 字节的
+/// [`EntryId`]。两者容易混：`EntryId` 标识**保险库里的一条记录**，[`DeviceId`] 标识
+/// **一台设备**。同步层要判定「谁在跟我说话」，那只能靠后者——前者是随机的，跨会话
+/// 认不出同一台设备。
+pub const HEADER_LEN: usize = MAGIC.len() + 1 + 1 + SYNC_ID_LEN + DEVICE_ID_LEN;
 
 /// 载荷标识的长度。
 ///
@@ -244,9 +347,14 @@ pub struct Payload {
     /// 是这台设备」。要真正证明设备身份（私钥在硬件里）是 [`crate::auth`] 的事，走
     /// 的是另一条路径。两者不可互相替代：这个字段挡的是「把载荷说成别人发的」，而
     /// 那个挡不住。
-    pub sender: EntryId,
+    pub sender: DeviceId,
     /// 载荷里的记录，**仍然加密**。
     pub records: RecordSet<Record>,
+    /// 这份载荷要对方做什么。
+    ///
+    /// 私有字段：它必须与写入线格式的那个字节**永远一致**，因此只由构造函数设置并
+    /// 提供只读访问器。把它公开会让「改了字段但忘了重新 `seal`」成为可能。
+    kind: PayloadKind,
 }
 
 impl Payload {
@@ -261,6 +369,34 @@ impl Payload {
         let mut id = [0_u8; SYNC_ID_LEN];
         crate::getrandom::fill(&mut id).map_err(|_| Error::RandomnessUnavailable)?;
         Ok(id)
+    }
+
+    /// 乘这份载荷要对方做什么。
+    #[must_use]
+    pub const fn kind(&self) -> PayloadKind {
+        self.kind
+    }
+
+    /// 造一份**请求**：请把你的全量状态发给我。
+    ///
+    /// # 请求为什么是载荷，而不是另一种消息
+    ///
+    /// 它是同一套搬运、同一套认证、同一套重放防护。把它做成另一种消息类型会立刻带来
+    /// 「那种消息要不要也记重放日志」这类问题，而答案只能是「要」——那就是同一套东西。
+    ///
+    /// 请求里**没有**记录（见 [`PayloadKind::Request`]），因此它总是很小，能塞进任何
+    /// 通道——包括二维码。这是「先发请求、再走局域网传数据」那条路的第一步。
+    ///
+    /// # 错误
+    ///
+    /// [`Error::RandomnessUnavailable`]：随机源不可用。
+    pub fn request(sender: DeviceId) -> Result<Self> {
+        Ok(Self {
+            sync_id: Self::new_sync_id()?,
+            sender,
+            records: RecordSet::<Record>::new(),
+            kind: PayloadKind::Request,
+        })
     }
 
     /// 从本地保险库生成一份载荷。
@@ -292,7 +428,7 @@ impl Payload {
     /// - 编码失败（见 [`record::seal_entry`]）。
     pub fn from_vault(
         master: &MasterKey,
-        sender: EntryId,
+        sender: DeviceId,
         vault: &crate::vault::Vault,
     ) -> Result<Self> {
         let record_key = derive_record_key(master)?;
@@ -312,6 +448,58 @@ impl Payload {
             sync_id: Self::new_sync_id()?,
             sender,
             records,
+            kind: PayloadKind::Vault,
+        })
+    }
+
+    /// 只读地看一眼一份载荷的头部，**不**解密。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 重放防护必须在**动保险库之前**生效，而记账需要 `sync_id`——它在明文头里。若
+    /// 非要先 `open` 再拿标识，代价是：一份**垃圾**载荷（密文被篡改、或根本是随机
+    /// 字节）会让我们先做一次完整解压尝试才发现不对；更糟的是调用方很容易顺手在
+    /// 解密失败**之前**就把标识记进日志，于是攻击者只要发垃圾并声称标识是 X，就能让
+    /// 真正的 X 永远被拒绝。
+    ///
+    /// 有了 `peek`，「这个标识我见过吗」可以在**一条指令**里问完，且对任意输入都不会
+    /// 分配大块内存。
+    ///
+    /// # 它**不**认证任何东西
+    ///
+    /// 返回的字段全部来自明文头，因此它们只是**声明**。唯一的合法用途是拿
+    /// `sync_id` 去查重放日志——查中了直接拒绝（拒绝一份未认证的载荷不需要理由），
+    /// 没查中则仍须走完整的 [`Payload::open`]。
+    ///
+    /// # 错误
+    ///
+    /// 与 [`Payload::open`] 的头部检查相同：魔数、版本、长度。
+    pub fn peek(data: &[u8]) -> Result<PayloadHeader> {
+        let mut reader = Reader::new(data);
+        let magic = reader.take(MAGIC.len()).ok_or(Error::SyncTruncated)?;
+        if magic != MAGIC {
+            return Err(Error::SyncBadMagic);
+        }
+        let version = reader.u8_bare().ok_or(Error::SyncTruncated)?;
+        check_version(version)?;
+        let kind_byte = reader.u8_bare().ok_or(Error::SyncTruncated)?;
+        let kind = PayloadKind::from_byte(kind_byte)
+            .ok_or(Error::SyncUnknownPayloadKind { value: kind_byte })?;
+        let sync_id: SyncId = reader
+            .take(SYNC_ID_LEN)
+            .ok_or(Error::SyncTruncated)?
+            .try_into()
+            .map_err(|_| Error::SyncTruncated)?;
+        let sender_bytes: [u8; DEVICE_ID_LEN] = reader
+            .take(DEVICE_ID_LEN)
+            .ok_or(Error::SyncTruncated)?
+            .try_into()
+            .map_err(|_| Error::SyncTruncated)?;
+        Ok(PayloadHeader {
+            version,
+            kind,
+            sync_id,
+            sender: DeviceId::from_bytes(sender_bytes),
         })
     }
 
@@ -382,6 +570,7 @@ impl Payload {
         let mut out = Vec::with_capacity(HEADER_LEN + NONCE_LEN + ciphertext.len());
         out.extend_from_slice(MAGIC);
         out.push(FORMAT_VERSION);
+        out.push(self.kind.as_byte());
         out.extend_from_slice(&self.sync_id);
         out.extend_from_slice(self.sender.as_bytes());
         out.extend_from_slice(&nonce);
@@ -415,26 +604,18 @@ impl Payload {
     pub fn open(master: &MasterKey, data: &[u8]) -> Result<Self> {
         // 魔数与版本要先于任何分配检查——否则一个 3 字节的输入就能让我们走进后面的
         // 读取逻辑。
+        let header = Self::peek(data)?;
+        let PayloadHeader {
+            version,
+            kind,
+            sync_id,
+            sender,
+        } = header;
+
         let mut reader = Reader::new(data);
-        let magic = reader.take(MAGIC.len()).ok_or(Error::SyncTruncated)?;
-        if magic != MAGIC {
-            return Err(Error::SyncBadMagic);
-        }
-        let version = reader.u8_bare().ok_or(Error::SyncTruncated)?;
-        if version != FORMAT_VERSION {
-            return Err(Error::SyncUnsupportedVersion { version });
-        }
-        let sync_id: SyncId = reader
-            .take(SYNC_ID_LEN)
-            .ok_or(Error::SyncTruncated)?
-            .try_into()
-            .map_err(|_| Error::SyncTruncated)?;
-        let sender_bytes: [u8; EntryId::LEN] = reader
-            .take(EntryId::LEN)
-            .ok_or(Error::SyncTruncated)?
-            .try_into()
-            .map_err(|_| Error::SyncTruncated)?;
-        let sender = EntryId::from_bytes(sender_bytes);
+        // `peek` 已经验证过前缀，这里再跳过一遍是为了拿到游标位置。丢掉返回值而不是
+        // 重新校验：两处各写一套校验迟早会漂移。
+        let _ = reader.take(HEADER_LEN).ok_or(Error::SyncTruncated)?;
         let nonce: [u8; NONCE_LEN] = reader
             .take(NONCE_LEN)
             .ok_or(Error::SyncTruncated)?
@@ -446,9 +627,14 @@ impl Payload {
             return Err(Error::SyncTruncated);
         }
 
-        let aad = header_aad(version, &sync_id, &sender);
+        let aad = header_aad(version, kind, &sync_id, &sender);
         let key = derive_envelope_key(master)?;
-        let compressed = crypto::open_bytes(&key, &aad, &nonce, ciphertext)?;
+        // `open_bytes` 是**两个域共用**的底层助手，它报的是保险库域的错误名
+        // （`VaultDecryptionFailed`）。同步层必须把它翻成自己域的名字：一个「打开同步
+        // 载荷失败」的用户看到「保险库解密失败」会去查文件损坏、查主密钥，而真正的问题
+        // 在网络上。两个域的错误名本来就该分开——它们处置方式不同。
+        let compressed = crypto::open_bytes(&key, &aad, &nonce, ciphertext)
+            .map_err(|_| Error::SyncAuthenticationFailed)?;
 
         // ── 反向：解压 → 解析 ─────────────────────────────────────────────
         let plaintext = compress::decompress(&compressed)?;
@@ -514,6 +700,7 @@ impl Payload {
             sync_id,
             sender,
             records,
+            kind,
         })
     }
 
@@ -540,8 +727,41 @@ impl Payload {
 
     /// 外层 AEAD 的 AAD。
     fn aad(&self) -> [u8; AAD_LEN] {
-        header_aad(FORMAT_VERSION, &self.sync_id, &self.sender)
+        header_aad(FORMAT_VERSION, self.kind, &self.sync_id, &self.sender)
     }
+}
+
+/// 一份载荷的明文头，**未经认证**。
+///
+/// 由 [`Payload::peek`] 产出。字段全部来自明文头，因此它们只是**声明**——唯一的合法
+/// 用途是拿 `sync_id` 去查重放日志。见 [`Payload::peek`] 的说明。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadHeader {
+    /// 载荷格式版本。永远等于 [`FORMAT_VERSION`]（其它版本在 `peek` 里就被拒了）。
+    pub version: u8,
+    /// 这份载荷要对方做什么。
+    pub kind: PayloadKind,
+    /// 载荷标识，用于查重放日志。
+    pub sync_id: SyncId,
+    /// 发送方**自称**的身份。
+    ///
+    /// 与 [`Payload::sender`] 一样，它在 AAD 里，因此 [`Payload::open`] 之后它是可信
+    /// 的；但在 `peek` 这一步它还只是一个声明。
+    pub sender: DeviceId,
+}
+
+/// 检查版本号是否受支持。
+///
+/// # 为什么单独一个函数
+///
+/// [`Payload::peek`] 与 [`Payload::open`] 都要检查它，而「版本 1 的载荷必须被拒绝」
+/// 这件事是**被测试盯着**的（见 `sync::tests::a_version_1_payload_is_rejected`）。
+/// 两处各写一遍判断，迟早会漂移成「peek 接受、open 拒绝」这种最难查的组合。
+fn check_version(version: u8) -> Result<()> {
+    if version != FORMAT_VERSION {
+        return Err(Error::SyncUnsupportedVersion { version });
+    }
+    Ok(())
 }
 
 /// 一个边界检查的读取游标。
@@ -614,8 +834,8 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// 外层 AAD 的长度：魔数 + 版本 + sync_id + 设备 ID。
-const AAD_LEN: usize = MAGIC.len() + 1 + SYNC_ID_LEN + EntryId::LEN;
+/// 外层 AAD 的长度：魔数 + 版本 + 种类 + sync_id + 设备 ID。
+const AAD_LEN: usize = HEADER_LEN;
 
 /// 构造外层 AEAD 的 AAD。
 ///
@@ -623,7 +843,7 @@ const AAD_LEN: usize = MAGIC.len() + 1 + SYNC_ID_LEN + EntryId::LEN;
 ///
 /// 整个明文头。这是我们唯一能「绑定但不泄露」的写法：`sync_id` 与 `sender` 都必须被
 /// 认证——前者挡住「把一份载荷的标识换掉以绕过重放防护」，后者挡住「把载荷说成别人
-/// 发的」。
+/// 发的」。`kind` 也必须被认证，理由见 [`PayloadKind`]。
 ///
 /// # 为什么是自由函数而不是 `Payload` 的方法
 ///
@@ -631,18 +851,35 @@ const AAD_LEN: usize = MAGIC.len() + 1 + SYNC_ID_LEN + EntryId::LEN;
 /// 什么）。写成方法就得先造一个字段全是占位值的 `Payload`，而那样的中间状态正是最
 /// 容易被后续改动误用的东西。
 ///
+/// # 只有当前版本
+///
+/// 与保险库文件不同，载荷**不向前兼容**：版本对不上就拒绝。理由是输入的性质——载荷
+/// 来自网络，是即时的，不落盘。对用户手里的旧文件网开一面是必须的（那是他的数据），
+/// 而接受一个旧版本的**网络输入**只是给自己增加一片要维护、又永远收不到真实流量的
+/// 解析路径。详见 [`LEGACY_FORMAT_VERSION_1`] 的说明。
+///
 /// # 为什么不需要防「版本号被改」
 ///
-/// `version` 直接来自输入，而它在 AAD 里。改低版本号会让 `version != FORMAT_VERSION`
-/// 在更早的地方就返回 `SyncUnsupportedVersion`，因此走不到这里；即使走到了，AAD 变了
-/// 也会让认证失败。两道检查独立成立。
-fn header_aad(version: u8, sync_id: &SyncId, sender: &EntryId) -> [u8; AAD_LEN] {
+/// `version` 在 AAD 里，所以把它改成任何别的值都会让认证失败；改成当前版本则等于没改。
+/// 而「不是当前版本」在更早的地方就返回 [`Error::SyncUnsupportedVersion`] 了。
+fn header_aad(
+    version: u8,
+    kind: PayloadKind,
+    sync_id: &SyncId,
+    sender: &DeviceId,
+) -> [u8; AAD_LEN] {
+    debug_assert_eq!(version, FORMAT_VERSION);
     let mut aad = [0_u8; AAD_LEN];
+    let mut offset = 0;
     aad[..MAGIC.len()].copy_from_slice(MAGIC);
-    aad[MAGIC.len()] = version;
-    let offset = MAGIC.len() + 1;
+    offset += MAGIC.len();
+    aad[offset] = version;
+    offset += 1;
+    aad[offset] = kind.as_byte();
+    offset += 1;
     aad[offset..offset + SYNC_ID_LEN].copy_from_slice(sync_id);
-    aad[offset + SYNC_ID_LEN..].copy_from_slice(sender.as_bytes());
+    offset += SYNC_ID_LEN;
+    aad[offset..].copy_from_slice(sender.as_bytes());
     aad
 }
 
@@ -663,6 +900,11 @@ mod tests {
     use crate::vault::{Entry as VaultEntry, RecordKind, Timestamp, Vault, master_key_to_bytes};
 
     /// 造一条合法条目。
+    // 「旧版本号必须小于当前版本」，否则「拒绝旧版本」的测试会退化成「拒绝当前版本」
+    // ——一个必然绿、什么也没证明的断言。编译期常量断言（不是运行期 `assert!`：后者
+    // 会被 clippy 正确地指为 `assertions_on_constants`）。
+    const _: () = assert!(LEGACY_FORMAT_VERSION_1 != FORMAT_VERSION);
+
     fn sample_entry(seed: u8) -> VaultEntry {
         VaultEntry::new(
             format!("服务 {seed}"),
@@ -678,6 +920,11 @@ mod tests {
             Timestamp::from(1_700_000_000_u64),
         )
         .expect("字段合法")
+    }
+
+    /// 造一个设备标识。同步的「发送方」是 [`DeviceId`]，不是 16 字节的 `EntryId`。
+    fn device(seed: u8) -> DeviceId {
+        DeviceId::from_bytes([seed; DEVICE_ID_LEN])
     }
 
     fn a_master_key() -> MasterKey {
@@ -721,17 +968,18 @@ mod tests {
         assert_eq!(reader.take(MAGIC.len()), Some(&MAGIC[..]), "魔数");
         let version = reader.u8_bare().expect("版本");
         assert_eq!(version, FORMAT_VERSION, "版本");
+        let kind = PayloadKind::from_byte(reader.u8_bare().expect("种类")).expect("种类合法");
         let sync_id = reader.take(SYNC_ID_LEN).expect("sync_id");
-        let sender = reader.take(EntryId::LEN).expect("发送方");
+        let sender = reader.take(DEVICE_ID_LEN).expect("发送方");
         let nonce = reader.take(NONCE_LEN).expect("nonce");
         let ciphertext = reader.rest();
         assert!(reader.is_empty(), "密文之后还有多余字节");
 
         let sync_id = <[u8; SYNC_ID_LEN]>::try_from(sync_id).expect("长度正确");
-        let sender = EntryId::from_bytes(<[u8; EntryId::LEN]>::try_from(sender).expect("长度"));
+        let sender = DeviceId::from_bytes(<[u8; DEVICE_ID_LEN]>::try_from(sender).expect("长度"));
         let nonce = <[u8; NONCE_LEN]>::try_from(nonce).expect("长度正确");
 
-        let aad = header_aad(version, &sync_id, &sender);
+        let aad = header_aad(version, kind, &sync_id, &sender);
         let envelope_key = derive_envelope_key(master).expect("可派生");
         let compressed = crate::vault::crypto::open_bytes(&envelope_key, &aad, &nonce, ciphertext)
             .expect("外层应当解得开");
@@ -766,7 +1014,7 @@ mod tests {
     #[test]
     fn the_plaintext_record_framing_matches_encoded_len() {
         let master = a_master_key();
-        let sender = EntryId::from_bytes([7; EntryId::LEN]);
+        let sender = device(7);
 
         // 三条条目 + 一条墓碑：两种记录都要出现在同一份载荷里。
         let mut vault = Vault::new();
@@ -819,7 +1067,7 @@ mod tests {
     #[test]
     fn the_record_kind_is_not_in_the_plaintext() {
         let master = a_master_key();
-        let sender = EntryId::from_bytes([7; EntryId::LEN]);
+        let sender = device(7);
 
         let mut vault = Vault::new();
         let id = vault.insert(sample_entry(1)).expect("随机源可用");
@@ -858,9 +1106,197 @@ mod tests {
         assert_eq!(&HKDF_SALT_SYNC, b"Qualia2FA sync salt v1 (records)");
         assert_eq!(HKDF_SALT_SYNC.len(), 32);
         assert_eq!(MAGIC, b"Q2FASYNC");
-        assert_eq!(FORMAT_VERSION, 1);
+        assert_eq!(FORMAT_VERSION, 2);
         // 载荷格式版本与文件格式版本是**两个**独立常量。
-        assert_ne!(FORMAT_VERSION, crate::vault::FORMAT_VERSION);
+        //
+        // 这里**不能**断言两者不相等：它们现在恰好都是 2，而那是巧合——一个是
+        // 「同步载荷布局」，一个是「保险库文件布局」，各自演进。真正的性质是它们
+        // **各自有定义且互不引用**，而那由「两者都是独立 `pub const`」保证，测不出来。
+        // 写一个 `assert_ne!` 只会让「文件格式加一个字段」这种无关改动把这条测试弄红。
+        assert!(
+            crate::vault::READABLE_VERSIONS.contains(&crate::vault::FORMAT_VERSION),
+            "文件格式自己声明的版本必须在自己可读的版本列表里"
+        );
+    }
+
+    /// **版本 1 的载荷必须被明确拒绝，而不是被当成版本 2 硬解。**
+    ///
+    /// # 为什么这条测试重要
+    ///
+    /// 版本 1 与版本 2 在外层**差一个 `PayloadKind` 字节**。一个「宽容」的解析器
+    /// （比如「版本号≤2 都按新格式读」）会把版本 1 的第 9 个字节当成种类、把
+    /// `sync_id` 整体错位一格，然后报一个**认证失败**——一个把诊断引向「密钥不对」
+    /// 的错误方向的现象。用户会去重新配对、重新登录，而真正的原因是版本。
+    ///
+    /// 而且版本 1 从未发布，因此这里没有兼容负担：拒绝是唯一正确的做法。
+    #[test]
+    fn a_version_1_payload_is_rejected() {
+        let master = a_master_key();
+        let mut vault = Vault::new();
+        vault.insert(sample_entry(1)).expect("随机源可用");
+        let payload = Payload::from_vault(&master, device(1), &vault).expect("打包");
+        let sealed = payload.seal(&master).expect("封装");
+
+        // 把版本号改回 1——字节层面完全模拟一份版本 1 的载荷。
+        let mut legacy = sealed.clone();
+        legacy[MAGIC.len()] = LEGACY_FORMAT_VERSION_1;
+
+        // `peek` 与 `open` 两条路径都必须拒绝它，且报的是**版本**而不是认证失败。
+        for result in [
+            Payload::peek(&legacy).map(|_| ()),
+            Payload::open(&master, &legacy).map(|_| ()),
+        ] {
+            match result {
+                Err(Error::SyncUnsupportedVersion { version }) => {
+                    assert_eq!(version, LEGACY_FORMAT_VERSION_1);
+                }
+                other => panic!("版本 1 未被按版本拒绝，实际 {other:?}"),
+            }
+        }
+    }
+
+    /// 一份**请求**载荷：种类被认证，且不携带记录。
+    #[test]
+    fn a_request_payload_carries_no_records_and_keeps_its_kind() {
+        let master = a_master_key();
+        let sender = device(3);
+        let payload = Payload::request(sender).expect("造请求");
+
+        assert_eq!(payload.kind(), PayloadKind::Request);
+        assert!(payload.is_empty(), "请求不该带记录");
+        assert_eq!(payload.sender, sender);
+
+        let sealed = payload.seal(&master).expect("封装");
+
+        // 不解密就能看出它是请求——这正是「先发请求、再走局域网传数据」那条路的
+        // 第一步：接收方要能在不动保险库的前提下知道对方想要什么。
+        let header = Payload::peek(&sealed).expect("peek");
+        assert_eq!(header.kind, PayloadKind::Request);
+        assert_eq!(header.sender, sender);
+        assert_eq!(header.sync_id, payload.sync_id);
+        assert_eq!(header.version, FORMAT_VERSION);
+
+        let opened = Payload::open(&master, &sealed).expect("拆包");
+        assert_eq!(opened.kind(), PayloadKind::Request);
+        assert!(opened.is_empty());
+    }
+
+    /// **种类被 AAD 认证**：把它从「状态」改成「请求」必须导致认证失败。
+    ///
+    /// 若种类不被认证，第三方把一份全量状态改成「请求」，就能让接收方把自己整份保险库
+    /// 发回去——一次由攻击者触发的、本不该发生的传输。
+    #[test]
+    fn flipping_the_payload_kind_breaks_authentication() {
+        let master = a_master_key();
+        let mut vault = Vault::new();
+        vault.insert(sample_entry(1)).expect("随机源可用");
+        let payload = Payload::from_vault(&master, device(1), &vault).expect("打包");
+        let sealed = payload.seal(&master).expect("封装");
+
+        // 种类字节紧跟在版本号之后。
+        let kind_offset = MAGIC.len() + 1;
+        assert_eq!(sealed[kind_offset], PayloadKind::Vault.as_byte());
+
+        let mut flipped = sealed.clone();
+        flipped[kind_offset] = PayloadKind::Request.as_byte();
+
+        // `peek` 只看明文，因此它会**成功**——这正是它「不认证任何东西」的体现。
+        let peeked = Payload::peek(&flipped).expect("peek 只看明文，应当成功");
+        assert_eq!(peeked.kind, PayloadKind::Request);
+
+        // 但 `open` 必须失败：种类在 AAD 里。
+        let result = Payload::open(&master, &flipped);
+        assert!(
+            matches!(result, Err(Error::SyncAuthenticationFailed)),
+            "篡改种类之后仍能打开，实际 {result:?}"
+        );
+
+        // 未篡改的那份仍然正常工作。
+        assert!(Payload::open(&master, &sealed).is_ok());
+    }
+
+    /// 未知的种类字节被拒绝，且**不**被当成默认值。
+    #[test]
+    fn an_unknown_payload_kind_is_rejected() {
+        let master = a_master_key();
+        let mut vault = Vault::new();
+        vault.insert(sample_entry(1)).expect("随机源可用");
+        let payload = Payload::from_vault(&master, device(1), &vault).expect("打包");
+        let sealed = payload.seal(&master).expect("封装");
+
+        for bogus in [0x00_u8, 0x03, 0x80, 0xFF] {
+            let mut bad = sealed.clone();
+            bad[MAGIC.len() + 1] = bogus;
+            let result = Payload::peek(&bad);
+            match result {
+                Err(Error::SyncUnknownPayloadKind { value }) => assert_eq!(value, bogus),
+                other => panic!("未知种类 {bogus:#04x} 未被拒绝，实际 {other:?}"),
+            }
+        }
+    }
+
+    /// `peek` 对**任意**字节都不会 panic，且不做与输入等长的分配。
+    #[test]
+    fn peek_never_panics_on_arbitrary_bytes() {
+        // 固定的一组前缀，而不是随机——这条测试要的是可复现。
+        let cases: [&[u8]; 6] = [
+            b"",
+            b"Q",
+            b"Q2FASYNC",
+            b"Q2FASYNC\x02",
+            b"Q2FASYNC\x02\x01",
+            b"Q2FASYNC\x09\xff",
+        ];
+        for case in cases {
+            // 只要求不 panic；成不成功都行。
+            let _ = Payload::peek(case);
+        }
+        // 一份完整的空载荷的头必须能读出来。
+        let master = a_master_key();
+        let payload = Payload::request(device(1)).expect("请求");
+        let sealed = payload.seal(&master).expect("封装");
+        assert!(Payload::peek(&sealed).is_ok());
+    }
+
+    /// 载荷头的字节排布**逐字节**与文档一致。
+    ///
+    /// 这条测试与 `Payload::seal` 是两份独立实现：它按文档手工拼出应有的前缀，而不是
+    /// 调用任何 `seal` 逻辑。版本 1 → 2 的改动正是那种「常量与写出的字节不一致」的
+    /// 改动，而 `HEADER_LEN` 此前也确实算错过（写成 `+2` 而实际是 `+1`）。
+    #[test]
+    fn the_payload_header_is_laid_out_byte_for_byte() {
+        let master = a_master_key();
+        let sender = device(0xAB);
+        let payload = Payload::request(sender).expect("请求");
+        let sealed = payload.seal(&master).expect("封装");
+
+        assert_eq!(&sealed[..8], b"Q2FASYNC", "魔数");
+        assert_eq!(sealed[8], FORMAT_VERSION, "版本");
+        assert_eq!(sealed[9], PayloadKind::Request.as_byte(), "种类");
+        assert_eq!(&sealed[10..42], &payload.sync_id, "sync_id");
+        assert_eq!(&sealed[42..74], sender.as_bytes(), "发送方");
+
+        // 头之后是 nonce，再之后是**压缩过**的明文，其长度无法从常量算出来（deflate
+        // 对 4 字节输入的输出与实现有关）。因此这里解出真实明文来对账，而不是硬编码
+        // 一个长度——硬编码会让这条测试在压缩实现变化时失败，而那时它报的原因是
+        // 「载荷总长度不对」，一个指向错误方向的现象。
+        let plaintext = plaintext_of(&sealed, &master);
+        assert_eq!(
+            plaintext,
+            0_u32.to_be_bytes(),
+            "空请求的明文应当就是一个「零条记录」的计数"
+        );
+        // 唯一的定长部分：头 + nonce + 认证标签，剩下的才是压缩段。
+        assert!(
+            sealed.len() >= HEADER_LEN + NONCE_LEN + TAG_LEN,
+            "连「头 + nonce + 认证标签」都不够长：{} < {}",
+            sealed.len(),
+            HEADER_LEN + NONCE_LEN + TAG_LEN
+        );
+        assert_eq!(
+            HEADER_LEN, 74,
+            "头的字节数：8 魔数 + 1 版本 + 1 种类 + 32 sync_id + 32 发送方"
+        );
     }
 
     /// 载荷与保险库的密钥必须真的不同。
@@ -880,7 +1316,7 @@ mod tests {
     #[test]
     fn an_empty_vault_roundtrips() {
         let master = a_master_key();
-        let sender = EntryId::from_bytes([1; EntryId::LEN]);
+        let sender = device(1);
         let payload = Payload::from_vault(&master, sender, &Vault::new()).expect("打包");
 
         assert!(payload.is_empty(), "空保险库不该产生记录");
@@ -901,7 +1337,7 @@ mod tests {
     #[test]
     fn every_payload_gets_a_fresh_sync_id() {
         let master = a_master_key();
-        let sender = EntryId::from_bytes([1; EntryId::LEN]);
+        let sender = device(1);
         let mut vault = Vault::new();
         vault.insert(sample_entry(1)).expect("随机源可用");
 
@@ -921,7 +1357,7 @@ mod tests {
     #[test]
     fn sealing_the_same_vault_twice_produces_different_bytes() {
         let master = a_master_key();
-        let sender = EntryId::from_bytes([1; EntryId::LEN]);
+        let sender = device(1);
         let mut vault = Vault::new();
         vault.insert(sample_entry(1)).expect("随机源可用");
 
@@ -960,7 +1396,7 @@ mod tests {
     #[test]
     fn an_entry_with_a_tombstone_is_not_sent() {
         let master = a_master_key();
-        let sender = EntryId::from_bytes([1; EntryId::LEN]);
+        let sender = device(1);
 
         let mut vault = Vault::new();
         let kept = vault.insert(sample_entry(1)).expect("随机源可用");
@@ -1024,8 +1460,7 @@ mod tests {
         // 明文 = 一个声称有一条记录的载荷，但把记录数改成 u32::MAX。
         let mut vault = Vault::new();
         vault.insert(sample_entry(1)).expect("随机源可用");
-        let payload = Payload::from_vault(&master, EntryId::from_bytes([1; EntryId::LEN]), &vault)
-            .expect("打包");
+        let payload = Payload::from_vault(&master, device(1), &vault).expect("打包");
 
         // 手工构造：记录数写成 u32::MAX，后面附上真实的记录字节（不压缩，直接进
         // 底层 AEAD——`decompress` 对未压缩输入会失败，因此这里改走 compress 之后
@@ -1036,13 +1471,19 @@ mod tests {
         let compressed = compress::compress(&plaintext).expect("可压缩");
 
         let envelope_key = derive_envelope_key(&master).expect("可派生");
-        let aad = header_aad(FORMAT_VERSION, &payload.sync_id, &payload.sender);
+        let aad = header_aad(
+            FORMAT_VERSION,
+            PayloadKind::Vault,
+            &payload.sync_id,
+            &payload.sender,
+        );
         let (nonce, ciphertext) =
             crate::vault::crypto::seal_bytes(&envelope_key, &aad, &compressed).expect("可加密");
 
         let mut sealed = Vec::new();
         sealed.extend_from_slice(MAGIC);
         sealed.push(FORMAT_VERSION);
+        sealed.push(PayloadKind::Vault.as_byte());
         sealed.extend_from_slice(&payload.sync_id);
         sealed.extend_from_slice(payload.sender.as_bytes());
         sealed.extend_from_slice(&nonce);
