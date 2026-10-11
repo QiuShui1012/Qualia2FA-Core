@@ -57,6 +57,7 @@ pub mod auth;
 pub mod base32;
 pub mod device;
 mod error;
+pub mod flow;
 pub mod otp;
 pub mod pairing;
 pub mod recovery;
@@ -66,6 +67,13 @@ pub mod vault;
 
 pub use auth::{Responder, Verified, Verifier};
 pub use error::{Error, Result};
+
+/// 注册与登录编排的公开类型。
+///
+/// 只导出**用户旅程**这一层的类型与两个注入点。刻意不导出任何按步骤拆开的中间
+/// 类型：调用方按顺序自己调 `vault`/`pairing`/`device` 是合法的，但那样做就绕开了
+/// 本模块保证的顺序（见 [`flow`] 的模块文档），因此不在公开面上鼓励。
+pub use flow::{DeviceKeys, Joiner, Login, Registered, SecureStore};
 
 /// 设备身份的公开类型。
 ///

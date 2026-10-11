@@ -16,6 +16,9 @@ cargo-fuzz = true
 # fuzz 目标把任意字节喂给库的公共解析入口。
 libfuzzer-sys = "0.4.13"
 qualia2fa-core = { path = ".." }
+# `login_handshake` 需要一条真实的设备身份（合法的 P-256 公钥与签名），而库刻意
+# 不导出「生成一把设备私钥」——那属于 `qualia2fa-keystore`，本目标用固定标量代替。
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 
 [[bin]]
 name = "secret_debug_redaction"
@@ -45,6 +48,15 @@ bench = false
 [[bin]]
 name = "vault_parse"
 path = "fuzz_targets/vault_parse.rs"
+test = false
+doc = false
+bench = false
+
+# 攻击者可控输入面：登录握手的 Msg1 与 Msg2。二维码是公开的（贴在屏幕上），
+# 因此任何能看到它的人都能往这两条路径上送任意字节。
+[[bin]]
+name = "login_handshake"
+path = "fuzz_targets/login_handshake.rs"
 test = false
 doc = false
 bench = false
