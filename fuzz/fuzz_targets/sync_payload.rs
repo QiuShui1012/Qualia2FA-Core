@@ -69,7 +69,7 @@ fn master_from(data: &[u8]) -> MasterKey {
     let mut key = [0_u8; vault::MASTER_KEY_LEN];
     let take = data.len().min(vault::MASTER_KEY_LEN);
     key[..take].copy_from_slice(&data[..take]);
-    MasterKey::from_bytes(key.to_vec().into()).expect("长度恒为 32")
+    MasterKey::from_bytes(key.to_vec().into()).expect("the length is always 32")
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -79,12 +79,12 @@ fuzz_target!(|data: &[u8]| {
         Ok(payload) => {
             if let Ok(again) = payload.seal(&master) {
                 let Ok(reparsed) = Payload::open(&master, &again) else {
-                    panic!("自己打包出的载荷自己解不开");
+                    panic!("a payload sealed by this target must open again");
                 };
                 assert_eq!(
                     reparsed.len(),
                     payload.len(),
-                    "往返后记录数变化"
+                    "the record count changed after the round trip"
                 );
             }
             let _ = payload.open_records(&master);
@@ -96,7 +96,7 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(plaintext) = sync::compress::decompress(data) {
         assert!(
             plaintext.len() <= sync::compress::MAX_DECOMPRESSED_LEN,
-            "解压结果 {} 字节，超过了声称的上限 {}",
+            "the decompressed result is {} bytes, over the claimed limit {}",
             plaintext.len(),
             sync::compress::MAX_DECOMPRESSED_LEN
         );
@@ -104,7 +104,7 @@ fuzz_target!(|data: &[u8]| {
 
     // ── Mode 3: round-trip of compression itself ────────────────────────────
     if let Ok(packed) = sync::compress::compress(data) {
-        let back = sync::compress::decompress(&packed).expect("自己压出的流自己解不开");
-        assert_eq!(back, data, "压缩往返改变了内容");
+        let back = sync::compress::decompress(&packed).expect("a stream this target compressed itself must decompress again");
+        assert_eq!(back, data, "the compression round trip changed the content");
     }
 });

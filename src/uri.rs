@@ -199,7 +199,7 @@ fn truncate(value: &str, max: usize) -> String {
 /// use qualia2fa_core::otp::{Algorithm, Digits};
 ///
 /// let uri = "otpauth://totp/GitHub:alice?secret=JBSWY3DPEHPK3PXP&issuer=GitHub&digits=8";
-/// let parsed = uri::parse(uri).expect("合法 URI");
+/// let parsed = uri::parse(uri).expect("valid URI");
 /// assert_eq!(parsed.issuer.as_deref(), Some("GitHub"));
 /// assert_eq!(parsed.account, "alice");
 /// assert_eq!(parsed.digits, Digits::Eight);
@@ -294,7 +294,7 @@ fn parse_period(value: &str) -> Result<u64> {
     let Ok(period) = value.parse::<u64>() else {
         return Err(Error::UriInvalidParameter {
             name: "period".to_owned(),
-            reason: format!("不是合法整数：{}", truncate(value, 16)),
+            reason: format!("not a valid integer: {}", truncate(value, 16)),
         });
     };
     if period == 0 {
@@ -303,7 +303,7 @@ fn parse_period(value: &str) -> Result<u64> {
     if period > MAX_PERIOD {
         return Err(Error::UriInvalidParameter {
             name: "period".to_owned(),
-            reason: format!("超出上限 {MAX_PERIOD} 秒"),
+            reason: format!("exceeds the {MAX_PERIOD} second limit"),
         });
     }
     Ok(period)
@@ -315,7 +315,7 @@ fn parse_counter(value: &str) -> Result<u64> {
         .parse::<u64>()
         .map_err(|_| Error::UriInvalidParameter {
             name: "counter".to_owned(),
-            reason: format!("不是合法无符号整数：{}", truncate(value, 16)),
+            reason: format!("not a valid unsigned integer: {}", truncate(value, 16)),
         })
 }
 
@@ -625,23 +625,23 @@ mod tests {
         assert_eq!(hex_value(b'a'), Some(10));
         assert_eq!(hex_value(b'F'), Some(15));
         for &bad in b"gG/: " {
-            assert_eq!(hex_value(bad), None, "{bad:?} 不应被接受");
+            assert_eq!(hex_value(bad), None, "{bad:?} must not be accepted");
         }
     }
 
     #[test]
     fn path_decoding_does_not_treat_plus_as_space() {
-        assert_eq!(percent_decode_path("a+b").expect("应可解码"), "a+b");
-        assert_eq!(percent_decode_path("a%2Bb").expect("应可解码"), "a+b");
-        assert_eq!(percent_decode_path("a%20b").expect("应可解码"), "a b");
+        assert_eq!(percent_decode_path("a+b").expect("must decode"), "a+b");
+        assert_eq!(percent_decode_path("a%2Bb").expect("must decode"), "a+b");
+        assert_eq!(percent_decode_path("a%20b").expect("must decode"), "a b");
     }
 
     #[test]
     fn path_decoding_handles_multibyte_utf8() {
-        assert_eq!(percent_decode_path("%E4%B8%AD").expect("应可解码"), "中");
-        assert_eq!(percent_decode_path("中").expect("应可解码"), "中");
+        assert_eq!(percent_decode_path("%E4%B8%AD").expect("must decode"), "中");
+        assert_eq!(percent_decode_path("中").expect("must decode"), "中");
         assert_eq!(
-            percent_decode_path("a%E4%B8%ADb").expect("应可解码"),
+            percent_decode_path("a%E4%B8%ADb").expect("must decode"),
             "a中b"
         );
     }
@@ -654,7 +654,7 @@ mod tests {
                     percent_decode_path(bad),
                     Err(Error::UriInvalidPercentEncoding)
                 ),
-                "{bad:?} 应因编码格式被拒绝"
+                "{bad:?} must be rejected for its escape format"
             );
         }
     }
@@ -673,7 +673,7 @@ mod tests {
                     percent_decode_path(bad),
                     Err(Error::UriInvalidPercentEncoding)
                 ),
-                "{bad:?} 应因非法 UTF-8 被拒绝"
+                "{bad:?} must be rejected for invalid UTF-8"
             );
         }
     }
@@ -698,15 +698,15 @@ mod tests {
     #[test]
     fn label_splits_on_first_colon_only() {
         assert_eq!(
-            split_label("ACME:john@example.com").expect("合法"),
+            split_label("ACME:john@example.com").expect("valid"),
             (Some("ACME"), "john@example.com".to_owned())
         );
         assert_eq!(
-            split_label("justaccount").expect("合法"),
+            split_label("justaccount").expect("valid"),
             (None, "justaccount".to_owned())
         );
         assert_eq!(
-            split_label(":acct").expect("合法"),
+            split_label(":acct").expect("valid"),
             (None, "acct".to_owned())
         );
     }
@@ -724,12 +724,12 @@ mod tests {
         for bad in ["ACME:john:8080", ":a::a", "a::b", "x:y:z"] {
             assert!(
                 matches!(split_label(bad), Err(Error::UriAccountContainsColon { .. })),
-                "{bad:?} 应被拒绝"
+                "{bad:?} must be rejected"
             );
         }
 
         assert_eq!(
-            split_label("a:").expect("空账号名应被接受"),
+            split_label("a:").expect("an empty account name must be accepted"),
             (Some("a"), String::new())
         );
 
@@ -738,7 +738,7 @@ mod tests {
                 split_label("::"),
                 Err(Error::UriAccountContainsColon { .. })
             ),
-            "\"::\" 的账号名是 \":\"，应被拒绝"
+            "the account name of \"::\" is \":\" and must be rejected"
         );
     }
 
@@ -748,7 +748,7 @@ mod tests {
     fn serialize_rejects_colon_in_account() {
         let auth = OtpAuth {
             uri_type: UriType::Totp,
-            secret: OtpSecret::from_bytes(vec![1, 2, 3, 4]).expect("非空"),
+            secret: OtpSecret::from_bytes(vec![1, 2, 3, 4]).expect("non-empty"),
             issuer: Some("ACME".to_owned()),
             account: "john:8080".to_owned(),
             algorithm: Algorithm::Sha1,
@@ -771,22 +771,23 @@ mod tests {
     #[test]
     fn issuer_may_come_from_either_source() {
         assert_eq!(
-            resolve_issuer(Some("GitHub"), None).expect("应成功"),
+            resolve_issuer(Some("GitHub"), None).expect("must succeed"),
             Some("GitHub".to_owned())
         );
         assert_eq!(
-            resolve_issuer(None, Some("GitHub".to_owned())).expect("应成功"),
+            resolve_issuer(None, Some("GitHub".to_owned())).expect("must succeed"),
             Some("GitHub".to_owned())
         );
         assert_eq!(
-            resolve_issuer(Some("GitHub"), Some("GitHub".to_owned())).expect("一致时应成功"),
+            resolve_issuer(Some("GitHub"), Some("GitHub".to_owned()))
+                .expect("must succeed when they agree"),
             Some("GitHub".to_owned())
         );
     }
 
     #[test]
     fn period_bounds_are_enforced() {
-        assert_eq!(parse_period("30").expect("30 合法"), 30);
+        assert_eq!(parse_period("30").expect("30 is valid"), 30);
         assert!(matches!(parse_period("0"), Err(Error::InvalidPeriod)));
         assert!(matches!(
             parse_period("99999999999999999999"),
@@ -801,15 +802,15 @@ mod tests {
 
     #[test]
     fn counter_parsing_is_strict() {
-        assert_eq!(parse_counter("0").expect("0 合法"), 0);
+        assert_eq!(parse_counter("0").expect("0 is valid"), 0);
         assert_eq!(
-            parse_counter("18446744073709551615").expect("u64 上限合法"),
+            parse_counter("18446744073709551615").expect("the u64 maximum is valid"),
             u64::MAX
         );
         for bad in ["-1", "1.5", "", "abc", "18446744073709551616"] {
             assert!(
                 matches!(parse_counter(bad), Err(Error::UriInvalidParameter { .. })),
-                "{bad:?} 应被拒绝"
+                "{bad:?} must be rejected"
             );
         }
     }
@@ -828,9 +829,13 @@ mod tests {
             "100%",
         ] {
             let encoded = percent_encode_path(original);
-            let decoded = percent_decode_path(&encoded)
-                .unwrap_or_else(|e| panic!("{original:?} 编码为 {encoded:?} 后无法解码: {e}"));
-            assert_eq!(decoded, original, "路径编码往返失败：{encoded:?}");
+            let decoded = percent_decode_path(&encoded).unwrap_or_else(|e| {
+                panic!("{original:?} encoded as {encoded:?} cannot be decoded back: {e}")
+            });
+            assert_eq!(
+                decoded, original,
+                "path encoding round trip failed: {encoded:?}"
+            );
         }
     }
 
@@ -840,10 +845,13 @@ mod tests {
             let encoded = percent_encode_query(original);
             let decoded = form_urlencoded::parse(format!("v={encoded}").as_bytes())
                 .next()
-                .expect("应有一个参数")
+                .expect("there must be one parameter")
                 .1
                 .into_owned();
-            assert_eq!(decoded, original, "query 编码往返失败：{encoded:?}");
+            assert_eq!(
+                decoded, original,
+                "query encoding round trip failed: {encoded:?}"
+            );
         }
     }
 
@@ -858,15 +866,18 @@ mod tests {
     #[test]
     fn debug_output_hides_the_secret() {
         let auth = parse("otpauth://totp/ACME:alice?secret=JBSWY3DPEHPK3PXP&issuer=ACME")
-            .expect("合法 URI");
+            .expect("valid URI");
         let text = format!("{auth:?}");
-        assert!(text.contains("redacted"), "应标注脱敏：{text}");
+        assert!(
+            text.contains("redacted"),
+            "must be marked as redacted: {text}"
+        );
         assert!(
             !text.contains("JBSWY3DPEHPK3PXP"),
-            "Debug 泄露了 Base32 种子：{text}"
+            "Debug output leaks the Base32 seed: {text}"
         );
-        assert!(text.contains("ACME"), "应显示 issuer：{text}");
-        assert!(text.contains("alice"), "应显示 account：{text}");
+        assert!(text.contains("ACME"), "must show the issuer: {text}");
+        assert!(text.contains("alice"), "must show the account: {text}");
     }
 
     /// `Debug` must truncate an oversized `issuer` / `account`.
@@ -881,23 +892,32 @@ mod tests {
         let long_issuer = "I".repeat(500);
         let long_account = "A".repeat(500);
         let input = format!("otpauth://totp/{long_issuer}:{long_account}?secret=AA");
-        let auth = parse(&input).expect("应可解析");
+        let auth = parse(&input).expect("must parse");
 
         let text = format!("{auth:?}");
 
-        assert!(!text.contains(&long_issuer), "超长 issuer 未被截断：{text}");
+        assert!(
+            !text.contains(&long_issuer),
+            "the oversized issuer was not truncated: {text}"
+        );
         assert!(
             !text.contains(&long_account),
-            "超长 account 未被截断：{text}"
+            "the oversized account was not truncated: {text}"
         );
-        assert!(text.contains('…'), "截断应带省略号：{text}");
+        assert!(
+            text.contains('…'),
+            "truncation must add an ellipsis: {text}"
+        );
 
-        assert_eq!(auth.account, long_account, "截断不应修改真实数据");
+        assert_eq!(
+            auth.account, long_account,
+            "truncation must not modify the real data"
+        );
         assert_eq!(auth.issuer.as_deref(), Some(long_issuer.as_str()));
 
         assert!(
             text.len() < 512,
-            "Debug 输出应被限长，实际 {} 字节：{text}",
+            "Debug output must be length-limited, actually {} bytes: {text}",
             text.len()
         );
     }

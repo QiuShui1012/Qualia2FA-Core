@@ -221,7 +221,7 @@ impl Verifier {
     pub fn verify(self, response: &[u8], master: &MasterKey) -> Result<Verified> {
         if response.len() != RESPONSE_SIGNED_LEN {
             return Err(Error::AuthMessageMalformed {
-                reason: "应答长度不对",
+                reason: "wrong response length",
             });
         }
         let body = &response[..RESPONSE_LEN];
@@ -238,12 +238,12 @@ impl Verifier {
 
         let responder_public = PublicKey::from_sec1_bytes(&responder_public).map_err(|_| {
             Error::AuthMessageMalformed {
-                reason: "应答里的临时公钥不是合法的 P-256 SEC1 点",
+                reason: "the ephemeral public key in the response is not a valid P-256 SEC1 point",
             }
         })?;
         let device_key = DevicePublicKey::from_sec1_bytes(&device_public).map_err(|_| {
             Error::AuthMessageMalformed {
-                reason: "应答里的设备公钥不是合法的 P-256 SEC1 点",
+                reason: "the device public key in the response is not a valid P-256 SEC1 point",
             }
         })?;
 
@@ -422,18 +422,18 @@ impl Responder {
     ) -> Result<Vec<u8>> {
         if device_public.len() != PUBLIC_KEY_LEN {
             return Err(Error::AuthMessageMalformed {
-                reason: "设备身份公钥长度不是 65 字节",
+                reason: "device identity public key length is not 65 bytes",
             });
         }
         DevicePublicKey::from_sec1_bytes(device_public).map_err(|_| {
             Error::AuthMessageMalformed {
-                reason: "设备身份公钥不是合法的 P-256 SEC1 点",
+                reason: "the device identity public key is not a valid P-256 SEC1 point",
             }
         })?;
 
         let verifier_public = PublicKey::from_sec1_bytes(&self.verifier_public).map_err(|_| {
             Error::AuthMessageMalformed {
-                reason: "挑战里的临时公钥不是合法的 P-256 SEC1 点",
+                reason: "the ephemeral public key in the challenge is not a valid P-256 SEC1 point",
             }
         })?;
         let session_id = self.session_id();
@@ -477,7 +477,7 @@ impl core::fmt::Debug for Responder {
 /// # Errors
 ///
 /// Fails only when the OS random source is unavailable ([`Error::RandomnessUnavailable`]).
-#[must_use = "挑战必须被发出去，否则这次认证无法开始"]
+#[must_use = "the challenge must be sent out, otherwise this authentication cannot start"]
 pub fn begin() -> Result<(Vec<u8>, Verifier)> {
     let secret = EphemeralSecret::generate();
     let point = secret.public_key().to_sec1_point(false);
@@ -513,7 +513,7 @@ pub fn begin() -> Result<(Vec<u8>, Verifier)> {
 pub fn accept(challenge: &[u8]) -> Result<Responder> {
     if challenge.len() != CHALLENGE_LEN {
         return Err(Error::AuthMessageMalformed {
-            reason: "挑战长度不对",
+            reason: "wrong challenge length",
         });
     }
     let mut verifier_public = [0_u8; PUBLIC_KEY_LEN];
@@ -522,7 +522,7 @@ pub fn accept(challenge: &[u8]) -> Result<Responder> {
     verifier_nonce.copy_from_slice(&challenge[PUBLIC_KEY_LEN..]);
 
     PublicKey::from_sec1_bytes(&verifier_public).map_err(|_| Error::AuthMessageMalformed {
-        reason: "挑战里的临时公钥不是合法的 P-256 SEC1 点",
+        reason: "the ephemeral public key in the challenge is not a valid P-256 SEC1 point",
     })?;
 
     let secret = EphemeralSecret::generate();
@@ -563,7 +563,7 @@ pub fn confirm(
 ) -> Result<()> {
     if confirmation.len() != CONFIRM_LEN {
         return Err(Error::AuthMessageMalformed {
-            reason: "确认标签长度不对",
+            reason: "wrong confirmation tag length",
         });
     }
     if *session_id != responder.session_id() {
@@ -571,7 +571,7 @@ pub fn confirm(
     }
     let verifier_public = PublicKey::from_sec1_bytes(&responder.verifier_public).map_err(|_| {
         Error::AuthMessageMalformed {
-            reason: "挑战里的临时公钥不是合法的 P-256 SEC1 点",
+            reason: "the ephemeral public key in the challenge is not a valid P-256 SEC1 point",
         }
     })?;
     let shared = responder.secret.diffie_hellman(&verifier_public);
@@ -744,7 +744,7 @@ mod tests {
     fn device(scalar: u8) -> (SigningKey, [u8; PUBLIC_KEY_LEN]) {
         let mut bytes = [0_u8; 32];
         bytes[31] = scalar;
-        let signing = SigningKey::from_bytes((&bytes).into()).expect("合法标量");
+        let signing = SigningKey::from_bytes((&bytes).into()).expect("a valid scalar");
         let public = signing.verifying_key().to_sec1_point(false);
         let mut out = [0_u8; PUBLIC_KEY_LEN];
         out.copy_from_slice(public.as_bytes());
@@ -753,7 +753,7 @@ mod tests {
 
     /// Create a master key.
     fn new_master() -> MasterKey {
-        MasterKey::generate().expect("随机源可用")
+        MasterKey::generate().expect("the random source is available")
     }
 
     /// Run one complete handshake and return both sides' intermediate results.
@@ -763,15 +763,17 @@ mod tests {
     /// copied, so every test runs its own handshake.
     fn handshake(master: &MasterKey) -> (Verified, Responder, [u8; PUBLIC_KEY_LEN], Vec<u8>) {
         let (signing, device_public) = device(7);
-        let (challenge, verifier) = begin().expect("生成挑战");
-        let responder = accept(&challenge).expect("接受挑战");
+        let (challenge, verifier) = begin().expect("challenge generation succeeds");
+        let responder = accept(&challenge).expect("challenge accepted");
         let response = responder
             .respond(master, &device_public, |message| {
                 let signature: p256::ecdsa::Signature = signing.sign(message);
                 signature_of(&signature.to_bytes())
             })
-            .expect("生成应答");
-        let verified = verifier.verify(&response, master).expect("验证应答");
+            .expect("response generation succeeds");
+        let verified = verifier
+            .verify(&response, master)
+            .expect("response verification succeeds");
         (verified, responder, device_public, response)
     }
 
@@ -784,7 +786,7 @@ mod tests {
         assert_eq!(
             verified.session_id(),
             &responder.session_id(),
-            "双方算出的会话标识必须一致"
+            "both sides must compute the same session identifier"
         );
         assert_eq!(verified.device_public(), &device_public);
 
@@ -794,7 +796,7 @@ mod tests {
             verified.session_id(),
             &verified.confirmation(),
         )
-        .expect("确认标签应当被接受");
+        .expect("the confirmation tag must be accepted");
     }
 
     /// **A responder without the master key must fail.** The response is produced with a
@@ -805,8 +807,8 @@ mod tests {
         let real = new_master();
         let wrong = new_master();
         let (_, device_public) = device(7);
-        let (challenge, verifier) = begin().expect("生成挑战");
-        let responder = accept(&challenge).expect("接受挑战");
+        let (challenge, verifier) = begin().expect("challenge generation succeeds");
+        let responder = accept(&challenge).expect("challenge accepted");
 
         let response = responder
             .respond(&wrong, &device_public, |digest| {
@@ -814,14 +816,14 @@ mod tests {
                 let signature: p256::ecdsa::Signature = signing.sign(digest);
                 signature_of(&signature.to_bytes())
             })
-            .expect("签名本身会成功");
+            .expect("signing itself succeeds");
 
         assert!(
             matches!(
                 verifier.verify(&response, &real),
                 Err(Error::AuthProofFailed)
             ),
-            "用错的主密钥却通过了认证"
+            "authentication passed with the wrong master key"
         );
     }
 
@@ -832,15 +834,15 @@ mod tests {
     fn forged_signature_is_rejected_even_with_a_valid_tag() {
         let master = new_master();
 
-        let (challenge, verifier) = begin().expect("生成挑战");
-        let responder = accept(&challenge).expect("接受挑战");
+        let (challenge, verifier) = begin().expect("challenge generation succeeds");
+        let responder = accept(&challenge).expect("challenge accepted");
         let (real_signing, real_device) = device(7);
         let response = responder
             .respond(&master, &real_device, |message| {
                 let signature: p256::ecdsa::Signature = real_signing.sign(message);
                 signature_of(&signature.to_bytes())
             })
-            .expect("生成应答");
+            .expect("response generation succeeds");
 
         let (_attacker_signing, attacker_device) = device(9);
         let mut forged = response.clone();
@@ -856,7 +858,7 @@ mod tests {
                     qualia_dik::Error::DeviceSignatureInvalid { .. }
                 ))
             ),
-            "被换成无效签名的应答却通过了"
+            "a response with a replaced invalid signature was accepted"
         );
     }
 
@@ -867,19 +869,19 @@ mod tests {
         let (signing, device_public) = device(7);
 
         for index in 0..RESPONSE_SIGNED_LEN {
-            let (challenge, verifier) = begin().expect("生成挑战");
-            let responder = accept(&challenge).expect("接受挑战");
+            let (challenge, verifier) = begin().expect("challenge generation succeeds");
+            let responder = accept(&challenge).expect("challenge accepted");
             let mut response = responder
                 .respond(&master, &device_public, |digest| {
                     let signature: p256::ecdsa::Signature = signing.sign(digest);
                     signature_of(&signature.to_bytes())
                 })
-                .expect("生成应答");
+                .expect("response generation succeeds");
             response[index] ^= 0x01;
 
             assert!(
                 verifier.verify(&response, &master).is_err(),
-                "第 {index} 字节被翻转却通过了认证"
+                "byte {index} was flipped but authentication still passed"
             );
         }
     }
@@ -894,7 +896,7 @@ mod tests {
             }
             assert!(
                 matches!(accept(&challenge), Err(Error::AuthMessageMalformed { .. })),
-                "长度 {length} 的挑战应被拒绝"
+                "a challenge of length {length} must be rejected"
             );
         }
     }
@@ -902,7 +904,7 @@ mod tests {
     /// A challenge whose public key is not on the curve must be rejected.
     #[test]
     fn challenge_with_off_curve_key_is_rejected() {
-        let (challenge, _) = begin().expect("生成挑战");
+        let (challenge, _) = begin().expect("challenge generation succeeds");
         let mut broken = challenge.clone();
         broken[PUBLIC_KEY_LEN - 1] ^= 0x01;
 
@@ -916,15 +918,15 @@ mod tests {
     #[test]
     fn response_with_off_curve_key_is_rejected() {
         let master = new_master();
-        let (challenge, verifier) = begin().expect("生成挑战");
-        let responder = accept(&challenge).expect("接受挑战");
+        let (challenge, verifier) = begin().expect("challenge generation succeeds");
+        let responder = accept(&challenge).expect("challenge accepted");
         let (signing, device_public) = device(7);
         let mut response = responder
             .respond(&master, &device_public, |message| {
                 let signature: p256::ecdsa::Signature = signing.sign(message);
                 signature_of(&signature.to_bytes())
             })
-            .expect("生成应答");
+            .expect("response generation succeeds");
         response[PUBLIC_KEY_LEN - 1] ^= 0x01;
 
         assert!(matches!(
@@ -1005,8 +1007,8 @@ mod tests {
         let mut tags = Vec::new();
         for _ in 0..8 {
             let (_, _, _, response) = handshake(&master);
-            let (challenge, verifier) = begin().expect("生成挑战");
-            let responder = accept(&challenge).expect("接受挑战");
+            let (challenge, verifier) = begin().expect("challenge generation succeeds");
+            let responder = accept(&challenge).expect("challenge accepted");
             sessions.push(responder.session_id());
             tags.push(response[PUBLIC_KEY_LEN + NONCE_LEN + PUBLIC_KEY_LEN..].to_vec());
             drop(verifier);
@@ -1014,8 +1016,11 @@ mod tests {
 
         for i in 0..sessions.len() {
             for j in (i + 1)..sessions.len() {
-                assert_ne!(sessions[i], sessions[j], "两次会话出现了相同的会话标识");
-                assert_ne!(tags[i], tags[j], "两次会话出现了相同的证明标签");
+                assert_ne!(
+                    sessions[i], sessions[j],
+                    "two sessions produced the same session identifier"
+                );
+                assert_ne!(tags[i], tags[j], "two sessions produced the same proof tag");
             }
         }
     }
@@ -1038,7 +1043,7 @@ mod tests {
             !response
                 .windows(crate::vault::MASTER_KEY_LEN)
                 .any(|w| w == master.expose()),
-            "应答里出现了主密钥明文"
+            "the master key appears in plaintext inside the response"
         );
     }
 
@@ -1048,18 +1053,20 @@ mod tests {
     #[test]
     fn debug_output_is_redacted() {
         let master = new_master();
-        let (challenge, verifier) = begin().expect("生成挑战");
-        let responder = accept(&challenge).expect("接受挑战");
+        let (challenge, verifier) = begin().expect("challenge generation succeeds");
+        let responder = accept(&challenge).expect("challenge accepted");
         let (signing, device_public) = device(7);
         let response = responder
             .respond(&master, &device_public, |message| {
                 let signature: p256::ecdsa::Signature = signing.sign(message);
                 signature_of(&signature.to_bytes())
             })
-            .expect("生成应答");
+            .expect("response generation succeeds");
         let verifier_text = format!("{verifier:?}");
         let responder_text = format!("{responder:?}");
-        let verified = verifier.verify(&response, &master).expect("验证");
+        let verified = verifier
+            .verify(&response, &master)
+            .expect("verification succeeds");
         let verified_text = format!("{verified:?}");
 
         let master_hex: String = master.expose().iter().map(|b| format!("{b:02x}")).collect();
@@ -1075,15 +1082,15 @@ mod tests {
         ] {
             assert!(
                 !text.contains(&master_hex),
-                "{what} 的 Debug 输出泄露了主密钥"
+                "the Debug output of {what} leaks the master key"
             );
             assert!(
                 !text.contains(&responder_nonce_hex),
-                "{what} 的 Debug 输出泄露了 nonce"
+                "the Debug output of {what} leaks the nonce"
             );
             assert!(
                 text.contains("redacted") || text.contains("bytes"),
-                "{what} 的 Debug 输出没有出现脱敏占位符：{text}"
+                "the Debug output of {what} has no redaction placeholder: {text}"
             );
         }
     }
@@ -1100,7 +1107,10 @@ mod tests {
     fn constant_time_eq_behaves() {
         assert!(constant_time_eq(&[1, 2, 3], &[1, 2, 3]));
         assert!(!constant_time_eq(&[1, 2, 3], &[1, 2, 4]));
-        assert!(!constant_time_eq(&[1, 2], &[1, 2, 3]), "长度不同必须为假");
+        assert!(
+            !constant_time_eq(&[1, 2], &[1, 2, 3]),
+            "different lengths must be false"
+        );
         assert!(constant_time_eq(&[], &[]));
     }
 }

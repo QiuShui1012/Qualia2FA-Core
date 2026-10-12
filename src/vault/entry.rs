@@ -280,7 +280,7 @@ impl Entry {
     /// [`crate::vault::VaultFile::parse`].
     #[expect(
         clippy::too_many_arguments,
-        reason = "全部参数都是必填字段；改用 builder 会把编译期保证换成运行时默认值"
+        reason = "every parameter is a required field; a builder would trade compile-time guarantees for runtime defaults"
     )]
     pub fn new(
         name: String,
@@ -384,7 +384,7 @@ mod tests {
     use super::*;
 
     fn sample_secret() -> otp::OtpSecret {
-        otp::OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("合法种子")
+        otp::OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("valid secret")
     }
 
     fn sample_entry() -> Entry {
@@ -401,15 +401,15 @@ mod tests {
             1_700_000_000,
             1_700_000_000,
         )
-        .expect("合法条目")
+        .expect("valid entry")
     }
 
     #[test]
     fn entry_id_is_16_bytes_and_hex_displayed() {
-        let id = EntryId::generate().expect("OS 随机源可用");
+        let id = EntryId::generate().expect("OS randomness available");
         assert_eq!(id.as_bytes().len(), 16);
         let text = id.to_string();
-        assert_eq!(text.len(), 32, "十六进制应为 32 字符：{text}");
+        assert_eq!(text.len(), 32, "hexadecimal must be 32 characters: {text}");
         assert!(text.chars().all(|c| c.is_ascii_hexdigit()));
 
         assert_eq!(format!("{id:?}"), format!("EntryId({text})"));
@@ -418,10 +418,10 @@ mod tests {
     #[test]
     fn entry_id_generation_does_not_repeat() {
         let ids: Vec<_> = (0..64)
-            .map(|_| EntryId::generate().expect("OS 随机源可用"))
+            .map(|_| EntryId::generate().expect("OS randomness available"))
             .collect();
         let unique: std::collections::HashSet<_> = ids.iter().collect();
-        assert_eq!(unique.len(), ids.len(), "随机 ID 出现重复");
+        assert_eq!(unique.len(), ids.len(), "random IDs repeated");
     }
 
     #[test]
@@ -465,7 +465,7 @@ mod tests {
         );
         match err {
             Err(Error::FieldTooLong { field, .. }) => assert_eq!(field, "name"),
-            other => panic!("应拒绝超长字段，实际 {other:?}"),
+            other => panic!("an over-long field must be rejected, actual {other:?}"),
         }
     }
 
@@ -486,8 +486,8 @@ mod tests {
             0,
             0,
         )
-        .expect("其余字段合法");
-        assert_eq!(entry.issuer, None, "空发行方应归一为 None");
+        .expect("the remaining fields are valid");
+        assert_eq!(entry.issuer, None, "an empty issuer must normalize to None");
 
         let blank = Entry::new(
             "x".into(),
@@ -502,7 +502,7 @@ mod tests {
             0,
             0,
         )
-        .expect("其余字段合法");
+        .expect("the remaining fields are valid");
         assert_eq!(blank.issuer.as_deref(), Some("   "));
     }
 
@@ -524,7 +524,7 @@ mod tests {
             0,
             0,
         )
-        .expect("合法条目");
+        .expect("valid entry");
         assert_eq!(hotp.uri_type(), crate::uri::UriType::Hotp);
         assert_eq!(hotp.counter, Some(7));
     }
@@ -534,23 +534,32 @@ mod tests {
     fn debug_does_not_leak_secret() {
         let entry = sample_entry();
         let debug = format!("{entry:?}");
-        assert!(debug.contains("GitHub"), "非秘密字段应正常：{debug}");
-        assert!(debug.contains("alice"), "非秘密字段应正常：{debug}");
+        assert!(
+            debug.contains("GitHub"),
+            "non-secret fields must appear as usual: {debug}"
+        );
+        assert!(
+            debug.contains("alice"),
+            "non-secret fields must appear as usual: {debug}"
+        );
 
         let base32 = entry.secret.to_base32();
         assert!(
             !debug.contains(&base32),
-            "Debug 泄露了种子的 Base32：{debug}"
+            "Debug leaked the Base32 secret: {debug}"
         );
-        assert!(!debug.contains("JBSWY3DP"), "Debug 泄露了种子：{debug}");
+        assert!(
+            !debug.contains("JBSWY3DP"),
+            "Debug leaked the secret: {debug}"
+        );
     }
 
     #[test]
     fn convert_from_parsed_uri() {
         let parsed =
             crate::uri::parse("otpauth://totp/GitHub:alice?secret=JBSWY3DPEHPK3PXP&issuer=GitHub")
-                .expect("合法 URI");
-        let entry = entry_from_parsed_uri(&parsed, 1_700_000_000).expect("可转换");
+                .expect("valid URI");
+        let entry = entry_from_parsed_uri(&parsed, 1_700_000_000).expect("conversion succeeds");
         assert_eq!(entry.issuer.as_deref(), Some("GitHub"));
         assert_eq!(entry.account, "alice");
         assert_eq!(entry.name, "GitHub:alice");
@@ -562,7 +571,7 @@ mod tests {
         assert_eq!(
             entry.secret.to_base32(),
             parsed.secret.to_base32(),
-            "转换后种子发生了变化"
+            "the secret changed after conversion"
         );
     }
 }

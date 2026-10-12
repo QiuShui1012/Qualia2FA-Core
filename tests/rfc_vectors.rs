@@ -70,13 +70,13 @@ fn rfc4226_appendix_d_all_ten_vectors() {
         (9, "520489"),
     ];
 
-    let secret = OtpSecret::from_bytes(RFC_SECRET_ASCII.to_vec()).expect("种子非空");
+    let secret = OtpSecret::from_bytes(RFC_SECRET_ASCII.to_vec()).expect("the seed is non-empty");
 
     for (counter, expected) in VECTORS {
         let got = otp::hotp_code(&secret, counter, Algorithm::Sha1, Digits::Six);
         assert_eq!(
             got, expected,
-            "RFC 4226 附录 D 计数器 {counter} 不符：期望 {expected}，实际 {got}"
+            "RFC 4226 Appendix D counter {counter} mismatch: expected {expected}, got {got}"
         );
     }
 }
@@ -99,14 +99,14 @@ fn rfc6238_appendix_b_sha1_vectors() {
         (20_000_000_000, "65353130"),
     ];
 
-    let secret = OtpSecret::from_bytes(seed_of_len(20)).expect("种子非空");
+    let secret = OtpSecret::from_bytes(seed_of_len(20)).expect("the seed is non-empty");
 
     for (time, expected) in VECTORS {
-        let got =
-            otp::totp_code(&secret, time, 30, Algorithm::Sha1, Digits::Eight).expect("period 非零");
+        let got = otp::totp_code(&secret, time, 30, Algorithm::Sha1, Digits::Eight)
+            .expect("period is non-zero");
         assert_eq!(
             got, expected,
-            "RFC 6238 附录 B (SHA-1) T={time} 不符：期望 {expected}，实际 {got}"
+            "RFC 6238 Appendix B (SHA-1) T={time} mismatch: expected {expected}, got {got}"
         );
     }
 }
@@ -122,14 +122,14 @@ fn rfc6238_appendix_b_sha256_vectors() {
         (20_000_000_000, "77737706"),
     ];
 
-    let secret = OtpSecret::from_bytes(seed_of_len(32)).expect("种子非空");
+    let secret = OtpSecret::from_bytes(seed_of_len(32)).expect("the seed is non-empty");
 
     for (time, expected) in VECTORS {
         let got = otp::totp_code(&secret, time, 30, Algorithm::Sha256, Digits::Eight)
-            .expect("period 非零");
+            .expect("period is non-zero");
         assert_eq!(
             got, expected,
-            "RFC 6238 附录 B (SHA-256) T={time} 不符：期望 {expected}，实际 {got}"
+            "RFC 6238 Appendix B (SHA-256) T={time} mismatch: expected {expected}, got {got}"
         );
     }
 }
@@ -145,14 +145,14 @@ fn rfc6238_appendix_b_sha512_vectors() {
         (20_000_000_000, "47863826"),
     ];
 
-    let secret = OtpSecret::from_bytes(seed_of_len(64)).expect("种子非空");
+    let secret = OtpSecret::from_bytes(seed_of_len(64)).expect("the seed is non-empty");
 
     for (time, expected) in VECTORS {
         let got = otp::totp_code(&secret, time, 30, Algorithm::Sha512, Digits::Eight)
-            .expect("period 非零");
+            .expect("period is non-zero");
         assert_eq!(
             got, expected,
-            "RFC 6238 附录 B (SHA-512) T={time} 不符：期望 {expected}，实际 {got}"
+            "RFC 6238 Appendix B (SHA-512) T={time} mismatch: expected {expected}, got {got}"
         );
     }
 }
@@ -173,7 +173,7 @@ fn cross_check_hotp_counter_zero_against_manual_hmac() {
     use hmac::digest::{Digest, KeyInit, Mac};
 
     let mut mac = <hmac::SimpleHmac<sha1::Sha1> as KeyInit>::new_from_slice(RFC_SECRET_ASCII)
-        .expect("HMAC 接受任意长度密钥");
+        .expect("HMAC accepts a key of any length");
     Mac::update(&mut mac, &0_u64.to_be_bytes());
     let digest = Mac::finalize(mac).into_bytes();
 
@@ -184,16 +184,19 @@ fn cross_check_hotp_counter_zero_against_manual_hmac() {
         | u32::from(digest[offset + 3]);
     let manual = format!("{:06}", bin % 1_000_000);
 
-    assert_eq!(manual, "755224", "手写实现应与 RFC 4226 附录 D 一致");
+    assert_eq!(
+        manual, "755224",
+        "the hand-written implementation must agree with RFC 4226 Appendix D"
+    );
 
-    let secret = OtpSecret::from_bytes(RFC_SECRET_ASCII.to_vec()).expect("种子非空");
+    let secret = OtpSecret::from_bytes(RFC_SECRET_ASCII.to_vec()).expect("the seed is non-empty");
     assert_eq!(
         otp::hotp_code(&secret, 0, Algorithm::Sha1, Digits::Six),
         manual
     );
 
     let sha1_len = <sha1::Sha1 as Digest>::output_size();
-    assert_eq!(sha1_len, 20, "SHA-1 输出长度应为 20 字节");
+    assert_eq!(sha1_len, 20, "the SHA-1 output length must be 20 bytes");
 }
 
 /// The 8-digit and 6-digit expected values must agree with each other.
@@ -205,7 +208,7 @@ fn cross_check_hotp_counter_zero_against_manual_hmac() {
 /// count that never actually takes effect.
 #[test]
 fn digit_count_actually_changes_the_modulus() {
-    let secret = OtpSecret::from_bytes(RFC_SECRET_ASCII.to_vec()).expect("种子非空");
+    let secret = OtpSecret::from_bytes(RFC_SECRET_ASCII.to_vec()).expect("the seed is non-empty");
     let counter = 1_u64;
 
     let six = otp::hotp_code(&secret, counter, Algorithm::Sha1, Digits::Six);
@@ -216,7 +219,7 @@ fn digit_count_actually_changes_the_modulus() {
     assert_eq!(
         &eight[eight.len() - 6..],
         six,
-        "6 位码应是 8 位码对 10^6 取模的结果"
+        "the 6-digit code must be the 8-digit code reduced modulo 10^6"
     );
 
     assert_eq!(six, "287082");
@@ -228,7 +231,7 @@ fn digit_count_actually_changes_the_modulus() {
 /// of the 8-digit code for the same counter.
 #[test]
 fn seven_digits_is_self_consistent() {
-    let secret = OtpSecret::from_bytes(RFC_SECRET_ASCII.to_vec()).expect("种子非空");
+    let secret = OtpSecret::from_bytes(RFC_SECRET_ASCII.to_vec()).expect("the seed is non-empty");
     let seven = otp::hotp_code(&secret, 1, Algorithm::Sha1, Digits::Seven);
     let eight = otp::hotp_code(&secret, 1, Algorithm::Sha1, Digits::Eight);
 
@@ -236,7 +239,7 @@ fn seven_digits_is_self_consistent() {
     assert_eq!(
         &eight[eight.len() - 7..],
         seven,
-        "7 位码应是 8 位码对 10^7 取模的结果"
+        "the 7-digit code must be the 8-digit code reduced modulo 10^7"
     );
 }
 
@@ -250,26 +253,29 @@ fn seven_digits_is_self_consistent() {
 /// steps, because the property would then go unverified.
 #[test]
 fn leading_zeros_are_preserved_in_output() {
-    let secret = OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("合法 Base32 种子");
+    let secret = OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("a valid Base32 seed");
 
     let mut found_leading_zero = false;
     for step in 0_u64..200 {
         let code = otp::totp_code(&secret, step * 30, 30, Algorithm::Sha1, Digits::Six)
-            .expect("period 非零");
-        assert_eq!(code.len(), 6, "任何情况下都必须是 6 位：{code}");
+            .expect("period is non-zero");
+        assert_eq!(code.len(), 6, "must be 6 digits in every case: {code}");
         assert!(
             code.chars().all(|c| c.is_ascii_digit()),
-            "必须全是 ASCII 数字：{code}"
+            "must be all ASCII digits: {code}"
         );
         if code.starts_with('0') {
             found_leading_zero = true;
-            let numeric: u32 = code.parse().expect("应可解析为数字");
-            assert!(numeric < 100_000, "带前导零的码应小于 100000：{code}");
+            let numeric: u32 = code.parse().expect("must parse as a number");
+            assert!(
+                numeric < 100_000,
+                "a code with a leading zero must be below 100000: {code}"
+            );
             assert_eq!(otp::format_code(numeric, Digits::Six), code);
         }
     }
     assert!(
         found_leading_zero,
-        "200 个时间步内未出现前导零案例，本测试未能覆盖目标场景"
+        "no leading-zero case appeared within 200 time steps, so this test did not cover its target scenario"
     );
 }

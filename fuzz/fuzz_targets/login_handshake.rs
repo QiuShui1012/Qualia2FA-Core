@@ -88,7 +88,7 @@ impl FixedKeys {
         let mut scalar = [0_u8; 32];
         scalar[31] = 1;
         let key = p256::ecdsa::SigningKey::from_bytes((&scalar).into())
-            .expect("标量 1 必定合法");
+            .expect("scalar 1 is always valid");
         public.copy_from_slice(key.verifying_key().to_sec1_point(false).as_bytes());
         Self { public }
     }
@@ -103,7 +103,7 @@ impl DeviceKeys for FixedKeys {
         let mut scalar = [0_u8; 32];
         scalar[31] = 1;
         let key = p256::ecdsa::SigningKey::from_bytes((&scalar).into())
-            .expect("标量 1 必定合法");
+            .expect("scalar 1 is always valid");
         use p256::ecdsa::signature::Signer as _;
         let signature: p256::ecdsa::Signature = key.sign(message);
         Ok(DeviceSignature::from_bytes(&signature.to_bytes())?)
@@ -119,7 +119,7 @@ fn master_from(data: &[u8]) -> MasterKey {
     let mut key = [0_u8; 32];
     let take = data.len().min(32);
     key[..take].copy_from_slice(&data[..take]);
-    MasterKey::from_bytes(key.to_vec().into()).expect("长度恒为 32")
+    MasterKey::from_bytes(key.to_vec().into()).expect("the length is always 32")
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -168,7 +168,7 @@ impl qualia2fa_core::flow::SecureStore for NeverStores {
 
     fn store_master_key(&mut self, _key: &MasterKey) -> Result<()> {
         Err(Error::SecureStoreWriteFailed {
-            reason: "fuzz 目标不存储",
+            reason: "the fuzz target does not store anything",
         })
     }
 

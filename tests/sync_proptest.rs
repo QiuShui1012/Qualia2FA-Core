@@ -102,7 +102,7 @@ fn arb_entry() -> impl Strategy<Value = Entry> {
                     name,
                     issuer,
                     account,
-                    OtpSecret::from_bytes(secret).expect("生成器保证非空"),
+                    OtpSecret::from_bytes(secret).expect("the generator guarantees non-empty"),
                     algorithm,
                     digits,
                     period,
@@ -111,7 +111,7 @@ fn arb_entry() -> impl Strategy<Value = Entry> {
                     Timestamp::from(created_at),
                     Timestamp::from(updated_at),
                 )
-                .expect("生成器保证各字段合法")
+                .expect("the generator guarantees every field is valid")
             },
         )
 }
@@ -125,7 +125,7 @@ fn arb_vault() -> impl Strategy<Value = Vault> {
         .prop_map(|(entries, deletes)| {
             let mut vault = Vault::new();
             for (index, entry) in entries.into_iter().enumerate() {
-                let id = vault.insert(entry).expect("OS 随机源可用");
+                let id = vault.insert(entry).expect("OS random source is available");
                 if deletes.get(index).copied().unwrap_or(false) {
                     vault.remove(&id, Timestamp::from(1_700_000_000_u64));
                 }
@@ -175,12 +175,12 @@ fn vault_contents(vault: &Vault) -> BTreeMap<String, String> {
 
 /// Packs one device's vault into a payload.
 fn payload_of(vault: &Vault, master: &MasterKey, sender: DeviceId) -> Payload {
-    Payload::from_vault(master, sender, vault).expect("打包应当成功")
+    Payload::from_vault(master, sender, vault).expect("packing should succeed")
 }
 
 /// Opens a payload into a set of semantic records suitable for deduplication.
 fn records_of(payload: &Payload, master: &MasterKey) -> RecordSet<MergedRecord> {
-    let opened = payload.open_records(master).expect("记录应当能解开");
+    let opened = payload.open_records(master).expect("the records should open");
     let mut set = RecordSet::new();
     for record in opened {
         set.insert(record.into_merged());
@@ -197,7 +197,7 @@ fn records_of(payload: &Payload, master: &MasterKey) -> RecordSet<MergedRecord> 
 /// order.
 fn merge_payload(vault: &mut Vault, payload: &Payload, master: &MasterKey) -> sync::MergeOutcome {
     let set = records_of(payload, master);
-    sync::merge_into(vault, &set).expect("合并不应当因复制失败而中止")
+    sync::merge_into(vault, &set).expect("the merge must not abort because a copy failed")
 }
 
 /// Generates a "device": a vault plus a device id. The master key is generated separately so
@@ -222,16 +222,16 @@ proptest! {
     fn a_payload_roundtrips_every_entry(
         (vault, sender) in arb_vault_and_sender(),
     ) {
-        let master = MasterKey::generate().expect("OS 随机源可用");
+        let master = MasterKey::generate().expect("OS random source is available");
         let payload = payload_of(&vault, &master, sender);
-        let sealed = payload.seal(&master).expect("打包应当成功");
+        let sealed = payload.seal(&master).expect("packing should succeed");
 
-        let opened = Payload::open(&master, &sealed).expect("拆包应当成功");
-        prop_assert_eq!(opened.sync_id, payload.sync_id, "载荷标识变了");
-        prop_assert_eq!(opened.sender, sender, "发送方变了");
-        prop_assert_eq!(opened.len(), payload.len(), "记录数变了");
+        let opened = Payload::open(&master, &sealed).expect("unpacking should succeed");
+        prop_assert_eq!(opened.sync_id, payload.sync_id, "the payload identifier changed");
+        prop_assert_eq!(opened.sender, sender, "the sender changed");
+        prop_assert_eq!(opened.len(), payload.len(), "the record count changed");
 
-        let records = opened.open_records(&master).expect("记录应当能解开");
+        let records = opened.open_records(&master).expect("the records should open");
 
         let mut got_entries = BTreeMap::new();
         let mut got_tombstones = BTreeMap::new();
@@ -240,27 +240,27 @@ proptest! {
                 sync::OpenedRecord::Entry { id, entry } => {
                     prop_assert!(
                         got_entries.insert(id, *entry).is_none(),
-                        "同一个标识出现了两条条目"
+                        "the same identifier appeared as two entries"
                     );
                 }
                 sync::OpenedRecord::Tombstone(tombstone) => {
                     prop_assert!(
                         got_tombstones.insert(tombstone.entry_id, *tombstone).is_none(),
-                        "同一个标识出现了两条墓碑"
+                        "the same identifier appeared as two tombstones"
                     );
                 }
             }
         }
 
-        prop_assert_eq!(got_entries.len(), vault.len(), "条目数不一致");
+        prop_assert_eq!(got_entries.len(), vault.len(), "the entry counts do not match");
         prop_assert_eq!(
             got_tombstones.len(),
             vault.tombstone_count(),
-            "墓碑数不一致"
+            "the tombstone counts do not match"
         );
 
         for (id, original) in vault.iter() {
-            let received = got_entries.get(id).expect("收到的条目里缺了这一条");
+            let received = got_entries.get(id).expect("this entry is missing from what was received");
             prop_assert_eq!(&received.name, &original.name, "name");
             prop_assert_eq!(&received.issuer, &original.issuer, "issuer");
             prop_assert_eq!(&received.account, &original.account, "account");
@@ -279,7 +279,7 @@ proptest! {
         }
 
         for (id, original) in vault.iter_tombstones() {
-            let received = got_tombstones.get(id).expect("收到的墓碑里缺了这一条");
+            let received = got_tombstones.get(id).expect("this tombstone is missing from what was received");
             prop_assert_eq!(received.deleted_at, original.deleted_at, "deleted_at");
             prop_assert_eq!(received.deleted_by, original.deleted_by, "deleted_by");
         }
@@ -296,7 +296,7 @@ proptest! {
         (source, sender) in arb_vault_and_sender(),
         (mut target, _) in arb_vault_and_sender(),
     ) {
-        let master = MasterKey::generate().expect("OS 随机源可用");
+        let master = MasterKey::generate().expect("OS random source is available");
         let payload = payload_of(&source, &master, sender);
 
         merge_payload(&mut target, &payload, &master);
@@ -307,13 +307,13 @@ proptest! {
 
         prop_assert!(
             second.made_no_change(),
-            "第二次合并报告有改动：added={} tombstones={} deletions={} conflicts={}",
+            "the second merge reports changes: added={} tombstones={} deletions={} conflicts={}",
             second.added,
             second.tombstones_added,
             second.deletions_applied,
             second.conflicts.len()
         );
-        prop_assert_eq!(after_first, after_second, "第二次合并改变了保险库内容");
+        prop_assert_eq!(after_first, after_second, "the second merge changed the vault content");
     }
 
     /// **Commutativity**: two devices' payloads merged in either order give the same result.
@@ -327,7 +327,7 @@ proptest! {
         (vault_a, sender_a) in arb_vault_and_sender(),
         (vault_b, sender_b) in arb_vault_and_sender(),
     ) {
-        let master = MasterKey::generate().expect("OS 随机源可用");
+        let master = MasterKey::generate().expect("OS random source is available");
         let payload_a = payload_of(&vault_a, &master, sender_a);
         let payload_b = payload_of(&vault_b, &master, sender_b);
 
@@ -342,7 +342,7 @@ proptest! {
         prop_assert_eq!(
             vault_contents(&forward),
             vault_contents(&backward),
-            "两种合并顺序得到了不同的保险库内容"
+            "the two merge orders produced different vault content"
         );
     }
 
@@ -360,7 +360,7 @@ proptest! {
         (vault_b, sender_b) in arb_vault_and_sender(),
         (vault_c, sender_c) in arb_vault_and_sender(),
     ) {
-        let master = MasterKey::generate().expect("OS 随机源可用");
+        let master = MasterKey::generate().expect("OS random source is available");
 
         let mut a = vault_a;
         let mut b = vault_b;
@@ -379,8 +379,8 @@ proptest! {
             merge_payload(&mut c, &payload_b, &master);
         }
 
-        prop_assert_eq!(vault_contents(&a), vault_contents(&b), "A 与 B 未收敛");
-        prop_assert_eq!(vault_contents(&b), vault_contents(&c), "B 与 C 未收敛");
+        prop_assert_eq!(vault_contents(&a), vault_contents(&b), "A and B did not converge");
+        prop_assert_eq!(vault_contents(&b), vault_contents(&c), "B and C did not converge");
     }
 
     /// **No byte stream may panic.**
@@ -392,7 +392,7 @@ proptest! {
     fn parsing_arbitrary_bytes_never_panics(
         data in prop::collection::vec(any::<u8>(), 0..=512),
     ) {
-        let master = MasterKey::generate().expect("OS 随机源可用");
+        let master = MasterKey::generate().expect("OS random source is available");
         let _ = Payload::open(&master, &data);
     }
 
@@ -406,9 +406,9 @@ proptest! {
         (vault, sender) in arb_vault_and_sender(),
         flip in any::<prop::sample::Index>(),
     ) {
-        let master = MasterKey::generate().expect("OS 随机源可用");
+        let master = MasterKey::generate().expect("OS random source is available");
         let payload = payload_of(&vault, &master, sender);
-        let sealed = payload.seal(&master).expect("打包应当成功");
+        let sealed = payload.seal(&master).expect("packing should succeed");
         prop_assume!(!sealed.is_empty());
 
         let index = flip.index(sealed.len());
@@ -417,7 +417,7 @@ proptest! {
 
         prop_assert!(
             Payload::open(&master, &tampered).is_err(),
-            "第 {} 字节被翻转后载荷仍被接受（共 {} 字节）",
+            "the payload was still accepted after byte {} was flipped ({} bytes in total)",
             index,
             sealed.len()
         );
@@ -433,24 +433,24 @@ proptest! {
         (vault, sender) in arb_vault_and_sender(),
         other_seed in any::<[u8; DEVICE_ID_LEN]>(),
     ) {
-        let master = MasterKey::generate().expect("OS 随机源可用");
+        let master = MasterKey::generate().expect("OS random source is available");
         prop_assume!(
             qualia2fa_core::vault::master_key_to_bytes(&master).expose_secret()
                 != other_seed.as_slice()
         );
 
         let payload = payload_of(&vault, &master, sender);
-        let sealed = payload.seal(&master).expect("打包应当成功");
+        let sealed = payload.seal(&master).expect("packing should succeed");
 
-        prop_assert!(Payload::open(&master, &sealed).is_ok(), "同一把密钥打不开");
+        prop_assert!(Payload::open(&master, &sealed).is_ok(), "the same key cannot open it");
 
         let wrong = MasterKey::from_bytes(qualia2fa_core::SecretBytes::from(
             other_seed.to_vec(),
         ))
-        .expect("长度 32 正确");
+        .expect("the length is exactly 32");
         prop_assert!(
             Payload::open(&wrong, &sealed).is_err(),
-            "另一把主密钥打开了载荷"
+            "a different master key opened the payload"
         );
     }
 
@@ -469,9 +469,9 @@ proptest! {
                 expected.push(*id);
             }
         }
-        prop_assert_eq!(log.len(), expected.len(), "日志长度与预期不符");
+        prop_assert_eq!(log.len(), expected.len(), "the log length does not match the expectation");
         for id in &expected {
-            prop_assert!(log.contains(id), "记过的标识找不到了");
+            prop_assert!(log.contains(id), "a recorded identifier cannot be found");
         }
     }
 }

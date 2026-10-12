@@ -125,7 +125,7 @@ const fn output_len_for(count: usize) -> Option<usize> {
 /// use qualia2fa_core::{base32, ExposeSecret};
 ///
 /// // RFC 4648 §10 test vector for "foobar"
-/// let decoded = base32::decode("MZXW6YTBOI======").expect("向量应能解码");
+/// let decoded = base32::decode("MZXW6YTBOI======").expect("the vector must decode");
 /// assert_eq!(decoded.expose_secret(), b"foobar");
 /// ```
 pub fn decode(input: &str) -> Result<SecretBytes> {
@@ -210,7 +210,11 @@ fn decode_inner(input: &str, require_canonical: bool) -> Result<SecretBytes> {
         }
     }
 
-    debug_assert_eq!(out.len(), byte_len, "容量计算与实际写入不一致");
+    debug_assert_eq!(
+        out.len(),
+        byte_len,
+        "the capacity calculation disagrees with the bytes actually written"
+    );
     Ok(out.into())
 }
 
@@ -270,15 +274,16 @@ mod tests {
             if expected.is_empty() {
                 assert!(
                     matches!(decode(encoded), Err(Error::SecretTooShort { .. })),
-                    "空输入应被拒绝"
+                    "empty input must be rejected"
                 );
                 continue;
             }
-            let decoded = decode(encoded).unwrap_or_else(|e| panic!("{encoded:?} 解码失败: {e}"));
+            let decoded =
+                decode(encoded).unwrap_or_else(|e| panic!("{encoded:?} failed to decode: {e}"));
             assert_eq!(
                 decoded.expose_secret(),
                 *expected,
-                "{encoded:?} 解码结果不符"
+                "{encoded:?} decoded to the wrong value"
             );
         }
     }
@@ -296,21 +301,21 @@ mod tests {
 
     #[test]
     fn accepts_lowercase() {
-        let upper = decode("MZXW6YTBOI======").expect("大写应可解码");
-        let lower = decode("mzxw6ytboi======").expect("小写应可解码");
+        let upper = decode("MZXW6YTBOI======").expect("upper case must decode");
+        let lower = decode("mzxw6ytboi======").expect("lower case must decode");
         assert_eq!(upper.expose_secret(), lower.expose_secret());
     }
 
     #[test]
     fn tolerates_missing_padding() {
-        let padded = decode("MZXW6YTBOI======").expect("带填充应可解码");
-        let unpadded = decode("MZXW6YTBOI").expect("无填充应可解码");
+        let padded = decode("MZXW6YTBOI======").expect("padded input must decode");
+        let unpadded = decode("MZXW6YTBOI").expect("unpadded input must decode");
         assert_eq!(padded.expose_secret(), unpadded.expose_secret());
     }
 
     #[test]
     fn tolerates_ascii_whitespace() {
-        let expected = decode("MZXW6YTBOI").expect("基准应可解码");
+        let expected = decode("MZXW6YTBOI").expect("the baseline must decode");
         for variant in [
             " MZXW6YTBOI ",
             "MZXW 6YTBOI",
@@ -318,7 +323,7 @@ mod tests {
             "MZ\tXW6YTBOI",
             "MZ XW 6Y TB OI ",
         ] {
-            let got = decode(variant).unwrap_or_else(|e| panic!("{variant:?} 应可解码: {e}"));
+            let got = decode(variant).unwrap_or_else(|e| panic!("{variant:?} must decode: {e}"));
             assert_eq!(got.expose_secret(), expected.expose_secret(), "{variant:?}");
         }
     }
@@ -337,7 +342,7 @@ mod tests {
             let result = decode(bad);
             assert!(
                 matches!(result, Err(Error::Base32InvalidCharacter { .. })),
-                "{bad:?} 应因非法字符被拒，实际: {result:?}"
+                "{bad:?} must be rejected for an invalid character, got: {result:?}"
             );
         }
     }
@@ -348,7 +353,7 @@ mod tests {
             let result = decode(bad);
             assert!(
                 matches!(result, Err(Error::Base32InvalidLength { .. })),
-                "{bad:?} 应因长度非法被拒，实际: {result:?}"
+                "{bad:?} must be rejected for an invalid length, got: {result:?}"
             );
         }
     }
@@ -358,7 +363,7 @@ mod tests {
         let result = decode("MZXW6YTB=OI");
         assert!(
             matches!(result, Err(Error::Base32InvalidCharacter { .. })),
-            "填充后出现数据应被拒，实际: {result:?}"
+            "data after padding must be rejected, got: {result:?}"
         );
     }
 
@@ -371,13 +376,13 @@ mod tests {
     /// immediately.
     #[test]
     fn padding_bits_are_accepted_leniently_but_rejected_strictly() {
-        let lenient = decode("MZ").expect("宽容模式应接受非规范填充比特");
+        let lenient = decode("MZ").expect("lenient mode must accept non-canonical padding bits");
         assert_eq!(lenient.expose_secret(), &[0x66]);
 
         let strict = decode_strict("MZ");
         assert!(
             matches!(strict, Err(Error::Base32InvalidPadding)),
-            "严格模式应拒绝非零填充比特，实际: {strict:?}"
+            "strict mode must reject non-zero padding bits, got: {strict:?}"
         );
     }
 
@@ -392,17 +397,20 @@ mod tests {
     #[test]
     fn zero_padding_bits_accepted_in_both_modes() {
         for input in ["MA", "ME", "MI", "MM", "MQ", "MU", "MY", "M4"] {
-            assert!(decode(input).is_ok(), "{input:?} 宽容模式应可解码");
+            assert!(
+                decode(input).is_ok(),
+                "{input:?} must decode in lenient mode"
+            );
             assert!(
                 decode_strict(input).is_ok(),
-                "{input:?} 严格模式应可解码（残留比特为零）"
+                "{input:?} must decode in strict mode (zero residual bits)"
             );
         }
 
-        assert!(decode("ML").is_ok(), "宽容模式仍应接受");
+        assert!(decode("ML").is_ok(), "lenient mode must still accept it");
         assert!(
             matches!(decode_strict("ML"), Err(Error::Base32InvalidPadding)),
-            "严格模式应拒绝 ML"
+            "strict mode must reject ML"
         );
     }
 
@@ -416,9 +424,10 @@ mod tests {
         for len in 1_usize..=70 {
             let data: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(31)).collect();
             let encoded = encode(&data);
-            let decoded = decode_strict(&encoded)
-                .unwrap_or_else(|e| panic!("长度 {len} 的自产编码不满足规范形式: {e}"));
-            assert_eq!(decoded.expose_secret(), data.as_slice(), "长度 {len}");
+            let decoded = decode_strict(&encoded).unwrap_or_else(|e| {
+                panic!("our own encoding of length {len} is not canonical: {e}")
+            });
+            assert_eq!(decoded.expose_secret(), data.as_slice(), "length {len}");
         }
     }
 
@@ -428,7 +437,7 @@ mod tests {
             let result = decode(bad);
             assert!(
                 matches!(result, Err(Error::SecretTooShort { .. })),
-                "{bad:?} 应被拒为空秘密，实际: {result:?}"
+                "{bad:?} must be rejected as an empty secret, got: {result:?}"
             );
         }
     }
@@ -441,8 +450,9 @@ mod tests {
         for len in [10_usize, 16, 20, 32, 64] {
             let original: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(7)).collect();
             let encoded = encode(&original);
-            let decoded = decode(&encoded).unwrap_or_else(|e| panic!("长度 {len} 往返失败: {e}"));
-            assert_eq!(decoded.expose_secret(), original.as_slice(), "长度 {len}");
+            let decoded = decode(&encoded)
+                .unwrap_or_else(|e| panic!("the round trip of length {len} failed: {e}"));
+            assert_eq!(decoded.expose_secret(), original.as_slice(), "length {len}");
         }
     }
 
@@ -451,12 +461,12 @@ mod tests {
     fn errors_do_not_embed_input() {
         let secret_like = "JBSWY3DPEHPK3PXP0";
         let Err(error) = decode(secret_like) else {
-            panic!("应解码失败");
+            panic!("decoding must fail");
         };
         let text = format!("{error}");
         assert!(
             !text.contains("JBSWY3DPEHPK3PXP"),
-            "错误信息泄露了种子内容：{text}"
+            "the error message leaks the seed content: {text}"
         );
     }
 }

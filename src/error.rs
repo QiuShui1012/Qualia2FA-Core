@@ -58,7 +58,7 @@ pub enum Error {
     ///
     /// Only the **position** is reported, never the character at that position, so that input
     /// content (which may come from a key) does not reach the logs.
-    #[error("Base32 输入在第 {index} 个字符处含非法字符")]
+    #[error("Base32 input has an invalid character at position {index}")]
     Base32InvalidCharacter {
         /// Position of the invalid character in the character sequence **after ASCII whitespace
         /// has been removed**.
@@ -72,7 +72,7 @@ pub enum Error {
     /// The Base32 input length (after padding is stripped) is not a valid remainder modulo 8.
     ///
     /// The only valid Base32 length remainders are 0, 2, 4, 5 and 7.
-    #[error("Base32 长度非法：{length} 个有效字符")]
+    #[error("invalid Base32 length: {length} significant characters")]
     Base32InvalidLength {
         /// Number of valid characters after padding is removed.
         length: usize,
@@ -83,7 +83,7 @@ pub enum Error {
     /// This is not a padding-format problem — padding itself may be absent or present (both are
     /// accepted). It means the encoded data itself is corrupt, for example significant bits
     /// written into padding bits that must be zero.
-    #[error("Base32 编码尾部残留比特非零，数据已损坏")]
+    #[error("Base32 encoding has non-zero residual bits at the end; the data is corrupt")]
     Base32InvalidPadding,
 
     /// The OTP secret is empty.
@@ -92,7 +92,7 @@ pub enum Error {
     /// (the URI has no `secret` at all, or Base32 decodes to nothing), while a short seed is a
     /// **strength** problem. The former must be rejected, the latter is a UI warning — merging
     /// them leaves the caller unable to tell the two apart.
-    #[error("OTP 密钥为空")]
+    #[error("OTP secret is empty")]
     SecretEmpty,
 
     /// The OTP secret is shorter than the minimum required by the selected algorithm.
@@ -101,7 +101,7 @@ pub enum Error {
     /// for a short one. HMAC accepts keys of any length and short seeds exist in the real world;
     /// a short seed is a **warning** to be surfaced by the UI, see
     /// `otp::recommended_min_secret_len`.
-    #[error("OTP 密钥过短：需要至少 {required} 字节，实际 {actual} 字节")]
+    #[error("OTP secret is too short: at least {required} bytes required, {actual} bytes given")]
     SecretTooShort {
         /// Minimum seed length in bytes required by RFC 6238 for this algorithm.
         required: usize,
@@ -113,7 +113,7 @@ pub enum Error {
     ///
     /// **Rejected rather than falling back to SHA-1**: a silent fallback gives the user a code
     /// that is consistently wrong, with nothing in the error to trace it back.
-    #[error("不支持的算法：{name}")]
+    #[error("unsupported algorithm: {name}")]
     UnsupportedAlgorithm {
         /// The raw parameter value, truncated to at most 16 characters.
         ///
@@ -126,14 +126,14 @@ pub enum Error {
     ///
     /// Only 6, 7 and 8 are accepted. Validation must be strict — any other value overflows
     /// `10^digits`.
-    #[error("不支持的位数：{value}（只接受 6、7、8）")]
+    #[error("unsupported digit count: {value} (only 6, 7 and 8 are accepted)")]
     UnsupportedDigits {
         /// The raw parameter value, truncated to at most 16 characters.
         value: String,
     },
 
     /// The TOTP `period` is 0, which would cause a division by zero.
-    #[error("TOTP 周期不能为 0")]
+    #[error("TOTP period must not be 0")]
     InvalidPeriod,
 
     /// Cryptographic random bytes cannot be obtained from the operating system.
@@ -150,51 +150,51 @@ pub enum Error {
     /// **It carries no `getrandom::Error` detail**: that type's internal representation differs
     /// across versions and platforms and offers the caller nothing actionable — retrying or
     /// telling the user is all that can be done.
-    #[error("无法从操作系统取得安全随机数")]
+    #[error("cannot obtain secure random bytes from the operating system")]
     RandomnessUnavailable,
 
     /// The URI scheme is not `otpauth`.
-    #[error("URI 的 scheme 不是 otpauth")]
+    #[error("URI scheme is not otpauth")]
     UriUnsupportedScheme,
 
     /// The URI has no type component (no `/` after `otpauth://`).
-    #[error("URI 缺少类型段（应为 totp 或 hotp）")]
+    #[error("URI is missing its type component (expected totp or hotp)")]
     UriMissingType,
 
     /// The URI type is neither `totp` nor `hotp`.
-    #[error("不支持的 URI 类型：{name}")]
+    #[error("unsupported URI type: {name}")]
     UriUnsupportedType {
         /// The raw type component, truncated to at most 16 characters.
         name: String,
     },
 
     /// The URI has no `secret` parameter.
-    #[error("URI 缺少必需的 secret 参数")]
+    #[error("URI is missing the required secret parameter")]
     UriMissingSecret,
 
     /// The HOTP URI has no `counter` parameter.
-    #[error("HOTP 的 URI 缺少必需的 counter 参数")]
+    #[error("HOTP URI is missing the required counter parameter")]
     UriMissingCounter,
 
     /// A TOTP URI carries a `counter` parameter.
     ///
     /// Rejected rather than ignored: such a URI signals a faulty generator, and ignoring it
     /// hands the user an entry that looks normal but means something else.
-    #[error("TOTP 的 URI 不应包含 counter 参数")]
+    #[error("TOTP URI must not carry a counter parameter")]
     UriUnexpectedCounter,
 
     /// The URI contains a known parameter more than once.
     ///
     /// Implementations disagree on whether the first or the last occurrence wins: a classic
     /// parsing ambiguity, and an attack surface.
-    #[error("URI 含重复参数：{name}")]
+    #[error("URI contains a duplicate parameter: {name}")]
     UriDuplicateParameter {
         /// The duplicated parameter name (truncated to 16 characters).
         name: String,
     },
 
     /// A URI parameter value is invalid.
-    #[error("URI 参数 {name} 非法：{reason}")]
+    #[error("invalid URI parameter {name}: {reason}")]
     UriInvalidParameter {
         /// Parameter name.
         name: String,
@@ -203,14 +203,14 @@ pub enum Error {
     },
 
     /// The percent encoding in the URI is malformed.
-    #[error("URI 含非法的百分号编码（% 后必须跟两个十六进制数字）")]
+    #[error("URI contains invalid percent encoding (% must be followed by two hexadecimal digits)")]
     UriInvalidPercentEncoding,
 
     /// The issuer in the label and the `issuer` parameter disagree.
     ///
     /// Rejected: two different issuers mean the URI was assembled or tampered with, and silently
     /// picking one would bind an entry's codes to the wrong service.
-    #[error("issuer 冲突：label 里是 {in_label}，参数里是 {in_parameter}")]
+    #[error("issuer conflict: the label says {in_label}, the parameter says {in_parameter}")]
     UriIssuerMismatch {
         /// The issuer from the label prefix (truncated).
         in_label: String,
@@ -227,7 +227,9 @@ pub enum Error {
     /// decoded.
     ///
     /// Both parsing and serialization therefore reject it, enforcing the invariant.
-    #[error("账号名不能包含冒号（会与 issuer 分隔符混淆）：{account}")]
+    #[error(
+        "the account name must not contain a colon (it is confused with the issuer separator): {account}"
+    )]
     UriAccountContainsColon {
         /// The account name, truncated to 32 characters.
         account: String,
@@ -237,18 +239,18 @@ pub enum Error {
     ///
     /// The most common structural problem: the file was truncated, or a length field claims more
     /// bytes than actually remain.
-    #[error("保险库文件不完整或被截断")]
+    #[error("vault file is incomplete or truncated")]
     VaultTruncated,
 
     /// The magic number at the start of the vault file does not match.
     ///
     /// It means this is not a vault file (the wrong file was picked, or the file was replaced
     /// with something else).
-    #[error("不是 Qualia2FA 保险库文件")]
+    #[error("not a Qualia2FA vault file")]
     VaultBadMagic,
 
     /// The vault file format version is not supported by this build.
-    #[error("不支持的保险库格式版本：{version}")]
+    #[error("unsupported vault format version: {version}")]
     VaultUnsupportedVersion {
         /// Version declared in the file.
         version: u8,
@@ -260,7 +262,7 @@ pub enum Error {
     /// version must reject a non-zero value: it means the file was written by a newer version
     /// that may have given the byte a meaning this version does not know, and reading on would
     /// parse it under wrong assumptions.
-    #[error("保险库保留字节应为 0，实际为 {value}")]
+    #[error("vault reserved byte must be 0, but is {value}")]
     VaultReservedByteNotZero {
         /// Actual value in the file.
         value: u8,
@@ -270,7 +272,7 @@ pub enum Error {
     ///
     /// **Not treated as a live entry**: guessing that an unknown kind "is probably an entry"
     /// would let a tombstone written by a future version come back to life as an entry here.
-    #[error("无法识别的保险库记录种类：{value}")]
+    #[error("unrecognized vault record kind: {value}")]
     VaultUnknownRecordKind {
         /// Actual value in the file.
         value: u8,
@@ -281,7 +283,7 @@ pub enum Error {
     /// The limit exists to reject a malicious file claiming to hold 4 GiB and to avoid allocating
     /// huge buffers for untrusted input. This is therefore a **structural** problem, not the
     /// business problem of "an entry that is too large".
-    #[error("保险库记录过长：上限 {limit} 字节，实际声明 {actual} 字节")]
+    #[error("vault record is too long: limit {limit} bytes, {actual} bytes declared")]
     VaultRecordTooLong {
         /// Allowed limit.
         limit: usize,
@@ -290,7 +292,10 @@ pub enum Error {
     },
 
     /// The vault holds more records than the limit allows.
-    #[error("保险库记录数超出上限（最多 {})", crate::vault::MAX_RECORDS)]
+    #[error(
+        "vault record count exceeds the limit (at most {})",
+        crate::vault::MAX_RECORDS
+    )]
     VaultTooManyRecords,
 
     /// The vault file has extra bytes at the end.
@@ -298,7 +303,7 @@ pub enum Error {
     /// **Rejected rather than ignored**: extra bytes mean content was appended and this version
     /// cannot explain what it is. Ignoring them would make the fact that the file was modified
     /// disappear.
-    #[error("保险库文件末尾有多余的 {count} 字节")]
+    #[error("vault file has {count} extra bytes at the end")]
     VaultTrailingBytes {
         /// Number of extra bytes.
         count: usize,
@@ -309,7 +314,7 @@ pub enum Error {
     /// **Rejected rather than overwritten**: a duplicate ID means the file was crafted or
     /// corrupted. Silently keeping one of them makes the user lose a 2FA entry, showing up as
     /// "one code suddenly stopped working" — extremely hard to trace.
-    #[error("保险库文件含重复的条目 ID")]
+    #[error("vault file contains a duplicate entry ID")]
     VaultDuplicateEntryId,
 
     /// The master key check value in the file has the wrong structure (length mismatch).
@@ -322,7 +327,7 @@ pub enum Error {
     /// The check value is a fixed-length plaintext field, so a length mismatch means the file was
     /// truncated, appended to, or never written in the format at all — all three mean "this file
     /// is untrustworthy", not "wrong key".
-    #[error("保险库文件的主密钥检查值长度不对")]
+    #[error("vault file has a master key check value of the wrong length")]
     VaultBadKeyCheck,
 
     /// No entry with this identifier exists.
@@ -335,7 +340,7 @@ pub enum Error {
     ///
     /// A common cause is synchronization having deleted the entry on the other device while this
     /// one still holds its identifier.
-    #[error("保险库里没有这条条目")]
+    #[error("no such entry in the vault")]
     VaultEntryNotFound,
 
     /// The plaintext structure of a vault entry contains a duplicated field node.
@@ -343,7 +348,7 @@ pub enum Error {
     /// Implementations disagree on whether the first or the last occurrence wins: a classic
     /// parsing ambiguity, and an attack surface — an attacker can append an overriding node after
     /// a legitimate one.
-    #[error("保险库条目含重复字段（标签 {tag:#04x}）")]
+    #[error("vault entry contains a duplicate field (tag {tag:#04x})")]
     VaultDuplicateField {
         /// The field tag that appears more than once.
         tag: u8,
@@ -358,7 +363,7 @@ pub enum Error {
     /// this library), or the key comes from an implementation of another version. **A parser
     /// called directly with arbitrary plaintext can trigger it as well**, since such a call
     /// bypasses the AEAD.
-    #[error("保险库条目结构损坏")]
+    #[error("vault entry structure is corrupt")]
     VaultCorrupt,
 
     /// A text field of a vault entry is not valid UTF-8.
@@ -366,7 +371,7 @@ pub enum Error {
     /// **Rejected rather than lossily replaced**: replacement turns corrupt data into an entry
     /// that looks normal but has different content, and the user never learns that the account
     /// name was changed.
-    #[error("保险库条目的文本字段不是合法 UTF-8")]
+    #[error("a text field of the vault entry is not valid UTF-8")]
     VaultInvalidUtf8,
 
     /// Vault decryption or authentication failed.
@@ -381,11 +386,11 @@ pub enum Error {
     ///
     /// Whether the wrong master key was picked is something the layer above decides from where
     /// the key came from; the cryptographic layer need not leak anything for that.
-    #[error("保险库无法解密：主密钥不匹配或文件已被篡改")]
+    #[error("cannot decrypt the vault: master key mismatch or the file has been tampered with")]
     VaultDecryptionFailed,
 
     /// The master key has the wrong length.
-    #[error("主密钥长度应为 {expected} 字节，实际 {actual} 字节")]
+    #[error("master key must be {expected} bytes, but is {actual} bytes")]
     MasterKeyWrongLength {
         /// Required length.
         expected: usize,
@@ -398,7 +403,7 @@ pub enum Error {
     /// The limit cannot be enforced **before** decryption from the ciphertext length (that length
     /// says nothing about the field length), so it must be checked while parsing after
     /// decryption. See [`crate::vault::Entry::MAX_FIELD_LEN`].
-    #[error("字段 {field} 过长：上限 {limit} 字节，实际 {actual} 字节")]
+    #[error("field {field} is too long: limit {limit} bytes, {actual} bytes given")]
     FieldTooLong {
         /// Field name (a fixed string, never user data).
         field: &'static str,
@@ -412,7 +417,7 @@ pub enum Error {
     ///
     /// It carries only the **operating system error description**, never file content — `reason`
     /// comes from `std::io::Error`, which does not include the bytes that were written.
-    #[error("保险库文件读写失败：{reason}")]
+    #[error("vault file read/write failed: {reason}")]
     VaultIo {
         /// Operating system error description.
         reason: String,
@@ -428,7 +433,7 @@ pub enum Error {
     /// `reason` is a fixed internal description and **contains no raw input bytes** — they may
     /// come from an attacker, and putting them into an error message turns logs into an injection
     /// point.
-    #[error("设备公钥非法：{reason}")]
+    #[error("invalid device public key: {reason}")]
     DevicePublicKeyInvalid {
         /// Fixed reason description.
         reason: &'static str,
@@ -439,7 +444,7 @@ pub enum Error {
     /// **A malformed signature and a failed verification deliberately share this variant.** The
     /// caller's response is identical (reject this authentication), and telling them apart would
     /// only give an attacker a small oracle.
-    #[error("设备签名无效：{reason}")]
+    #[error("invalid device signature: {reason}")]
     DeviceSignatureInvalid {
         /// Fixed reason description.
         reason: &'static str,
@@ -454,7 +459,7 @@ pub enum Error {
     ///
     /// `reason` is a fixed internal description and **contains no input bytes**: QR code content
     /// may come from an attacker.
-    #[error("配对载荷非法：{reason}")]
+    #[error("invalid pairing payload: {reason}")]
     PairingPayloadMalformed {
         /// Fixed reason description.
         reason: &'static str,
@@ -465,7 +470,7 @@ pub enum Error {
     /// It must be **rejected outright** rather than interpreted as best as possible: reading a
     /// future version's fields under this version's layout would turn a "this operation is
     /// forbidden" written by the future version into "allowed".
-    #[error("配对协议版本不受支持：{version}")]
+    #[error("unsupported pairing protocol version: {version}")]
     PairingUnsupportedVersion {
         /// Version declared in the payload.
         version: u8,
@@ -477,7 +482,9 @@ pub enum Error {
     /// wrong public key** deliberately share this variant. The caller's response is identical
     /// (this pairing failed, scan the code again), and telling them apart would give an attacker
     /// an oracle to probe with.
-    #[error("配对消息认证失败：密文被篡改、或不属于本次配对")]
+    #[error(
+        "pairing message authentication failed: tampered ciphertext, or not part of this pairing"
+    )]
     PairingAuthenticationFailed,
 
     /// The recovery file structure is invalid.
@@ -488,7 +495,7 @@ pub enum Error {
     /// direction where retrying cannot help.
     ///
     /// `reason` is a fixed internal description and **contains no input bytes**.
-    #[error("恢复文件非法：{reason}")]
+    #[error("invalid recovery file: {reason}")]
     RecoveryFileMalformed {
         /// Fixed reason description.
         reason: &'static str,
@@ -499,7 +506,7 @@ pub enum Error {
     /// These parameters **come from the file itself** and are therefore untrusted input. Without
     /// this validation, a file edited to say `m_cost = u32::MAX` would turn an import into a
     /// memory-exhaustion attack.
-    #[error("恢复文件的派生参数非法：{reason}")]
+    #[error("invalid recovery file derivation parameters: {reason}")]
     RecoveryParametersInvalid {
         /// Fixed reason description.
         reason: &'static str,
@@ -510,14 +517,16 @@ pub enum Error {
     /// **Rejected outright rather than accepted as a weak passphrase**: accepting it would hand
     /// the user, behind a screen that looks successful, a backup that can be opened in about a
     /// second.
-    #[error("恢复口令不得为空")]
+    #[error("recovery passphrase must not be empty")]
     RecoveryPassphraseEmpty,
 
     /// Authentication of the recovery file failed: wrong passphrase, or a tampered file.
     ///
     /// The two causes deliberately share this variant (same reasoning as
     /// [`Error::PairingAuthenticationFailed`]).
-    #[error("恢复文件认证失败：口令错误，或文件已被篡改")]
+    #[error(
+        "recovery file authentication failed: wrong passphrase, or the file has been tampered with"
+    )]
     RecoveryAuthenticationFailed,
 
     /// The encryption step of the recovery file failed.
@@ -525,14 +534,14 @@ pub enum Error {
     /// It can only come from an AEAD implementation limit (plaintext or AAD too long) and does
     /// not happen with the parameters in use; it is listed separately so that this case is not
     /// misreported as a wrong passphrase.
-    #[error("恢复文件加密失败")]
+    #[error("recovery file encryption failed")]
     RecoveryEncryptionFailed,
 
     /// The Argon2id computation failed.
     ///
     /// The most common real cause is **out of memory**: the default parameters allocate 64 MiB
     /// at once.
-    #[error("口令派生失败（可能是内存不足）")]
+    #[error("passphrase derivation failed (possibly out of memory)")]
     RecoveryKdfFailed,
 
     /// The version of a persisted format is not supported.
@@ -541,7 +550,7 @@ pub enum Error {
     /// by a future version reaches an older one, it must be **rejected outright** instead of being
     /// interpreted under the current layout. The latter would turn "the new version improved
     /// security" into "the older version accepted it under a weaker interpretation".
-    #[error("格式版本不受支持：{version}")]
+    #[error("unsupported format version: {version}")]
     UnsupportedFormatVersion {
         /// Version declared in the file.
         version: u8,
@@ -555,7 +564,7 @@ pub enum Error {
     /// correct tag.
     ///
     /// `reason` is a fixed internal description and **contains no input bytes**.
-    #[error("认证消息非法：{reason}")]
+    #[error("invalid authentication message: {reason}")]
     AuthMessageMalformed {
         /// Fixed reason description.
         reason: &'static str,
@@ -567,7 +576,7 @@ pub enum Error {
     /// inconsistent session identifier, or a peer that has no master key at all — the three causes
     /// deliberately share this variant, because the caller's response is identical (declare this
     /// authentication failed and disconnect) and telling them apart would give a probeable signal.
-    #[error("认证失败：对方未能证明持有主密钥")]
+    #[error("authentication failed: the peer did not prove possession of the master key")]
     AuthProofFailed,
 
     // ── Orchestration (`crate::flow`) ─────────────────────────────────────────
@@ -575,7 +584,7 @@ pub enum Error {
     ///
     /// Different from "creating the identity failed": this is a caller asking for a signature
     /// before obtaining an identity — a call-order error, not a platform capability problem.
-    #[error("本设备还没有设备身份，请先取得身份再签名")]
+    #[error("this device has no device identity yet; obtain one before signing")]
     DeviceKeyMissing,
 
     /// This device has never registered or logged in.
@@ -584,18 +593,20 @@ pub enum Error {
     /// normal path (send the user to register or log in), the latter means data may already be
     /// damaged. Sharing one error would make the UI treat the latter as "not logged in yet" and
     /// send the user to **register again**, permanently losing the existing data.
-    #[error("本设备尚未注册或登录")]
+    #[error("this device is not registered or logged in")]
     DeviceNotRegistered,
 
     /// The declared device identity is not the local one.
-    #[error("设备身份不匹配：对方声明的身份与本机取得的不一致")]
+    #[error(
+        "device identity mismatch: the peer's declared identity differs from the locally obtained one"
+    )]
     DeviceIdentityMismatch,
 
     /// Writing the master key to platform storage failed.
     ///
     /// `reason` is a **fixed string** and must not contain key material: it is logged, and this is
     /// one of the very few paths that touch the master key.
-    #[error("主密钥无法写入平台存储：{reason}")]
+    #[error("cannot write the master key to platform storage: {reason}")]
     SecureStoreWriteFailed {
         /// Developer-facing reason, containing no secret.
         reason: &'static str,
@@ -606,7 +617,7 @@ pub enum Error {
     /// `0` usually means the caller forgot to pass a time (this library never reads a clock; time
     /// always comes from the caller). Letting such a value into the vault pollutes the
     /// time-ordered merge logic, and the result is consistently wrong and hard to trace.
-    #[error("时间戳不得为 0")]
+    #[error("timestamp must not be 0")]
     TimestampZero,
 
     // ── Sync ──────────────────────────────────────────────────────────────────
@@ -616,11 +627,11 @@ pub enum Error {
     /// payload at all** (the user picked the wrong file, or another protocol's data was fed in),
     /// which points the investigation in a completely different direction than "a payload
     /// produced by this application is broken".
-    #[error("不是 Qualia2FA 的同步载荷")]
+    #[error("not a Qualia2FA sync payload")]
     SyncBadMagic,
 
     /// The sync payload format version is not supported.
-    #[error("同步载荷版本 {version} 不受支持")]
+    #[error("unsupported sync payload version {version}")]
     SyncUnsupportedVersion {
         /// Version declared by the payload.
         version: u8,
@@ -632,11 +643,11 @@ pub enum Error {
     /// "There is no payload at all" and "the payload is broken" point in completely different
     /// directions when investigating: the former is usually a caller passing an empty buffer, the
     /// latter a peer or transport problem.
-    #[error("同步载荷为空")]
+    #[error("sync payload is empty")]
     SyncEmptyPayload,
 
     /// The payload is truncated.
-    #[error("同步载荷被截断")]
+    #[error("sync payload is truncated")]
     SyncTruncated,
 
     /// The record count declared in the payload does not match its actual content.
@@ -644,7 +655,7 @@ pub enum Error {
     /// Separate from [`Error::SyncTruncated`]: truncation means "not enough bytes", this one means
     /// "enough bytes, but they do not add up" — the payload was reassembled, a stronger signal
     /// than truncation.
-    #[error("同步载荷声明有 {declared} 条记录，实际只解出 {actual} 条")]
+    #[error("sync payload declares {declared} records but only {actual} were decoded")]
     SyncRecordCountMismatch {
         /// Record count declared by the payload.
         declared: usize,
@@ -653,7 +664,7 @@ pub enum Error {
     },
 
     /// The payload contains more records than the limit allows.
-    #[error("同步载荷的记录数 {count} 超过上限 {limit}")]
+    #[error("sync payload record count {count} exceeds the limit {limit}")]
     SyncTooManyRecords {
         /// Record count declared by the payload.
         count: usize,
@@ -665,7 +676,7 @@ pub enum Error {
     ///
     /// Deflate is defined for every input, so this does not occur in practice. It exists so that
     /// the return value of `miniz_oxide` is not `unwrap`ped.
-    #[error("同步载荷压缩失败")]
+    #[error("sync payload compression failed")]
     SyncCompressionFailed,
 
     /// The decompressed content exceeds [`MAX_DECOMPRESSED_LEN`], or the input is not a valid
@@ -676,7 +687,7 @@ pub enum Error {
     /// Corruption, truncation and a length mismatch deliberately share one variant: their handling
     /// is identical (reject this sync, ask the peer to resend), and separating them has no
     /// actionable value for the user.
-    #[error("同步载荷解压失败")]
+    #[error("sync payload decompression failed")]
     SyncDecompressionFailed,
 
     /// The payload exceeds the length limit after decompression.
@@ -691,7 +702,9 @@ pub enum Error {
     /// The price is that an attacker can probe the limit's position with one bit, and the limit is
     /// in the open-source code anyway. A related fact: decompression happens **after** the outer
     /// AEAD, so input reaching this point has already been authenticated.
-    #[error("同步载荷解压后超过 {limit} 字节上限，请改用局域网模式")]
+    #[error(
+        "sync payload exceeds the {limit} byte limit after decompression; use LAN mode instead"
+    )]
     SyncPayloadTooLarge {
         /// The limit, attached to the error so callers need not look up the constant.
         limit: usize,
@@ -703,7 +716,7 @@ pub enum Error {
     /// skipping makes semantics added by a future version **silently disappear** on older
     /// versions, and "the sync finished but a few entries are missing" is one of the hardest
     /// failures to trace.
-    #[error("同步载荷含未知记录种类 {value:#04x}")]
+    #[error("sync payload contains an unknown record kind {value:#04x}")]
     SyncUnknownRecordKind {
         /// The kind byte that was read.
         value: u8,
@@ -714,7 +727,7 @@ pub enum Error {
     /// This variant is the **catch-all**: every structural problem that can be named has its own
     /// variant, so reaching this one means "the payload failed a self-consistency check, but which
     /// one cannot be said".
-    #[error("同步载荷结构不合法：{reason}")]
+    #[error("malformed sync payload: {reason}")]
     SyncMalformed {
         /// Human-readable reason for logs and diagnostics. **Must not contain secret material.**
         reason: &'static str,
@@ -729,7 +742,7 @@ pub enum Error {
     ///
     /// **It does not distinguish** a wrong master key, a tampered payload and a mismatched sender
     /// identifier: telling them apart helps an attacker and has no actionable value for the user.
-    #[error("同步载荷认证失败")]
+    #[error("sync payload authentication failed")]
     SyncAuthenticationFailed,
 
     /// This sync payload has already been processed.
@@ -741,7 +754,7 @@ pub enum Error {
     ///
     /// This is a **separate error** rather than a silent success: the caller needs to know "the
     /// sync did happen, this one is a duplicate", not "a sync just succeeded".
-    #[error("这份同步载荷已经处理过了")]
+    #[error("this sync payload has already been applied")]
     SyncAlreadyApplied,
 
     /// The log of used payload identifiers is full.
@@ -750,7 +763,7 @@ pub enum Error {
     /// payload acceptable again, which is exactly what replay protection must prevent. On seeing
     /// this error the caller should tell the user that the sync history is too long; what to do
     /// about it is a higher-level policy decision.
-    #[error("已用同步载荷标识的日志已满（上限 {limit}）")]
+    #[error("the log of used sync payload identifiers is full (limit {limit})")]
     SyncIdLogFull {
         /// Maximum number of entries allowed.
         limit: usize,
@@ -766,7 +779,7 @@ pub enum Error {
     /// `#![forbid(unsafe_code)]` and depends on no I/O, so writing those types into the error enum
     /// would freeze platform details into the protocol layer. Only an opaque `reason` is kept — it
     /// is meant for logs, not for program decisions.
-    #[error("传输失败：{reason}")]
+    #[error("transport failed: {reason}")]
     TransportFailed {
         /// Opaque description for logs.
         reason: &'static str,
@@ -785,7 +798,7 @@ pub enum Error {
     ///
     /// Note that it stops **impersonation**, not replay — replay is stopped by
     /// [`Error::SyncAlreadyApplied`].
-    #[error("载荷自报的发送方与通道声称的发送方不一致")]
+    #[error("the sender reported by the payload differs from the sender claimed by the channel")]
     SyncSenderMismatch,
 
     /// The kind claimed by the payload is not one this version knows.
@@ -793,7 +806,7 @@ pub enum Error {
     /// Separate from [`Error::SyncUnknownRecordKind`]: that one is about the kind of **one record
     /// inside** the payload (entry or tombstone), this one about the kind of **the whole payload**
     /// (state exchange or request). See [`crate::sync::PayloadKind`].
-    #[error("未知的载荷种类 {value:#04x}")]
+    #[error("unknown payload kind {value:#04x}")]
     SyncUnknownPayloadKind {
         /// Raw byte from the wire format.
         value: u8,
@@ -805,7 +818,7 @@ pub enum Error {
     /// long-lived connection. It is **not** used for "this channel cannot fit the payload" — that
     /// is [`Error::TransportMessageTooLarge`], and the two are handled quite differently (the
     /// former can only switch channels; the latter can switch modes or send the user to the LAN).
-    #[error("传输通道不支持该操作：{operation}")]
+    #[error("the transport channel does not support this operation: {operation}")]
     TransportUnsupported {
         /// Name of the rejected operation.
         operation: &'static str,
@@ -815,7 +828,7 @@ pub enum Error {
     /// A QR code is the typical one-shot channel: one code carries exactly one exchange. Treating
     /// it as reusable would turn "scan the same code twice" into two syncs, which is a side path
     /// around replay protection.
-    #[error("该传输通道已经使用过，不能再次使用")]
+    #[error("this transport channel has already been used and cannot be reused")]
     TransportAlreadyUsed,
 
     /// A single message exceeds what the channel can carry.
@@ -824,7 +837,7 @@ pub enum Error {
     /// not fit the only options are switching mode or switching channel. The caller should use this
     /// to steer the user towards the LAN, not truncate the payload — a truncated payload fails
     /// AEAD, so what the user sees is "corrupted data".
-    #[error("单条消息需要 {needed} 字节，超过该通道的 {limit} 字节上限")]
+    #[error("a single message needs {needed} bytes, exceeding this channel's {limit} byte limit")]
     TransportMessageTooLarge {
         /// Number of bytes this message needs.
         needed: usize,
@@ -837,7 +850,7 @@ pub enum Error {
     /// Separate from "found one, but the handshake failed": the former is the normal "nobody
     /// nearby", where the caller should let the user retry or check the network; only the latter is
     /// an anomaly.
-    #[error("未发现可加入的同步会话")]
+    #[error("no joinable sync session was found")]
     SyncNoSessionFound,
 }
 
@@ -865,7 +878,10 @@ mod tests {
         ];
         for (err, needle) in cases {
             let text = err.to_string();
-            assert!(text.contains(needle), "错误文本 {text:?} 未包含 {needle:?}");
+            assert!(
+                text.contains(needle),
+                "error text {text:?} does not contain {needle:?}"
+            );
         }
     }
 

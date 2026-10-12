@@ -261,7 +261,7 @@ impl QrPayload {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != QR_PAYLOAD_LEN {
             return Err(Error::PairingPayloadMalformed {
-                reason: "长度不是 1 + 65 + 32 + 1 字节",
+                reason: "the length is not 1 + 65 + 32 + 1 bytes",
             });
         }
         if bytes[0] != PROTOCOL_VERSION {
@@ -274,12 +274,12 @@ impl QrPayload {
         let capabilities = bytes[QR_PAYLOAD_LEN - 1];
 
         PublicKey::from_sec1_bytes(&public_key).map_err(|_| Error::DevicePublicKeyInvalid {
-            reason: "二维码里的临时公钥不是合法的 P-256 SEC1 点",
+            reason: "the ephemeral public key in the QR code is not a valid P-256 SEC1 point",
         })?;
 
         if capabilities & CAPABILITY_DEVICE_IDENTITY == 0 {
             return Err(Error::PairingPayloadMalformed {
-                reason: "二维码缺少必需的能力位",
+                reason: "the QR code is missing a required capability bit",
             });
         }
 
@@ -392,7 +392,7 @@ impl PendingSession {
         joiner_ephemeral.copy_from_slice(&msg1[NONCE_LEN..MSG1_HEADER_LEN]);
         let joiner_ephemeral = PublicKey::from_sec1_bytes(&joiner_ephemeral).map_err(|_| {
             Error::DevicePublicKeyInvalid {
-                reason: "加入方的临时公钥不是合法的 P-256 SEC1 点",
+                reason: "the joiner's ephemeral public key is not a valid P-256 SEC1 point",
             }
         })?;
 
@@ -426,7 +426,7 @@ impl PendingSession {
         }
         PublicKey::from_sec1_bytes(&joiner_identity).map_err(|_| {
             Error::DevicePublicKeyInvalid {
-                reason: "加入方的设备身份公钥不是合法的 P-256 SEC1 点",
+                reason: "the joiner's device identity public key is not a valid P-256 SEC1 point",
             }
         })?;
 
@@ -563,11 +563,11 @@ impl JoinerSession {
     pub fn request(&self, device_identity: &[u8]) -> Result<(Vec<u8>, [u8; SESSION_ID_LEN])> {
         if device_identity.len() != PUBLIC_KEY_LEN {
             return Err(Error::DevicePublicKeyInvalid {
-                reason: "设备身份公钥长度不是 65 字节",
+                reason: "the device identity public key is not 65 bytes long",
             });
         }
         PublicKey::from_sec1_bytes(device_identity).map_err(|_| Error::DevicePublicKeyInvalid {
-            reason: "设备身份公钥不是合法的 P-256 SEC1 点",
+            reason: "the device identity public key is not a valid P-256 SEC1 point",
         })?;
         let (transcript, keys) = self.derive()?;
 
@@ -613,7 +613,7 @@ impl JoinerSession {
         }
         if device_identity.len() != PUBLIC_KEY_LEN {
             return Err(Error::DevicePublicKeyInvalid {
-                reason: "设备身份公钥长度不是 65 字节",
+                reason: "the device identity public key is not 65 bytes long",
             });
         }
         let (transcript, keys) = self.derive()?;
@@ -644,12 +644,11 @@ impl JoinerSession {
 
     /// Derive this side's session material; it must come out exactly as on the initiator.
     fn derive(&self) -> Result<([u8; SESSION_ID_LEN], SessionKeys)> {
-        let initiator_public =
-            PublicKey::from_sec1_bytes(&self.payload.public_key).map_err(|_| {
-                Error::DevicePublicKeyInvalid {
-                    reason: "二维码里的临时公钥不是合法的 P-256 SEC1 点",
-                }
-            })?;
+        let initiator_public = PublicKey::from_sec1_bytes(&self.payload.public_key).map_err(
+            |_| Error::DevicePublicKeyInvalid {
+                reason: "the ephemeral public key in the QR code is not a valid P-256 SEC1 point",
+            },
+        )?;
         let transcript = transcript_hash(
             &self.payload.public_key,
             &self.payload.nonce,
@@ -847,7 +846,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// The payload goes into the QR code and the session keeps the ephemeral private key, so the two are
 /// produced and returned as a pair: a public key in the QR code without its matching private key
 /// makes every pairing fail.
-#[must_use = "配对会话必须被保留，否则二维码里的公钥就没有对应的私钥了"]
+#[must_use = "the pairing session must be kept, or the public key in the QR code has no matching private key"]
 pub fn begin() -> Result<(QrPayload, PendingSession)> {
     let secret = EphemeralSecret::generate();
     let public_key = secret.public_key().to_sec1_point(false);
@@ -881,7 +880,7 @@ pub fn begin() -> Result<(QrPayload, PendingSession)> {
 /// be assumed to come from `decode`.
 pub fn join(payload: &QrPayload) -> Result<JoinerSession> {
     PublicKey::from_sec1_bytes(&payload.public_key).map_err(|_| Error::DevicePublicKeyInvalid {
-        reason: "二维码里的临时公钥不是合法的 P-256 SEC1 点",
+        reason: "the ephemeral public key in the QR code is not a valid P-256 SEC1 point",
     })?;
 
     let secret = EphemeralSecret::generate();
@@ -996,12 +995,12 @@ mod tests {
     /// that is a security boundary. A key derived from a small scalar is enough here, since the
     /// pairing protocol only moves the identity around as **opaque** bytes.
     fn fake_identity() -> [u8; PUBLIC_KEY_LEN] {
-        public_key_of(&SecretKey::from_bytes(&[1_u8; 32].into()).expect("标量 1 合法"))
+        public_key_of(&SecretKey::from_bytes(&[1_u8; 32].into()).expect("scalar 1 is valid"))
     }
 
     /// Another valid but different identity.
     fn other_identity() -> [u8; PUBLIC_KEY_LEN] {
-        public_key_of(&SecretKey::from_bytes(&[2_u8; 32].into()).expect("标量 2 合法"))
+        public_key_of(&SecretKey::from_bytes(&[2_u8; 32].into()).expect("scalar 2 is valid"))
     }
 
     /// Take the SEC1 uncompressed public key belonging to a private key.
@@ -1019,25 +1018,25 @@ mod tests {
         [u8; SESSION_ID_LEN],
         [u8; SESSION_ID_LEN],
     ) {
-        let initiator_master = MasterKey::generate().expect("随机源可用");
+        let initiator_master = MasterKey::generate().expect("randomness should be available");
         let identity = fake_identity();
 
-        let (payload, pending) = begin().expect("随机源可用");
-        let joiner = join(&payload).expect("随机源可用");
-        let (msg1, joiner_sid) = joiner.request(&identity).expect("可生成 Msg1");
+        let (payload, pending) = begin().expect("randomness should be available");
+        let joiner = join(&payload).expect("randomness should be available");
+        let (msg1, joiner_sid) = joiner.request(&identity).expect("Msg1 should be produced");
 
         let adoption = pending
             .accept(&msg1, &initiator_master)
-            .expect("Msg1 应通过认证");
+            .expect("Msg1 should authenticate");
         assert_eq!(
             adoption.joiner_identity(),
             &identity,
-            "发起方应看到加入方的设备身份"
+            "the initiator should see the joiner's device identity"
         );
 
         let joiner_master = joiner
             .open(adoption.reply(), &identity)
-            .expect("Msg2 应通过认证");
+            .expect("Msg2 should authenticate");
         (
             initiator_master,
             joiner_master,
@@ -1050,23 +1049,30 @@ mod tests {
     #[test]
     fn happy_path_transfers_the_master_key() {
         let (a, b, sid_a, sid_b) = run_pairing();
-        assert_eq!(a.expose(), b.expose(), "双方主密钥必须一致");
-        assert_eq!(sid_a, sid_b, "双方会话标识必须一致");
+        assert_eq!(
+            a.expose(),
+            b.expose(),
+            "both sides must agree on the master key"
+        );
+        assert_eq!(
+            sid_a, sid_b,
+            "both sides must agree on the session identifier"
+        );
     }
 
     /// The QR payload must survive a Base32 round trip.
     #[test]
     fn qr_payload_roundtrips_through_base32() {
-        let (payload, _pending) = begin().expect("随机源可用");
+        let (payload, _pending) = begin().expect("randomness should be available");
         let text = payload.to_base32();
-        let decoded = QrPayload::from_base32(&text).expect("应能解码");
+        let decoded = QrPayload::from_base32(&text).expect("it should decode");
         assert_eq!(decoded, payload);
     }
 
     /// The QR byte layout is an external contract; pin it down.
     #[test]
     fn qr_payload_layout_is_stable() {
-        let (payload, _pending) = begin().expect("随机源可用");
+        let (payload, _pending) = begin().expect("randomness should be available");
         let bytes = payload.encode();
         assert_eq!(bytes.len(), QR_PAYLOAD_LEN);
         assert_eq!(bytes[0], PROTOCOL_VERSION);
@@ -1078,7 +1084,7 @@ mod tests {
     /// A QR payload of the wrong length must be rejected.
     #[test]
     fn qr_payload_rejects_wrong_length() {
-        let (payload, _pending) = begin().expect("随机源可用");
+        let (payload, _pending) = begin().expect("randomness should be available");
         let bytes = payload.encode();
         for cut in [0_usize, 1, QR_PAYLOAD_LEN - 1] {
             assert!(
@@ -1086,7 +1092,7 @@ mod tests {
                     QrPayload::decode(&bytes[..cut]),
                     Err(Error::PairingPayloadMalformed { .. })
                 ),
-                "长度 {cut} 应被拒绝"
+                "length {cut} must be rejected"
             );
         }
         let mut longer = bytes.clone();
@@ -1097,12 +1103,15 @@ mod tests {
     /// An unknown version must be rejected **explicitly**, not read as this version.
     #[test]
     fn qr_payload_rejects_unknown_version() {
-        let (payload, _pending) = begin().expect("随机源可用");
+        let (payload, _pending) = begin().expect("randomness should be available");
         let mut bytes = payload.encode();
         bytes[0] = 0x7F;
         match QrPayload::decode(&bytes) {
             Err(Error::PairingUnsupportedVersion { version }) => assert_eq!(version, 0x7F),
-            other => panic!("应报版本不支持，实际 is_ok={}", other.is_ok()),
+            other => panic!(
+                "an unsupported version should be reported, got is_ok={}",
+                other.is_ok()
+            ),
         }
     }
 
@@ -1111,7 +1120,7 @@ mod tests {
     /// almost certainly leaves the curve.
     #[test]
     fn qr_payload_rejects_off_curve_public_key() {
-        let (payload, _pending) = begin().expect("随机源可用");
+        let (payload, _pending) = begin().expect("randomness should be available");
         let mut bytes = payload.encode();
         bytes[PUBLIC_KEY_LEN] ^= 0x01;
         assert!(
@@ -1119,14 +1128,14 @@ mod tests {
                 QrPayload::decode(&bytes),
                 Err(Error::DevicePublicKeyInvalid { .. })
             ),
-            "曲外公钥应被拒绝"
+            "an off-curve public key must be rejected"
         );
     }
 
     /// A missing required capability bit must be rejected.
     #[test]
     fn qr_payload_rejects_missing_capability() {
-        let (payload, _pending) = begin().expect("随机源可用");
+        let (payload, _pending) = begin().expect("randomness should be available");
         let mut bytes = payload.encode();
         bytes[QR_PAYLOAD_LEN - 1] = 0x00;
         assert!(matches!(
@@ -1138,30 +1147,36 @@ mod tests {
     /// Every session must get a fresh ephemeral public key and nonce.
     #[test]
     fn each_session_gets_a_fresh_payload() {
-        let (a, _pa) = begin().expect("随机源可用");
-        let (b, _pb) = begin().expect("随机源可用");
-        assert_ne!(a.nonce(), b.nonce(), "nonce 被复用");
-        assert_ne!(a.public_key(), b.public_key(), "临时公钥被复用");
+        let (a, _pa) = begin().expect("randomness should be available");
+        let (b, _pb) = begin().expect("randomness should be available");
+        assert_ne!(a.nonce(), b.nonce(), "the nonce was reused");
+        assert_ne!(
+            a.public_key(),
+            b.public_key(),
+            "the ephemeral public key was reused"
+        );
     }
 
     /// **Tampering with any byte of `Msg1` must fail.**
     #[test]
     fn tampering_with_msg1_fails() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let identity = fake_identity();
-        let (payload, pending) = begin().expect("随机源可用");
-        let joiner = join(&payload).expect("随机源可用");
-        let (baseline, _) = joiner.request(&identity).expect("可生成 Msg1");
+        let (payload, pending) = begin().expect("randomness should be available");
+        let joiner = join(&payload).expect("randomness should be available");
+        let (baseline, _) = joiner.request(&identity).expect("Msg1 should be produced");
         assert_eq!(baseline.len(), MSG1_LEN);
 
         for index in 0..baseline.len() {
-            let (payload_i, pending_i) = begin().expect("随机源可用");
-            let joiner_i = join(&payload_i).expect("随机源可用");
-            let (mut tampered, _) = joiner_i.request(&identity).expect("可生成 Msg1");
+            let (payload_i, pending_i) = begin().expect("randomness should be available");
+            let joiner_i = join(&payload_i).expect("randomness should be available");
+            let (mut tampered, _) = joiner_i
+                .request(&identity)
+                .expect("Msg1 should be produced");
             tampered[index] ^= 0x01;
             assert!(
                 pending_i.accept(&tampered, &master).is_err(),
-                "Msg1 第 {index} 字节被翻转却通过了认证"
+                "byte {index} of Msg1 was flipped, yet authentication passed"
             );
         }
         assert!(pending.accept(&baseline, &master).is_ok());
@@ -1170,35 +1185,39 @@ mod tests {
     /// **Tampering with any byte of `Msg2` must fail**, the master key itself included.
     #[test]
     fn tampering_with_msg2_fails() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let identity = fake_identity();
-        let (payload, pending) = begin().expect("随机源可用");
-        let joiner = join(&payload).expect("随机源可用");
-        let (msg1, _) = joiner.request(&identity).expect("可生成 Msg1");
-        let adoption = pending.accept(&msg1, &master).expect("应通过认证");
+        let (payload, pending) = begin().expect("randomness should be available");
+        let joiner = join(&payload).expect("randomness should be available");
+        let (msg1, _) = joiner.request(&identity).expect("Msg1 should be produced");
+        let adoption = pending
+            .accept(&msg1, &master)
+            .expect("it should authenticate");
         assert_eq!(adoption.reply().len(), MSG2_LEN);
 
         let mut tampered = adoption.reply().to_vec();
         tampered[0] ^= 0x01;
         assert!(
             joiner.open(&tampered, &identity).is_err(),
-            "被改动的主密钥却通过了认证"
+            "the tampered master key still passed authentication"
         );
     }
 
     /// Answering this session with **another session's** `Msg1` must fail.
     #[test]
     fn msg1_from_another_session_fails() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let identity = fake_identity();
-        let (_payload_a, pending_a) = begin().expect("随机源可用");
-        let (payload_b, _pending_b) = begin().expect("随机源可用");
-        let joiner_b = join(&payload_b).expect("随机源可用");
-        let (msg1_b, _) = joiner_b.request(&identity).expect("可生成 Msg1");
+        let (_payload_a, pending_a) = begin().expect("randomness should be available");
+        let (payload_b, _pending_b) = begin().expect("randomness should be available");
+        let joiner_b = join(&payload_b).expect("randomness should be available");
+        let (msg1_b, _) = joiner_b
+            .request(&identity)
+            .expect("Msg1 should be produced");
 
         assert!(
             pending_a.accept(&msg1_b, &master).is_err(),
-            "跨会话 Msg1 应被拒绝"
+            "a cross-session Msg1 must be rejected"
         );
     }
 
@@ -1208,37 +1227,37 @@ mod tests {
     /// input would let an attacker buy a lot of computation for very little cost.
     #[test]
     fn wrong_length_messages_fail() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let identity = fake_identity();
 
-        let (payload, _pending) = begin().expect("随机源可用");
-        let joiner = join(&payload).expect("随机源可用");
-        let (msg1, _) = joiner.request(&identity).expect("可生成 Msg1");
+        let (payload, _pending) = begin().expect("randomness should be available");
+        let joiner = join(&payload).expect("randomness should be available");
+        let (msg1, _) = joiner.request(&identity).expect("Msg1 should be produced");
         for cut in [0_usize, 1, MSG1_LEN - 1] {
-            let (p, pend) = begin().expect("随机源可用");
-            drop(join(&p).expect("随机源可用"));
+            let (p, pend) = begin().expect("randomness should be available");
+            drop(join(&p).expect("randomness should be available"));
             assert!(
                 pend.accept(&msg1[..cut], &master).is_err(),
-                "长度 {cut} 应被拒绝"
+                "length {cut} must be rejected"
             );
         }
         let mut too_long = msg1.clone();
         too_long.push(0);
-        let (p, pend) = begin().expect("随机源可用");
-        drop(join(&p).expect("随机源可用"));
+        let (p, pend) = begin().expect("randomness should be available");
+        drop(join(&p).expect("randomness should be available"));
         assert!(
             pend.accept(&too_long, &master).is_err(),
-            "过长的 Msg1 应被拒绝"
+            "an over-long Msg1 must be rejected"
         );
 
         for cut in [0_usize, 1, MSG2_LEN - 1] {
-            let (p, pend) = begin().expect("随机源可用");
-            let j = join(&p).expect("随机源可用");
-            let (m1, _) = j.request(&identity).expect("可生成 Msg1");
-            let ad = pend.accept(&m1, &master).expect("应通过认证");
+            let (p, pend) = begin().expect("randomness should be available");
+            let j = join(&p).expect("randomness should be available");
+            let (m1, _) = j.request(&identity).expect("Msg1 should be produced");
+            let ad = pend.accept(&m1, &master).expect("it should authenticate");
             assert!(
                 j.open(&ad.reply()[..cut], &identity).is_err(),
-                "长度 {cut} 应被拒绝"
+                "length {cut} must be rejected"
             );
         }
     }
@@ -1246,15 +1265,15 @@ mod tests {
     /// A device identity public key of the wrong length must be rejected **before a message is sent**.
     #[test]
     fn request_rejects_wrong_identity_length() {
-        let (payload, _pending) = begin().expect("随机源可用");
-        let joiner = join(&payload).expect("随机源可用");
+        let (payload, _pending) = begin().expect("randomness should be available");
+        let joiner = join(&payload).expect("randomness should be available");
         for bad in [&[][..], &[0_u8; 64][..], &[0_u8; 66][..]] {
             assert!(
                 matches!(
                     joiner.request(bad),
                     Err(Error::DevicePublicKeyInvalid { .. })
                 ),
-                "长度 {} 应被拒绝",
+                "length {} must be rejected",
                 bad.len()
             );
         }
@@ -1263,11 +1282,14 @@ mod tests {
     /// A "device identity public key" off the curve must be rejected.
     #[test]
     fn request_rejects_off_curve_identity() {
-        let (payload, _pending) = begin().expect("随机源可用");
-        let joiner = join(&payload).expect("随机源可用");
+        let (payload, _pending) = begin().expect("randomness should be available");
+        let joiner = join(&payload).expect("randomness should be available");
         let mut bad = fake_identity();
         bad[0] = 0x03;
-        assert!(joiner.request(&bad).is_err(), "非法前缀应被拒绝");
+        assert!(
+            joiner.request(&bad).is_err(),
+            "an invalid prefix must be rejected"
+        );
     }
 
     /// **Opening `Msg2` with a different identity public key must fail.**
@@ -1276,16 +1298,18 @@ mod tests {
     /// generic OK that says nothing about who the peer is.
     #[test]
     fn msg2_cannot_be_opened_with_a_different_identity() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let identity = fake_identity();
-        let (payload, pending) = begin().expect("随机源可用");
-        let joiner = join(&payload).expect("随机源可用");
-        let (msg1, _) = joiner.request(&identity).expect("可生成 Msg1");
-        let adoption = pending.accept(&msg1, &master).expect("应通过认证");
+        let (payload, pending) = begin().expect("randomness should be available");
+        let joiner = join(&payload).expect("randomness should be available");
+        let (msg1, _) = joiner.request(&identity).expect("Msg1 should be produced");
+        let adoption = pending
+            .accept(&msg1, &master)
+            .expect("it should authenticate");
 
         assert!(
             joiner.open(adoption.reply(), &other_identity()).is_err(),
-            "用另一个身份却能打开 Msg2"
+            "Msg2 could be opened with a different identity"
         );
     }
 
@@ -1295,9 +1319,12 @@ mod tests {
         let mut log = NonceLog::new();
         let nonce = [7_u8; NONCE_LEN];
         assert!(!log.is_used(&nonce));
-        assert!(log.record(nonce), "首次记录应成功");
+        assert!(log.record(nonce), "the first record should succeed");
         assert!(log.is_used(&nonce));
-        assert!(!log.record(nonce), "重复记录应被识别为重放");
+        assert!(
+            !log.record(nonce),
+            "a duplicate record must be recognized as a replay"
+        );
         assert_eq!(log.len(), 1);
     }
 
@@ -1308,7 +1335,7 @@ mod tests {
         for i in 0..(NonceLog::DEFAULT_CAPACITY + 50) {
             let mut nonce = [0_u8; NONCE_LEN];
             nonce[..8].copy_from_slice(&(i as u64).to_be_bytes());
-            assert!(log.record(nonce), "第 {i} 条应记录成功");
+            assert!(log.record(nonce), "entry {i} should be recorded");
         }
         assert_eq!(log.len(), NonceLog::DEFAULT_CAPACITY);
     }
@@ -1317,21 +1344,25 @@ mod tests {
     #[test]
     fn transcripts_differ_per_session() {
         let identity = fake_identity();
-        let (payload_a, _pa) = begin().expect("随机源可用");
-        let (payload_b, _pb) = begin().expect("随机源可用");
-        let joiner_a = join(&payload_a).expect("随机源可用");
-        let joiner_b = join(&payload_b).expect("随机源可用");
-        let (_, sid_a) = joiner_a.request(&identity).expect("可生成");
-        let (_, sid_b) = joiner_b.request(&identity).expect("可生成");
-        assert_ne!(sid_a, sid_b, "两次会话的 transcript 相同");
+        let (payload_a, _pa) = begin().expect("randomness should be available");
+        let (payload_b, _pb) = begin().expect("randomness should be available");
+        let joiner_a = join(&payload_a).expect("randomness should be available");
+        let joiner_b = join(&payload_b).expect("randomness should be available");
+        let (_, sid_a) = joiner_a
+            .request(&identity)
+            .expect("Msg1 should be produced");
+        let (_, sid_b) = joiner_b
+            .request(&identity)
+            .expect("Msg1 should be produced");
+        assert_ne!(sid_a, sid_b, "two sessions produced the same transcript");
     }
 
     /// Round trip of master key storage.
     #[test]
     fn master_key_storage_roundtrip() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let bytes = master_key_for_storage(&master);
-        let rebuilt = master_key_from_storage(bytes).expect("长度正确");
+        let rebuilt = master_key_from_storage(bytes).expect("the length is correct");
         assert_eq!(master.expose(), rebuilt.expose());
     }
 
@@ -1343,25 +1374,25 @@ mod tests {
     #[test]
     fn msg1_layout_keeps_device_identity_encrypted() {
         let identity = fake_identity();
-        let (payload, _pending) = begin().expect("随机源可用");
-        let joiner = join(&payload).expect("随机源可用");
-        let (msg1, _) = joiner.request(&identity).expect("可生成 Msg1");
+        let (payload, _pending) = begin().expect("randomness should be available");
+        let joiner = join(&payload).expect("randomness should be available");
+        let (msg1, _) = joiner.request(&identity).expect("Msg1 should be produced");
 
         assert_eq!(msg1.len(), MSG1_LEN);
         assert_eq!(MSG1_LEN, 32 + 65 + (65 + 32) + 16);
         assert_eq!(
             &msg1[..NONCE_LEN],
             &joiner_nonce_of(&msg1),
-            "nonce 应在最前"
+            "the nonce must come first"
         );
         assert_eq!(
             &msg1[NONCE_LEN..MSG1_HEADER_LEN],
             joiner.public_key(),
-            "明文头应携带加入方的临时公钥"
+            "the plaintext header must carry the joiner's ephemeral public key"
         );
         assert!(
             !msg1.windows(PUBLIC_KEY_LEN).any(|w| w == identity),
-            "设备身份公钥出现在了 Msg1 的明文部分"
+            "the device identity public key appears in Msg1's plaintext part"
         );
     }
 
@@ -1392,7 +1423,7 @@ mod tests {
         nonce.copy_from_slice(&msg1[..NONCE_LEN]);
         let mut eph = [0u8; PUBLIC_KEY_LEN];
         eph.copy_from_slice(&msg1[NONCE_LEN..MSG1_HEADER_LEN]);
-        let eph_pub = PublicKey::from_sec1_bytes(&eph).expect("曲线上");
+        let eph_pub = PublicKey::from_sec1_bytes(&eph).expect("on the curve");
         let sid_i = transcript_hash(
             &pending.payload.public_key,
             &pending.payload.nonce,
@@ -1429,7 +1460,7 @@ mod tests {
             let bytes: SecretBytes = vec![0_u8; len].into();
             assert!(
                 master_key_from_storage(bytes).is_err(),
-                "长度 {len} 应被拒绝"
+                "length {len} must be rejected"
             );
         }
     }
@@ -1437,14 +1468,18 @@ mod tests {
     /// **Debug output must not leak the master key.**
     #[test]
     fn debug_output_is_redacted() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let identity = fake_identity();
-        let (payload, pending) = begin().expect("随机源可用");
-        let joiner = join(&payload).expect("随机源可用");
-        let (msg1, _) = joiner.request(&identity).expect("可生成 Msg1");
+        let (payload, pending) = begin().expect("randomness should be available");
+        let joiner = join(&payload).expect("randomness should be available");
+        let (msg1, _) = joiner.request(&identity).expect("Msg1 should be produced");
         let joiner_debug = format!("{joiner:?}");
-        let adoption = pending.accept(&msg1, &master).expect("应通过认证");
-        let _ = joiner.open(adoption.reply(), &identity).expect("应能解开");
+        let adoption = pending
+            .accept(&msg1, &master)
+            .expect("it should authenticate");
+        let _ = joiner
+            .open(adoption.reply(), &identity)
+            .expect("it should open");
 
         let texts = [
             format!("{payload:?}"),
@@ -1452,11 +1487,17 @@ mod tests {
             format!("{adoption:?}"),
         ];
         for text in &texts {
-            assert!(!text.contains("XChaCha"), "不该出现内部类型名");
+            assert!(
+                !text.contains("XChaCha"),
+                "no internal type name should appear"
+            );
         }
         let hex: String = master.expose().iter().map(|b| format!("{b:02x}")).collect();
         for text in &texts {
-            assert!(!text.contains(&hex), "Debug 泄露了主密钥十六进制：{text}");
+            assert!(
+                !text.contains(&hex),
+                "Debug output leaked the master key in hex: {text}"
+            );
         }
     }
 
@@ -1466,6 +1507,10 @@ mod tests {
     fn reply_actually_carries_the_master_key() {
         let (a, b, _, _) = run_pairing();
         assert_eq!(a.expose(), b.expose());
-        assert_ne!(a.expose(), &[0_u8; MASTER_KEY_LEN], "主密钥不该是全零");
+        assert_ne!(
+            a.expose(),
+            &[0_u8; MASTER_KEY_LEN],
+            "the master key must not be all zeros"
+        );
     }
 }

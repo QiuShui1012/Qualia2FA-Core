@@ -233,7 +233,7 @@ impl OtpSecret {
     /// exempted below.
     #[expect(
         clippy::len_without_is_empty,
-        reason = "本类型的不变量保证非空，`is_empty` 恒为 false，提供它反而误导"
+        reason = "the invariants of this type guarantee it is non-empty, so `is_empty` would always be false and offering it would be misleading"
     )]
     #[must_use]
     pub fn len(&self) -> usize {
@@ -440,9 +440,9 @@ pub fn totp_code(
 /// ```
 /// use qualia2fa_core::otp::{self, Algorithm, Digits, OtpSecret};
 ///
-/// let secret = OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("合法种子");
+/// let secret = OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("a valid seed");
 /// let code = otp::totp_code(&secret, 1_700_000_000, 30, Algorithm::Sha1, Digits::Six)
-///     .expect("period 非零");
+///     .expect("period is non-zero");
 /// assert!(otp::verify_code(&code, &code));
 /// assert!(!otp::verify_code(&code, "000000"));
 /// ```
@@ -602,7 +602,7 @@ mod tests {
                     Algorithm::parse(bad),
                     Err(Error::UnsupportedAlgorithm { .. })
                 ),
-                "{bad:?} 应被拒绝"
+                "{bad:?} must be rejected"
             );
         }
     }
@@ -613,7 +613,7 @@ mod tests {
     fn truncate_for_error_handles_multibyte_boundary() {
         let long = "算".repeat(20);
         let text = truncate_for_error(&long);
-        assert!(text.ends_with('…'), "应带省略号：{text}");
+        assert!(text.ends_with('…'), "must end with an ellipsis: {text}");
         assert!(long.starts_with(text.trim_end_matches('…')));
     }
 
@@ -625,7 +625,7 @@ mod tests {
         for bad in ["5", "9", "0", "06", "", "six", "99999999999999999999"] {
             assert!(
                 matches!(Digits::parse(bad), Err(Error::UnsupportedDigits { .. })),
-                "{bad:?} 应被拒绝"
+                "{bad:?} must be rejected"
             );
         }
     }
@@ -653,17 +653,20 @@ mod tests {
 
     #[test]
     fn secret_debug_never_leaks_bytes() {
-        let secret = OtpSecret::from_bytes(vec![0xde, 0xad, 0xbe, 0xef]).expect("非空");
+        let secret = OtpSecret::from_bytes(vec![0xde, 0xad, 0xbe, 0xef]).expect("non-empty");
         let text = format!("{secret:?}");
-        assert!(text.contains("redacted"), "应标注脱敏：{text}");
+        assert!(
+            text.contains("redacted"),
+            "must be marked as redacted: {text}"
+        );
         for leak in ["dead", "beef", "222", "173"] {
-            assert!(!text.to_lowercase().contains(leak), "泄露 {leak}：{text}");
+            assert!(!text.to_lowercase().contains(leak), "leaks {leak}: {text}");
         }
     }
 
     #[test]
     fn period_zero_is_rejected() {
-        let secret = OtpSecret::from_bytes(vec![1, 2, 3]).expect("非空");
+        let secret = OtpSecret::from_bytes(vec![1, 2, 3]).expect("non-empty");
         assert!(matches!(
             totp(&secret, 0, 0, Algorithm::Sha1, Digits::Six),
             Err(Error::InvalidPeriod)
@@ -687,11 +690,12 @@ mod tests {
 
     #[test]
     fn short_secret_is_flagged_but_accepted() {
-        let secret = OtpSecret::from_bytes(vec![1, 2, 3, 4]).expect("非空短种子应被接受");
+        let secret = OtpSecret::from_bytes(vec![1, 2, 3, 4])
+            .expect("a non-empty short seed must be accepted");
         assert!(secret.is_shorter_than_recommended(Algorithm::Sha1));
         assert_eq!(secret.len(), 4);
 
-        let long = OtpSecret::from_bytes(vec![0_u8; 20]).expect("非空");
+        let long = OtpSecret::from_bytes(vec![0_u8; 20]).expect("non-empty");
         assert!(!long.is_shorter_than_recommended(Algorithm::Sha1));
     }
 
@@ -708,29 +712,31 @@ mod tests {
     /// correct one.
     #[test]
     fn drift_window_finds_neighbouring_steps() {
-        let secret = OtpSecret::from_bytes((0..20).collect::<Vec<u8>>()).expect("非空");
+        let secret = OtpSecret::from_bytes((0..20).collect::<Vec<u8>>()).expect("non-empty");
         let period = 30_u64;
         let now = 1_700_000_000_u64;
         let counter = now / period;
 
         for expected_offset in [-1_i64, 0, 1] {
-            let target = counter.checked_add_signed(expected_offset).expect("不越界");
+            let target = counter
+                .checked_add_signed(expected_offset)
+                .expect("no overflow");
             let code = hotp_code(&secret, target, Algorithm::Sha1, Digits::Six);
             let got = verify_with_drift(&secret, counter, 1, Algorithm::Sha1, Digits::Six, &code);
-            assert_eq!(got, Some(expected_offset), "偏移 {expected_offset}");
+            assert_eq!(got, Some(expected_offset), "offset {expected_offset}");
         }
     }
 
     #[test]
     fn drift_window_rejects_out_of_window() {
-        let secret = OtpSecret::from_bytes((0..20).collect::<Vec<u8>>()).expect("非空");
+        let secret = OtpSecret::from_bytes((0..20).collect::<Vec<u8>>()).expect("non-empty");
         let counter = 1_700_000_000_u64 / 30;
         let far = counter + 5;
         let code = hotp_code(&secret, far, Algorithm::Sha1, Digits::Six);
         assert_eq!(
             verify_with_drift(&secret, counter, 1, Algorithm::Sha1, Digits::Six, &code),
             None,
-            "窗口外不应命中"
+            "must not match outside the window"
         );
     }
 
@@ -738,22 +744,26 @@ mod tests {
     /// underflow nor panic.
     #[test]
     fn drift_window_handles_counter_underflow() {
-        let secret = OtpSecret::from_bytes(vec![7_u8; 20]).expect("非空");
+        let secret = OtpSecret::from_bytes(vec![7_u8; 20]).expect("non-empty");
         let code = hotp_code(&secret, 0, Algorithm::Sha1, Digits::Six);
         let got = verify_with_drift(&secret, 0, 3, Algorithm::Sha1, Digits::Six, &code);
-        assert_eq!(got, Some(0), "当前步应命中");
+        assert_eq!(got, Some(0), "the current step must match");
     }
 
     #[test]
     fn steam_codes_are_five_chars_from_steam_alphabet() {
-        let secret = OtpSecret::from_bytes((0..20).collect::<Vec<u8>>()).expect("非空");
-        let code =
-            steam_guard_code(&secret, 1_700_000_000, 30, Algorithm::Sha1).expect("period 非零");
-        assert_eq!(code.chars().count(), STEAM_DIGITS, "应为 5 位：{code}");
+        let secret = OtpSecret::from_bytes((0..20).collect::<Vec<u8>>()).expect("non-empty");
+        let code = steam_guard_code(&secret, 1_700_000_000, 30, Algorithm::Sha1)
+            .expect("period is non-zero");
+        assert_eq!(
+            code.chars().count(),
+            STEAM_DIGITS,
+            "must be 5 characters: {code}"
+        );
         for ch in code.chars() {
             assert!(
                 STEAM_ALPHABET.contains(&(ch as u8)),
-                "字符 {ch:?} 不在 Steam 字母表内：{code}"
+                "character {ch:?} is not in the Steam alphabet: {code}"
             );
         }
     }
@@ -762,17 +772,22 @@ mod tests {
     /// counter is not being used.
     #[test]
     fn steam_codes_change_across_steps() {
-        let secret = OtpSecret::from_bytes((0..20).collect::<Vec<u8>>()).expect("非空");
-        let a = steam_guard_code(&secret, 1_700_000_000, 30, Algorithm::Sha1).expect("period 非零");
-        let b = steam_guard_code(&secret, 1_700_000_030, 30, Algorithm::Sha1).expect("period 非零");
-        assert_ne!(a, b, "相邻时间步应产出不同 Steam 码");
+        let secret = OtpSecret::from_bytes((0..20).collect::<Vec<u8>>()).expect("non-empty");
+        let a = steam_guard_code(&secret, 1_700_000_000, 30, Algorithm::Sha1)
+            .expect("period is non-zero");
+        let b = steam_guard_code(&secret, 1_700_000_030, 30, Algorithm::Sha1)
+            .expect("period is non-zero");
+        assert_ne!(
+            a, b,
+            "neighbouring time steps must produce different Steam codes"
+        );
     }
 
     /// Exercises the crate-internal borrow accessor and checks that its
     /// semantics match the public path.
     #[test]
     fn internal_expose_matches_public_secret() {
-        let secret = OtpSecret::from_bytes(vec![1, 2, 3]).expect("非空");
+        let secret = OtpSecret::from_bytes(vec![1, 2, 3]).expect("non-empty");
         assert_eq!(secret.expose(), &[1, 2, 3]);
         assert_eq!(secret.len(), 3);
     }
@@ -783,7 +798,10 @@ mod tests {
     fn zeroize_is_available_for_intermediate_buffers() {
         let mut buffer = vec![0xAA_u8; 16];
         buffer.zeroize();
-        assert!(buffer.iter().all(|&b| b == 0), "擦除后应全为零");
+        assert!(
+            buffer.iter().all(|&b| b == 0),
+            "must be all zeros after erasure"
+        );
     }
 
     /// `SecretBox::expose_secret` is provided through a trait; this confirms the

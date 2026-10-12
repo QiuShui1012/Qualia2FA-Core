@@ -335,7 +335,7 @@ pub fn key_check(master: &MasterKey) -> [u8; KEY_CHECK_LEN] {
     let hkdf = Hkdf::<Sha256>::new(Some(&HKDF_SALT), master.expose());
     let mut check = [0_u8; KEY_CHECK_LEN];
     hkdf.expand(HKDF_INFO_KEY_CHECK, &mut check)
-        .expect("HKDF 输出 32 字节不可能失败");
+        .expect("a 32-byte HKDF output cannot fail");
     check
 }
 
@@ -440,7 +440,7 @@ impl RecordKind {
         not(test),
         expect(
             dead_code,
-            reason = "契约定义，供 sync 的编译期断言与测试使用；载荷解析按种类试解密，不走这里"
+            reason = "defined by contract, used by the compile-time assertions and tests of sync; payload parsing tries each kind instead of coming through here"
         )
     )]
     pub(crate) const fn from_sync_byte(byte: u8) -> Option<Self> {
@@ -581,7 +581,7 @@ mod tests {
     use super::*;
 
     fn key() -> MasterKey {
-        MasterKey::generate().expect("OS 随机源可用")
+        MasterKey::generate().expect("OS randomness available")
     }
 
     #[test]
@@ -590,11 +590,11 @@ mod tests {
         assert_eq!(k.expose().len(), MASTER_KEY_LEN);
 
         let debug = format!("{k:?}");
-        assert!(debug.contains("REDACTED"), "Debug 未脱敏：{debug}");
+        assert!(debug.contains("REDACTED"), "Debug is not redacted: {debug}");
         for byte in k.expose() {
             assert!(
                 !debug.contains(&format!("{byte}")),
-                "Debug 泄露了密钥字节：{debug}"
+                "Debug leaked key bytes: {debug}"
             );
         }
     }
@@ -608,7 +608,7 @@ mod tests {
                     assert_eq!(expected, MASTER_KEY_LEN);
                     assert_eq!(actual, len);
                 }
-                other => panic!("长度 {len} 应被拒绝，实际 ok={}", other.is_ok()),
+                other => panic!("length {len} must be rejected, actual ok={}", other.is_ok()),
             }
         }
     }
@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn master_key_accepts_exactly_32_bytes() {
         let bytes: SecretBytes = vec![7_u8; MASTER_KEY_LEN].into();
-        let k = MasterKey::from_bytes(bytes).expect("长度正确");
+        let k = MasterKey::from_bytes(bytes).expect("correct length");
         assert_eq!(k.expose(), &[7_u8; MASTER_KEY_LEN]);
     }
 
@@ -625,22 +625,22 @@ mod tests {
     #[test]
     fn derived_key_is_deterministic() {
         let bytes: SecretBytes = vec![3_u8; MASTER_KEY_LEN].into();
-        let a = MasterKey::from_bytes(bytes.clone()).expect("长度正确");
-        let b = MasterKey::from_bytes(bytes).expect("长度正确");
+        let a = MasterKey::from_bytes(bytes.clone()).expect("correct length");
+        let b = MasterKey::from_bytes(bytes).expect("correct length");
         assert_eq!(
-            entry_key(&a).expect("可派生"),
-            entry_key(&b).expect("可派生")
+            entry_key(&a).expect("derivation succeeds"),
+            entry_key(&b).expect("derivation succeeds")
         );
     }
 
     /// Different master keys must derive different subkeys.
     #[test]
     fn derived_key_differs_per_master_key() {
-        let a = MasterKey::from_bytes(vec![1_u8; MASTER_KEY_LEN].into()).expect("长度正确");
-        let b = MasterKey::from_bytes(vec![2_u8; MASTER_KEY_LEN].into()).expect("长度正确");
+        let a = MasterKey::from_bytes(vec![1_u8; MASTER_KEY_LEN].into()).expect("correct length");
+        let b = MasterKey::from_bytes(vec![2_u8; MASTER_KEY_LEN].into()).expect("correct length");
         assert_ne!(
-            entry_key(&a).expect("可派生"),
-            entry_key(&b).expect("可派生")
+            entry_key(&a).expect("derivation succeeds"),
+            entry_key(&b).expect("derivation succeeds")
         );
     }
 
@@ -650,28 +650,30 @@ mod tests {
     #[test]
     fn derived_key_is_not_the_master_key() {
         let bytes: SecretBytes = vec![5_u8; MASTER_KEY_LEN].into();
-        let k = MasterKey::from_bytes(bytes).expect("长度正确");
+        let k = MasterKey::from_bytes(bytes).expect("correct length");
         assert_ne!(
-            entry_key(&k).expect("可派生"),
-            *k.expose().first_chunk::<32>().expect("32 字节")
+            entry_key(&k).expect("derivation succeeds"),
+            *k.expose().first_chunk::<32>().expect("32 bytes")
         );
     }
 
     #[test]
     fn seal_then_open_roundtrips() {
         let k = key();
-        let id = EntryId::generate().expect("OS 随机源可用");
+        let id = EntryId::generate().expect("OS randomness available");
         let plaintext = b"the quick brown fox";
 
-        let (nonce, ciphertext) = seal(&k, RecordKind::Entry, &id, 1, plaintext).expect("可加密");
+        let (nonce, ciphertext) =
+            seal(&k, RecordKind::Entry, &id, 1, plaintext).expect("sealing succeeds");
         assert_eq!(ciphertext.len(), plaintext.len() + TAG_LEN);
         assert_ne!(
             &ciphertext[..plaintext.len()],
             &plaintext[..],
-            "密文与明文相同"
+            "the ciphertext equals the plaintext"
         );
 
-        let opened = open(&k, RecordKind::Entry, &id, 1, &nonce, &ciphertext).expect("可解密");
+        let opened =
+            open(&k, RecordKind::Entry, &id, 1, &nonce, &ciphertext).expect("opening succeeds");
         assert_eq!(opened, plaintext);
     }
 
@@ -680,10 +682,10 @@ mod tests {
     #[test]
     fn each_seal_uses_a_fresh_nonce() {
         let k = key();
-        let id = EntryId::generate().expect("OS 随机源可用");
-        let (n1, _) = seal(&k, RecordKind::Entry, &id, 1, b"same").expect("可加密");
-        let (n2, _) = seal(&k, RecordKind::Entry, &id, 1, b"same").expect("可加密");
-        assert_ne!(n1, n2, "两次加密复用了 nonce");
+        let id = EntryId::generate().expect("OS randomness available");
+        let (n1, _) = seal(&k, RecordKind::Entry, &id, 1, b"same").expect("sealing succeeds");
+        let (n2, _) = seal(&k, RecordKind::Entry, &id, 1, b"same").expect("sealing succeeds");
+        assert_ne!(n1, n2, "two encryptions reused a nonce");
     }
 
     /// Two encryptions of the same plaintext must differ, otherwise they leak that the
@@ -691,18 +693,18 @@ mod tests {
     #[test]
     fn ciphertext_is_not_deterministic() {
         let k = key();
-        let id = EntryId::generate().expect("OS 随机源可用");
-        let (_, c1) = seal(&k, RecordKind::Entry, &id, 1, b"same").expect("可加密");
-        let (_, c2) = seal(&k, RecordKind::Entry, &id, 1, b"same").expect("可加密");
+        let id = EntryId::generate().expect("OS randomness available");
+        let (_, c1) = seal(&k, RecordKind::Entry, &id, 1, b"same").expect("sealing succeeds");
+        let (_, c2) = seal(&k, RecordKind::Entry, &id, 1, b"same").expect("sealing succeeds");
         assert_ne!(c1, c2);
     }
 
     /// Another master key must fail to decrypt.
     #[test]
     fn wrong_master_key_fails() {
-        let id = EntryId::generate().expect("OS 随机源可用");
+        let id = EntryId::generate().expect("OS randomness available");
         let (nonce, ciphertext) =
-            seal(&key(), RecordKind::Entry, &id, 1, b"secret").expect("可加密");
+            seal(&key(), RecordKind::Entry, &id, 1, b"secret").expect("sealing succeeds");
         let err = open(&key(), RecordKind::Entry, &id, 1, &nonce, &ciphertext);
         assert!(matches!(err, Err(Error::VaultDecryptionFailed)));
     }
@@ -712,16 +714,17 @@ mod tests {
     #[test]
     fn ciphertext_cannot_move_between_entry_ids() {
         let k = key();
-        let a = EntryId::generate().expect("OS 随机源可用");
-        let b = EntryId::generate().expect("OS 随机源可用");
-        let (nonce, ciphertext) = seal(&k, RecordKind::Entry, &a, 1, b"payload").expect("可加密");
+        let a = EntryId::generate().expect("OS randomness available");
+        let b = EntryId::generate().expect("OS randomness available");
+        let (nonce, ciphertext) =
+            seal(&k, RecordKind::Entry, &a, 1, b"payload").expect("sealing succeeds");
 
         assert!(open(&k, RecordKind::Entry, &a, 1, &nonce, &ciphertext).is_ok());
 
         let err = open(&k, RecordKind::Entry, &b, 1, &nonce, &ciphertext);
         assert!(
             matches!(err, Err(Error::VaultDecryptionFailed)),
-            "密文被搬运到别的条目却仍能解开"
+            "the ciphertext was moved to another entry yet still opens"
         );
     }
 
@@ -730,13 +733,14 @@ mod tests {
     #[test]
     fn ciphertext_cannot_move_between_kinds() {
         let k = key();
-        let id = EntryId::generate().expect("OS 随机源可用");
+        let id = EntryId::generate().expect("OS randomness available");
 
-        let (nonce, ciphertext) = seal(&k, RecordKind::Entry, &id, 1, b"payload").expect("可加密");
+        let (nonce, ciphertext) =
+            seal(&k, RecordKind::Entry, &id, 1, b"payload").expect("sealing succeeds");
         assert!(open(&k, RecordKind::Tombstone, &id, 1, &nonce, &ciphertext).is_err());
 
         let (nonce2, ciphertext2) =
-            seal(&k, RecordKind::Tombstone, &id, 1, b"payload").expect("可加密");
+            seal(&k, RecordKind::Tombstone, &id, 1, b"payload").expect("sealing succeeds");
         assert!(open(&k, RecordKind::Entry, &id, 1, &nonce2, &ciphertext2).is_err());
     }
 
@@ -744,8 +748,9 @@ mod tests {
     #[test]
     fn ciphertext_cannot_move_between_format_versions() {
         let k = key();
-        let id = EntryId::generate().expect("OS 随机源可用");
-        let (nonce, ciphertext) = seal(&k, RecordKind::Entry, &id, 1, b"payload").expect("可加密");
+        let id = EntryId::generate().expect("OS randomness available");
+        let (nonce, ciphertext) =
+            seal(&k, RecordKind::Entry, &id, 1, b"payload").expect("sealing succeeds");
         assert!(open(&k, RecordKind::Entry, &id, 2, &nonce, &ciphertext).is_err());
     }
 
@@ -756,9 +761,10 @@ mod tests {
     #[test]
     fn flipping_any_ciphertext_byte_fails_authentication() {
         let k = key();
-        let id = EntryId::generate().expect("OS 随机源可用");
+        let id = EntryId::generate().expect("OS randomness available");
         let plaintext = b"0123456789abcdef0123456789abcdef";
-        let (nonce, ciphertext) = seal(&k, RecordKind::Entry, &id, 1, plaintext).expect("可加密");
+        let (nonce, ciphertext) =
+            seal(&k, RecordKind::Entry, &id, 1, plaintext).expect("sealing succeeds");
 
         for index in 0..ciphertext.len() {
             let mut tampered = ciphertext.clone();
@@ -766,7 +772,7 @@ mod tests {
             let err = open(&k, RecordKind::Entry, &id, 1, &nonce, &tampered);
             assert!(
                 matches!(err, Err(Error::VaultDecryptionFailed)),
-                "密文第 {index} 字节被翻转却仍通过认证"
+                "ciphertext byte {index} was flipped yet still authenticates"
             );
         }
 
@@ -776,7 +782,7 @@ mod tests {
             let err = open(&k, RecordKind::Entry, &id, 1, &tampered, &ciphertext);
             assert!(
                 matches!(err, Err(Error::VaultDecryptionFailed)),
-                "nonce 第 {index} 字节被翻转却仍通过认证"
+                "nonce byte {index} was flipped yet still authenticates"
             );
         }
     }
@@ -788,9 +794,9 @@ mod tests {
         let id = EntryId::from_bytes([0xAB; EntryId::LEN]);
         let aad = build_aad(RecordKind::Entry, &id, 1);
         assert_eq!(aad.len(), AAD_LEN);
-        assert_eq!(aad[0], 0x01, "种类字节");
-        assert_eq!(&aad[1..17], &[0xAB; 16], "entry_id 应紧随其后");
-        assert_eq!(aad[17], 1, "格式版本应在末字节");
+        assert_eq!(aad[0], 0x01, "kind byte");
+        assert_eq!(&aad[1..17], &[0xAB; 16], "entry_id must follow immediately");
+        assert_eq!(aad[17], 1, "the format version must be the last byte");
 
         assert_eq!(build_aad(RecordKind::Tombstone, &id, 7)[0], 0x02);
         assert_eq!(build_aad(RecordKind::Tombstone, &id, 7)[17], 7);
@@ -811,10 +817,16 @@ mod tests {
     #[test]
     fn empty_plaintext_roundtrips() {
         let k = key();
-        let id = EntryId::generate().expect("OS 随机源可用");
-        let (nonce, ciphertext) = seal(&k, RecordKind::Entry, &id, 1, b"").expect("可加密");
-        assert_eq!(ciphertext.len(), TAG_LEN, "空明文只剩标签");
-        let opened = open(&k, RecordKind::Entry, &id, 1, &nonce, &ciphertext).expect("可解密");
+        let id = EntryId::generate().expect("OS randomness available");
+        let (nonce, ciphertext) =
+            seal(&k, RecordKind::Entry, &id, 1, b"").expect("sealing succeeds");
+        assert_eq!(
+            ciphertext.len(),
+            TAG_LEN,
+            "empty plaintext leaves only the tag"
+        );
+        let opened =
+            open(&k, RecordKind::Entry, &id, 1, &nonce, &ciphertext).expect("opening succeeds");
         assert!(opened.is_empty());
     }
 
@@ -822,15 +834,16 @@ mod tests {
     #[test]
     fn truncated_ciphertext_fails() {
         let k = key();
-        let id = EntryId::generate().expect("OS 随机源可用");
-        let (nonce, ciphertext) = seal(&k, RecordKind::Entry, &id, 1, b"payload").expect("可加密");
+        let id = EntryId::generate().expect("OS randomness available");
+        let (nonce, ciphertext) =
+            seal(&k, RecordKind::Entry, &id, 1, b"payload").expect("sealing succeeds");
 
         for cut in 1..=ciphertext.len() {
             let truncated = &ciphertext[..ciphertext.len() - cut];
             let err = open(&k, RecordKind::Entry, &id, 1, &nonce, truncated);
             assert!(
                 matches!(err, Err(Error::VaultDecryptionFailed)),
-                "截断 {cut} 字节后仍通过认证"
+                "truncating {cut} bytes still authenticates"
             );
         }
     }
@@ -838,9 +851,10 @@ mod tests {
     /// `master_key_to_bytes` must produce bytes that rebuild the same key.
     #[test]
     fn master_key_bytes_roundtrip() {
-        let original = MasterKey::from_bytes(vec![9_u8; MASTER_KEY_LEN].into()).expect("长度正确");
+        let original =
+            MasterKey::from_bytes(vec![9_u8; MASTER_KEY_LEN].into()).expect("correct length");
         let bytes = master_key_to_bytes(&original);
-        let rebuilt = MasterKey::from_bytes(bytes).expect("长度正确");
+        let rebuilt = MasterKey::from_bytes(bytes).expect("correct length");
         assert_eq!(original.expose(), rebuilt.expose());
     }
 }

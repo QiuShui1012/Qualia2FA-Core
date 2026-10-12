@@ -43,7 +43,7 @@
 //!
 //! // Base32 decoding (RFC 4648); tolerates lowercase, missing padding, and whitespace.
 //! use qualia2fa_core::{base32, ExposeSecret};
-//! let seed = base32::decode("MZXW6YTBOI======").expect("合法 Base32");
+//! let seed = base32::decode("MZXW6YTBOI======").expect("valid Base32");
 //! assert_eq!(seed.expose_secret(), b"foobar");
 //! ```
 //!

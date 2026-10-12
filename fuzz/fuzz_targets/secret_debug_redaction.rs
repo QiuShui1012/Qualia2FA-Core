@@ -66,20 +66,20 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(
         secret.expose_secret(),
         data,
-        "SecretBytes 改变了字节内容"
+        "SecretBytes changed the byte content"
     );
 
     let copy = secret.clone();
     assert_eq!(
         copy.expose_secret(),
         secret.expose_secret(),
-        "Clone 改变了内容"
+        "Clone changed the content"
     );
 
     let arbitrary_debug = format!("{secret:?}");
     assert!(
         arbitrary_debug.to_lowercase().contains("redacted"),
-        "Debug 输出未标注脱敏：{arbitrary_debug}"
+        "Debug output does not carry the redaction marker: {arbitrary_debug}"
     );
 
     // ── Property 3: exact leak check with a fixed sentinel ──────────────────
@@ -89,13 +89,13 @@ fuzz_target!(|data: &[u8]| {
 
     assert!(
         sentinel_lower.contains("redacted"),
-        "哨兵 Debug 未标注脱敏：{sentinel_debug}"
+        "the sentinel Debug does not carry the redaction marker: {sentinel_debug}"
     );
 
     let hex: String = SENTINEL_BYTES.iter().map(|b| format!("{b:02x}")).collect();
     assert!(
         !sentinel_lower.contains(&hex),
-        "Debug 泄露了哨兵的十六进制表示：{sentinel_debug}"
+        "Debug leaked the sentinel's hexadecimal form: {sentinel_debug}"
     );
 
     let decimal = SENTINEL_BYTES
@@ -105,7 +105,7 @@ fuzz_target!(|data: &[u8]| {
         .join("");
     assert!(
         !sentinel_debug.contains(&decimal),
-        "Debug 泄露了哨兵的十进制表示：{sentinel_debug}"
+        "Debug leaked the sentinel's decimal form: {sentinel_debug}"
     );
 
     // ── Sentinel check on the text path ─────────────────────────────────────
@@ -114,11 +114,11 @@ fuzz_target!(|data: &[u8]| {
 
     assert!(
         text_debug.to_lowercase().contains("redacted"),
-        "SecretString 的 Debug 未标注脱敏：{text_debug}"
+        "the SecretString Debug does not carry the redaction marker: {text_debug}"
     );
     assert!(
         !text_debug.contains(SENTINEL_TEXT),
-        "SecretString 的 Debug 泄露了哨兵文本：{text_debug}"
+        "the SecretString Debug leaked the sentinel text: {text_debug}"
     );
 
     if let Ok(text) = core::str::from_utf8(data) {
@@ -126,7 +126,7 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(
             string_secret.expose_secret(),
             text,
-            "SecretString 改变了文本内容"
+            "SecretString changed the text content"
         );
     }
 });

@@ -135,9 +135,9 @@ mod tests {
     fn roundtrip_preserves_content() {
         for size in [0_usize, 1, 15, 4096, 100_000] {
             let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-            let packed = compress(&data).expect("可压缩");
-            let back = decompress(&packed).expect("可解压");
-            assert_eq!(back, data, "长度 {size} 的往返不一致");
+            let packed = compress(&data).expect("compression succeeds");
+            let back = decompress(&packed).expect("decompression succeeds");
+            assert_eq!(back, data, "round trip differs at length {size}");
         }
     }
 
@@ -152,10 +152,10 @@ mod tests {
             data.extend_from_slice(b"\x01name\x02otpauth://totp/ACME:alice@example.com");
             data.extend_from_slice(&i.to_be_bytes());
         }
-        let packed = compress(&data).expect("可压缩");
+        let packed = compress(&data).expect("compression succeeds");
         assert!(
             packed.len() * 4 < data.len(),
-            "压缩后 {} 字节，原 {} 字节——收益太差，压缩层可能没生效",
+            "compressed to {} bytes from {} bytes: gain too small, the compression layer may be inactive",
             packed.len(),
             data.len()
         );
@@ -165,16 +165,19 @@ mod tests {
     #[test]
     fn incompressible_payload_still_roundtrips() {
         let mut data = vec![0_u8; 8192];
-        crate::getrandom::fill(&mut data).expect("OS 随机源可用");
-        let packed = compress(&data).expect("可压缩");
-        let back = decompress(&packed).expect("可解压");
+        crate::getrandom::fill(&mut data).expect("OS randomness available");
+        let packed = compress(&data).expect("compression succeeds");
+        let back = decompress(&packed).expect("decompression succeeds");
         assert_eq!(back, data);
     }
 
     #[test]
     fn empty_input_is_reported_as_empty_not_corrupt() {
         let err = decompress(&[]);
-        assert!(matches!(err, Err(Error::SyncEmptyPayload)), "实际 {err:?}");
+        assert!(
+            matches!(err, Err(Error::SyncEmptyPayload)),
+            "actual {err:?}"
+        );
     }
 
     #[test]
@@ -187,7 +190,7 @@ mod tests {
             let err = decompress(&garbage);
             assert!(
                 matches!(err, Err(Error::SyncDecompressionFailed)),
-                "垃圾输入 {garbage:?} 未被拒绝，实际 {err:?}"
+                "garbage input {garbage:?} was not rejected, actual {err:?}"
             );
         }
     }
@@ -200,17 +203,17 @@ mod tests {
     #[test]
     fn a_decompression_bomb_is_rejected() {
         let bomb = vec![0_u8; MAX_DECOMPRESSED_LEN + 1];
-        let packed = compress(&bomb).expect("可压缩");
+        let packed = compress(&bomb).expect("compression succeeds");
         assert!(
             packed.len() < bomb.len() / 100,
-            "前提不成立：炸弹没被压得足够小（压后 {} 字节）",
+            "precondition failed: the bomb did not compress small enough ({} bytes after compression)",
             packed.len()
         );
 
         let err = decompress(&packed);
         assert!(
             matches!(err, Err(Error::SyncPayloadTooLarge { .. })),
-            "超过上限的解压未被拒绝，实际 {err:?}"
+            "decompression past the limit was not rejected, actual {err:?}"
         );
     }
 
@@ -225,13 +228,13 @@ mod tests {
     #[test]
     fn incompressible_data_over_the_limit_is_rejected() {
         let mut data = vec![0_u8; MAX_DECOMPRESSED_LEN + 1];
-        crate::getrandom::fill(&mut data).expect("OS 随机源可用");
-        let packed = compress(&data).expect("可压缩");
+        crate::getrandom::fill(&mut data).expect("OS randomness available");
+        let packed = compress(&data).expect("compression succeeds");
 
         let err = decompress(&packed);
         assert!(
             matches!(err, Err(Error::SyncPayloadTooLarge { .. })),
-            "随机数据超限未被拒绝，实际 {err:?}"
+            "random data past the limit was not rejected, actual {err:?}"
         );
     }
 
@@ -245,24 +248,27 @@ mod tests {
     #[test]
     fn exactly_at_the_limit_is_accepted() {
         let mut data = vec![0_u8; MAX_DECOMPRESSED_LEN];
-        crate::getrandom::fill(&mut data).expect("OS 随机源可用");
-        let packed = compress(&data).expect("可压缩");
-        let back = decompress(&packed).expect("恰好到上限应当通过");
+        crate::getrandom::fill(&mut data).expect("OS randomness available");
+        let packed = compress(&data).expect("compression succeeds");
+        let back = decompress(&packed).expect("exactly at the limit must pass");
         assert_eq!(back.len(), MAX_DECOMPRESSED_LEN);
-        assert_eq!(back, data, "恰好到上限的内容应当逐字节一致");
+        assert_eq!(
+            back, data,
+            "content exactly at the limit must be byte-identical"
+        );
     }
 
     /// A truncated deflate stream must be rejected and never partially decompressed.
     #[test]
     fn truncated_stream_is_rejected() {
         let data = vec![3_u8; 4096];
-        let packed = compress(&data).expect("可压缩");
+        let packed = compress(&data).expect("compression succeeds");
         for cut in 1..packed.len().min(24) {
             let truncated = &packed[..packed.len() - cut];
             let result = decompress(truncated);
             if let Ok(partial) = result {
                 panic!(
-                    "截断 {cut} 字节后仍解出 {} 字节（原 {} 字节）",
+                    "truncating {cut} bytes still decompressed to {} bytes (originally {} bytes)",
                     partial.len(),
                     data.len()
                 );

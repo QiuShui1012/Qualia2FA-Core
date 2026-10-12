@@ -125,7 +125,7 @@ pub fn seal_entry(key: &[u8; 32], id: &EntryId, entry: &VaultEntry) -> Result<Re
     plaintext.extend_from_slice(ENTRY_MAGIC);
     plaintext.extend_from_slice(id.as_bytes());
     let len = u16::try_from(body.len()).map_err(|_| Error::SyncMalformed {
-        reason: "单条条目的编码超过 65535 字节",
+        reason: "a single entry encodes to more than 65535 bytes",
     })?;
     plaintext.extend_from_slice(&len.to_be_bytes());
     plaintext.extend_from_slice(&body);
@@ -232,7 +232,7 @@ fn try_open_as(key: &[u8; 32], kind: InnerRecordKind, record: &Record) -> Result
         InnerRecordKind::SyncEntry => open_entry(&record.entry_id, &plaintext),
         InnerRecordKind::SyncTombstone => open_tombstone(&record.entry_id, &plaintext),
         _ => Err(Error::SyncMalformed {
-            reason: "解码路径收到了非同步的记录种类",
+            reason: "the decoding path received a non-sync record kind",
         }),
     }
 }
@@ -247,7 +247,7 @@ fn open_entry(id: &EntryId, plaintext: &[u8]) -> Result<OpenedRecord> {
     }
     if &plaintext[..4] != ENTRY_MAGIC {
         return Err(Error::SyncMalformed {
-            reason: "条目明文缺少魔数",
+            reason: "the entry plaintext is missing its magic",
         });
     }
     let embedded: [u8; EntryId::LEN] = plaintext[4..4 + EntryId::LEN]
@@ -255,7 +255,7 @@ fn open_entry(id: &EntryId, plaintext: &[u8]) -> Result<OpenedRecord> {
         .map_err(|_| Error::SyncTruncated)?;
     if &embedded != id.as_bytes() {
         return Err(Error::SyncMalformed {
-            reason: "条目明文里的标识与记录标识不一致",
+            reason: "the identifier in the entry plaintext differs from the record identifier",
         });
     }
     let len_bytes: [u8; 2] = plaintext[4 + EntryId::LEN..ENTRY_HEADER_LEN]
@@ -267,7 +267,7 @@ fn open_entry(id: &EntryId, plaintext: &[u8]) -> Result<OpenedRecord> {
         .ok_or(Error::SyncTruncated)?;
     if plaintext.len() != ENTRY_HEADER_LEN + declared {
         return Err(Error::SyncMalformed {
-            reason: "条目明文含超出声明长度的内容",
+            reason: "the entry plaintext holds content beyond its declared length",
         });
     }
     Ok(OpenedRecord::Entry {
@@ -300,7 +300,7 @@ mod tests {
             "ACME".to_owned(),
             Some("ACME 公司".to_owned()),
             "alice@example.com".to_owned(),
-            crate::otp::OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("种子合法"),
+            crate::otp::OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("valid secret"),
             crate::otp::Algorithm::Sha1,
             crate::otp::Digits::Six,
             30,
@@ -309,26 +309,29 @@ mod tests {
             Timestamp::from(1_700_000_000_u64),
             Timestamp::from(1_700_000_100_u64),
         )
-        .expect("条目合法")
+        .expect("valid entry")
     }
 
     #[test]
     fn an_entry_roundtrips() {
         let id = EntryId::from_bytes([1; EntryId::LEN]);
         let entry = sample_entry();
-        let record = seal_entry(&key(), &id, &entry).expect("可加密");
+        let record = seal_entry(&key(), &id, &entry).expect("sealing succeeds");
         assert_eq!(record.entry_id, id);
 
-        let opened = open(&key(), &record).expect("可解密");
+        let opened = open(&key(), &record).expect("opening succeeds");
         match opened {
             OpenedRecord::Entry {
                 id: got_id,
                 entry: got,
             } => {
                 assert_eq!(got_id, id);
-                assert_eq!(*got, entry, "往返后条目内容不一致");
+                assert_eq!(
+                    *got, entry,
+                    "the entry content differs after the round trip"
+                );
             }
-            other => panic!("期望是条目，实际 {other:?}"),
+            other => panic!("expected an entry, actual {other:?}"),
         }
     }
 
@@ -340,12 +343,15 @@ mod tests {
             deleted_at: 1_700_000_200,
             deleted_by: Some(EntryId::from_bytes([3; EntryId::LEN])),
         };
-        let record = seal_tombstone(&key(), &tombstone).expect("可加密");
+        let record = seal_tombstone(&key(), &tombstone).expect("sealing succeeds");
 
-        let opened = open(&key(), &record).expect("可解密");
+        let opened = open(&key(), &record).expect("opening succeeds");
         match opened {
-            OpenedRecord::Tombstone(got) => assert_eq!(*got, tombstone, "往返后墓碑不一致"),
-            other => panic!("期望是墓碑，实际 {other:?}"),
+            OpenedRecord::Tombstone(got) => assert_eq!(
+                *got, tombstone,
+                "the tombstone differs after the round trip"
+            ),
+            other => panic!("expected a tombstone, actual {other:?}"),
         }
     }
 
@@ -362,11 +368,11 @@ mod tests {
                 deleted_at: 1,
                 deleted_by,
             };
-            let record = seal_tombstone(&key(), &tombstone).expect("可加密");
-            let opened = open(&key(), &record).expect("可解密");
+            let record = seal_tombstone(&key(), &tombstone).expect("sealing succeeds");
+            let opened = open(&key(), &record).expect("opening succeeds");
             match opened {
                 OpenedRecord::Tombstone(got) => assert_eq!(got.deleted_by, deleted_by),
-                other => panic!("期望是墓碑，实际 {other:?}"),
+                other => panic!("expected a tombstone, actual {other:?}"),
             }
         }
     }
@@ -375,11 +381,11 @@ mod tests {
     #[test]
     fn a_wrong_key_is_rejected() {
         let id = EntryId::from_bytes([6; EntryId::LEN]);
-        let record = seal_entry(&key(), &id, &sample_entry()).expect("可加密");
+        let record = seal_entry(&key(), &id, &sample_entry()).expect("sealing succeeds");
         let err = open(&[0x5B; 32], &record);
         assert!(
             matches!(err, Err(Error::SyncAuthenticationFailed)),
-            "实际 {err:?}"
+            "actual {err:?}"
         );
     }
 
@@ -392,13 +398,13 @@ mod tests {
     fn moving_a_ciphertext_to_another_id_is_rejected() {
         let id_a = EntryId::from_bytes([7; EntryId::LEN]);
         let id_b = EntryId::from_bytes([8; EntryId::LEN]);
-        let mut record = seal_entry(&key(), &id_a, &sample_entry()).expect("可加密");
+        let mut record = seal_entry(&key(), &id_a, &sample_entry()).expect("sealing succeeds");
 
         record.entry_id = id_b;
         let err = open(&key(), &record);
         assert!(
             matches!(err, Err(Error::SyncAuthenticationFailed)),
-            "条目密文被搬到另一个 ID 后仍被接受，实际 {err:?}"
+            "an entry ciphertext moved to another ID was still accepted, actual {err:?}"
         );
     }
 
@@ -415,10 +421,10 @@ mod tests {
             deleted_at: 1_700_000_300,
             deleted_by: None,
         };
-        let record = seal_tombstone(&key(), &tombstone).expect("可加密");
-        match open(&key(), &record).expect("可解密") {
+        let record = seal_tombstone(&key(), &tombstone).expect("sealing succeeds");
+        match open(&key(), &record).expect("opening succeeds") {
             OpenedRecord::Tombstone(_) => {}
-            other => panic!("墓碑被误判成 {other:?}"),
+            other => panic!("a tombstone was misread as {other:?}"),
         }
     }
 
@@ -426,14 +432,14 @@ mod tests {
     #[test]
     fn flipping_any_ciphertext_byte_is_rejected() {
         let id = EntryId::from_bytes([10; EntryId::LEN]);
-        let record = seal_entry(&key(), &id, &sample_entry()).expect("可加密");
+        let record = seal_entry(&key(), &id, &sample_entry()).expect("sealing succeeds");
         for index in 0..record.ciphertext.len() {
             let mut tampered = record.clone();
             tampered.ciphertext[index] ^= 0x01;
             let err = open(&key(), &tampered);
             assert!(
                 matches!(err, Err(Error::SyncAuthenticationFailed)),
-                "第 {index} 字节被翻转后仍被接受，实际 {err:?}"
+                "byte {index} was flipped yet still accepted, actual {err:?}"
             );
         }
     }
@@ -445,14 +451,14 @@ mod tests {
     #[test]
     fn a_tampered_nonce_is_rejected() {
         let id = EntryId::from_bytes([11; EntryId::LEN]);
-        let record = seal_entry(&key(), &id, &sample_entry()).expect("可加密");
+        let record = seal_entry(&key(), &id, &sample_entry()).expect("sealing succeeds");
         for index in 0..record.nonce.len() {
             let mut tampered = record.clone();
             tampered.nonce[index] ^= 0x80;
             let err = open(&key(), &tampered);
             assert!(
                 matches!(err, Err(Error::SyncAuthenticationFailed)),
-                "nonce 第 {index} 字节被翻转后仍被接受，实际 {err:?}"
+                "nonce byte {index} was flipped yet still accepted, actual {err:?}"
             );
         }
     }
@@ -461,11 +467,14 @@ mod tests {
     #[test]
     fn a_truncated_ciphertext_is_rejected() {
         let id = EntryId::from_bytes([12; EntryId::LEN]);
-        let record = seal_entry(&key(), &id, &sample_entry()).expect("可加密");
+        let record = seal_entry(&key(), &id, &sample_entry()).expect("sealing succeeds");
         for cut in 1..record.ciphertext.len().min(8) {
             let mut short = record.clone();
             short.ciphertext.truncate(record.ciphertext.len() - cut);
-            assert!(open(&key(), &short).is_err(), "截断 {cut} 字节后仍被接受");
+            assert!(
+                open(&key(), &short).is_err(),
+                "truncating {cut} bytes was still accepted"
+            );
         }
     }
 
@@ -478,12 +487,15 @@ mod tests {
     fn nonces_differ_across_records() {
         let id = EntryId::from_bytes([13; EntryId::LEN]);
         let entry = sample_entry();
-        let first = seal_entry(&key(), &id, &entry).expect("可加密");
-        let second = seal_entry(&key(), &id, &entry).expect("可加密");
-        assert_ne!(first.nonce, second.nonce, "两次加密用了同一个 nonce");
+        let first = seal_entry(&key(), &id, &entry).expect("sealing succeeds");
+        let second = seal_entry(&key(), &id, &entry).expect("sealing succeeds");
+        assert_ne!(
+            first.nonce, second.nonce,
+            "two encryptions used the same nonce"
+        );
         assert_ne!(
             first.ciphertext, second.ciphertext,
-            "同一内容两次加密产生了相同密文，随机性有问题"
+            "encrypting the same content twice produced the same ciphertext, randomness is broken"
         );
     }
 
@@ -494,22 +506,31 @@ mod tests {
     /// byte) and the AEAD would authenticate it.
     #[test]
     fn sync_and_vault_keys_are_different() {
-        let master = crate::vault::MasterKey::generate().expect("随机源可用");
+        let master = crate::vault::MasterKey::generate().expect("randomness available");
 
-        let sync_key = crate::sync::derive_record_key(&master).expect("可派生");
-        let vault_key = crypto::entry_key(&master).expect("可派生");
+        let sync_key = crate::sync::derive_record_key(&master).expect("derivation succeeds");
+        let vault_key = crypto::entry_key(&master).expect("derivation succeeds");
 
         assert_ne!(
             sync_key, vault_key,
-            "同步记录与保险库记录派生了同一把子密钥，域分离失效"
+            "the sync record key and the vault record key are the same subkey, domain separation failed"
         );
 
-        let envelope_key = crate::sync::derive_envelope_key(&master).expect("可派生");
-        assert_ne!(sync_key, envelope_key, "记录密钥与信封密钥相同");
-        assert_ne!(vault_key, envelope_key, "保险库密钥与信封密钥相同");
+        let envelope_key = crate::sync::derive_envelope_key(&master).expect("derivation succeeds");
+        assert_ne!(
+            sync_key, envelope_key,
+            "the record key equals the envelope key"
+        );
+        assert_ne!(
+            vault_key, envelope_key,
+            "the vault key equals the envelope key"
+        );
 
-        let again = crate::sync::derive_record_key(&master).expect("可派生");
-        assert_eq!(sync_key, again, "同一主密钥两次派生的结果不同");
+        let again = crate::sync::derive_record_key(&master).expect("derivation succeeds");
+        assert_eq!(
+            sync_key, again,
+            "the same master key derived two different results"
+        );
     }
 
     /// The constants themselves must not change silently.
@@ -521,19 +542,19 @@ mod tests {
         assert_eq!(
             crate::sync::HKDF_SALT_SYNC,
             *b"Qualia2FA sync salt v1 (records)",
-            "同步的 HKDF salt 变了，既有载荷会全部解不开"
+            "the sync HKDF salt changed, every existing payload will fail to open"
         );
         assert_eq!(
             RecordKind::SyncEntry.as_byte(),
             0x81,
-            "同步条目的种类字节变了"
+            "the sync entry kind byte changed"
         );
         assert_eq!(
             RecordKind::SyncTombstone.as_byte(),
             0x82,
-            "同步墓碑的种类字节变了"
+            "the sync tombstone kind byte changed"
         );
-        assert_eq!(FORMAT_VERSION, 2, "载荷格式版本变了");
+        assert_eq!(FORMAT_VERSION, 2, "the payload format version changed");
     }
 
     /// **The record kind bytes of the two domains must not overlap, and each parser must refuse the
@@ -549,18 +570,18 @@ mod tests {
         assert!(RecordKind::from_byte(0x02).is_some());
         assert!(
             RecordKind::from_byte(0x81).is_none(),
-            "文件解析器接受了同步条目种类——一份同步载荷会被当成保险库文件收下"
+            "the file parser accepted the sync entry kind: a sync payload would be taken in as a vault file"
         );
         assert!(
             RecordKind::from_byte(0x82).is_none(),
-            "文件解析器接受了同步墓碑种类"
+            "the file parser accepted the sync tombstone kind"
         );
 
         assert!(RecordKind::from_sync_byte(0x81).is_some());
         assert!(RecordKind::from_sync_byte(0x82).is_some());
         assert!(
             RecordKind::from_sync_byte(0x01).is_none(),
-            "同步解析器接受了文件条目种类"
+            "the sync parser accepted the file entry kind"
         );
         assert!(RecordKind::from_sync_byte(0x02).is_none());
         assert!(RecordKind::from_sync_byte(0x00).is_none());
@@ -585,7 +606,7 @@ mod tests {
     #[test]
     fn encoded_len_matches_the_wire_format() {
         let id = EntryId::from_bytes([14; EntryId::LEN]);
-        let record = seal_entry(&key(), &id, &sample_entry()).expect("可加密");
+        let record = seal_entry(&key(), &id, &sample_entry()).expect("sealing succeeds");
         assert_eq!(record.encoded_len(), 16 + 24 + 4 + record.ciphertext.len());
     }
 
@@ -598,12 +619,16 @@ mod tests {
                 let mut bytes = [0_u8; EntryId::LEN];
                 bytes[position] = pattern;
                 let id = EntryId::from_bytes(bytes);
-                let record = seal_entry(&key(), &id, &sample_entry()).expect("可加密");
-                match open(&key(), &record).expect("可解密") {
+                let record = seal_entry(&key(), &id, &sample_entry()).expect("sealing succeeds");
+                match open(&key(), &record).expect("opening succeeds") {
                     OpenedRecord::Entry { id: got, .. } => {
-                        assert_eq!(got.as_bytes(), &bytes, "标识 {bytes:?} 往返后不同");
+                        assert_eq!(
+                            got.as_bytes(),
+                            &bytes,
+                            "identifier {bytes:?} differs after the round trip"
+                        );
                     }
-                    other => panic!("期望是条目，实际 {other:?}"),
+                    other => panic!("expected an entry, actual {other:?}"),
                 }
             }
         }
@@ -618,13 +643,13 @@ mod tests {
                 deleted_at: Timestamp::from(deleted_at),
                 deleted_by: None,
             };
-            let record = seal_tombstone(&key(), &tombstone).expect("可加密");
-            match open(&key(), &record).expect("可解密") {
+            let record = seal_tombstone(&key(), &tombstone).expect("sealing succeeds");
+            match open(&key(), &record).expect("opening succeeds") {
                 OpenedRecord::Tombstone(got) => assert_eq!(
                     got.deleted_at, deleted_at,
-                    "删除时间 {deleted_at} 往返后不同"
+                    "deletion time {deleted_at} differs after the round trip"
                 ),
-                other => panic!("期望是墓碑，实际 {other:?}"),
+                other => panic!("expected a tombstone, actual {other:?}"),
             }
         }
     }

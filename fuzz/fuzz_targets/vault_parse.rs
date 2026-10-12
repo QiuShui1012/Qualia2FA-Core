@@ -77,7 +77,7 @@ fn master_from(data: &[u8]) -> MasterKey {
     let mut key = [0_u8; vault::MASTER_KEY_LEN];
     let take = data.len().min(vault::MASTER_KEY_LEN);
     key[..take].copy_from_slice(&data[..take]);
-    MasterKey::from_bytes(key.to_vec().into()).expect("长度恒为 32")
+    MasterKey::from_bytes(key.to_vec().into()).expect("the length is always 32")
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -102,24 +102,24 @@ fn check_file(master: MasterKey, data: &[u8]) {
 
     let master2 = master_key_of(&file);
     let Ok(reparsed) = VaultFile::parse(master2, &again) else {
-        panic!("自己序列化出的文件自己解不开");
+        panic!("a file this target serialized itself cannot be parsed back");
     };
     assert_eq!(
         reparsed.vault().len(),
         file.vault().len(),
-        "往返后条目数变化"
+        "the entry count changed after the round trip"
     );
     assert_eq!(
         reparsed.vault().tombstone_count(),
         file.vault().tombstone_count(),
-        "往返后墓碑数变化"
+        "the tombstone count changed after the round trip"
     );
 }
 
 /// Takes out the copy of the master key held by the file (used to parse it again).
 fn master_key_of(file: &VaultFile) -> MasterKey {
     let bytes = vault::master_key_to_bytes(file.master_key());
-    MasterKey::from_bytes(bytes).expect("长度正确")
+    MasterKey::from_bytes(bytes).expect("the length is correct")
 }
 
 /// Inserts the input as the record ciphertext into a skeleton file and parses that.
@@ -164,7 +164,7 @@ fn check_embedded_record(master: &MasterKey, data: &[u8]) {
 /// bytes here — doing it this way in a fuzz target is deliberate: it keeps the fact
 /// that a key really is copied visible in the code.
 fn clone_key(master: &MasterKey) -> MasterKey {
-    MasterKey::from_bytes(vault::master_key_to_bytes(master)).expect("长度正确")
+    MasterKey::from_bytes(vault::master_key_to_bytes(master)).expect("the length is correct")
 }
 
 /// A valid entry used to build the skeleton.
@@ -173,7 +173,7 @@ fn sample_entry() -> Entry {
         "fuzz".into(),
         Some("Qualia2FA".into()),
         "alice".into(),
-        otp::OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("合法 Base32"),
+        otp::OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("valid Base32"),
         otp::Algorithm::Sha1,
         otp::Digits::Six,
         30,
@@ -182,5 +182,5 @@ fn sample_entry() -> Entry {
         0,
         0,
     )
-    .expect("字段均合法")
+    .expect("all fields are valid")
 }

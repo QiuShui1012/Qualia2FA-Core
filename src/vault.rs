@@ -520,7 +520,7 @@ impl VaultFile {
         }
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "total 已与 MAX_RECORDS（远小于 u32::MAX）比较过"
+            reason = "total was already compared against MAX_RECORDS (far below u32::MAX)"
         )]
         let count = total as u32;
 
@@ -1019,7 +1019,7 @@ mod tests {
     use super::*;
 
     fn secret() -> otp::OtpSecret {
-        otp::OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("合法种子")
+        otp::OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("valid secret")
     }
 
     fn sample_entry(name: &str) -> VaultEntry {
@@ -1036,7 +1036,7 @@ mod tests {
             1_700_000_000,
             1_700_000_123,
         )
-        .expect("合法条目")
+        .expect("valid entry")
     }
 
     fn sample_hotp_entry() -> VaultEntry {
@@ -1053,7 +1053,7 @@ mod tests {
             1_700_000_000,
             1_700_000_000,
         )
-        .expect("合法条目")
+        .expect("valid entry")
     }
 
     /// Asserts that two entries are equal in **every** field.
@@ -1076,7 +1076,7 @@ mod tests {
 
     #[test]
     fn create_starts_empty() {
-        let file = VaultFile::create().expect("OS 随机源可用");
+        let file = VaultFile::create().expect("OS randomness available");
         assert!(file.vault().is_empty());
         assert_eq!(file.vault().len(), 0);
         assert_eq!(file.vault().tombstone_count(), 0);
@@ -1085,39 +1085,39 @@ mod tests {
     /// Serialize, parse and decrypt preserve every field.
     #[test]
     fn roundtrip_preserves_every_field() {
-        let mut file = VaultFile::create().expect("OS 随机源可用");
+        let mut file = VaultFile::create().expect("OS randomness available");
         let id = file
             .vault_mut()
             .insert(sample_entry("GitHub"))
-            .expect("可插入");
+            .expect("insertion succeeds");
 
-        let bytes = file.serialize().expect("可序列化");
+        let bytes = file.serialize().expect("serialization succeeds");
         let reopened = VaultFile::parse(
-            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("长度正确"),
+            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("correct length"),
             &bytes,
         )
-        .expect("可解析");
+        .expect("parsing succeeds");
 
         assert_eq!(reopened.vault().len(), 1);
-        let restored = reopened.vault().get(&id).expect("条目应存在");
+        let restored = reopened.vault().get(&id).expect("the entry must exist");
         assert_entry_eq(&sample_entry("GitHub"), restored);
     }
 
     /// An HOTP entry keeps its counter.
     #[test]
     fn roundtrip_preserves_hotp_counter() {
-        let mut file = VaultFile::create().expect("OS 随机源可用");
+        let mut file = VaultFile::create().expect("OS randomness available");
         let id = file
             .vault_mut()
             .insert(sample_hotp_entry())
-            .expect("可插入");
-        let bytes = file.serialize().expect("可序列化");
+            .expect("insertion succeeds");
+        let bytes = file.serialize().expect("serialization succeeds");
         let reopened = VaultFile::parse(
-            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("长度正确"),
+            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("correct length"),
             &bytes,
         )
-        .expect("可解析");
-        let restored = reopened.vault().get(&id).expect("条目应存在");
+        .expect("parsing succeeds");
+        let restored = reopened.vault().get(&id).expect("the entry must exist");
         assert_eq!(restored.counter, Some(42));
         assert_eq!(restored.uri_type(), crate::uri::UriType::Hotp);
     }
@@ -1125,23 +1125,29 @@ mod tests {
     /// Tombstones survive a round trip and do **not** turn into live entries.
     #[test]
     fn roundtrip_preserves_tombstones() {
-        let mut file = VaultFile::create().expect("OS 随机源可用");
+        let mut file = VaultFile::create().expect("OS randomness available");
         let id = file
             .vault_mut()
             .insert(sample_entry("Doomed"))
-            .expect("可插入");
+            .expect("insertion succeeds");
         file.vault_mut().remove(&id, 1_800_000_000);
 
-        let bytes = file.serialize().expect("可序列化");
+        let bytes = file.serialize().expect("serialization succeeds");
         let reopened = VaultFile::parse(
-            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("长度正确"),
+            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("correct length"),
             &bytes,
         )
-        .expect("可解析");
+        .expect("parsing succeeds");
 
-        assert!(reopened.vault().is_empty(), "条目应已被删除");
+        assert!(
+            reopened.vault().is_empty(),
+            "the entry must have been deleted"
+        );
         assert_eq!(reopened.vault().tombstone_count(), 1);
-        let tombstone = reopened.vault().get_tombstone(&id).expect("墓碑应存在");
+        let tombstone = reopened
+            .vault()
+            .get_tombstone(&id)
+            .expect("the tombstone must exist");
         assert_eq!(tombstone.entry_id, id);
         assert_eq!(tombstone.deleted_at, 1_800_000_000);
         assert_eq!(tombstone.deleted_by, None);
@@ -1151,33 +1157,39 @@ mod tests {
     #[test]
     fn repeated_removal_keeps_original_timestamp() {
         let mut vault = Vault::new();
-        let id = vault.insert(sample_entry("x")).expect("可插入");
+        let id = vault.insert(sample_entry("x")).expect("insertion succeeds");
         vault.remove(&id, 100);
         assert!(vault.remove(&id, 999).is_none());
-        assert_eq!(vault.get_tombstone(&id).expect("墓碑存在").deleted_at, 100);
+        assert_eq!(
+            vault
+                .get_tombstone(&id)
+                .expect("tombstone exists")
+                .deleted_at,
+            100
+        );
     }
 
     /// Many entries survive a round trip, in a deterministic order.
     #[test]
     fn roundtrip_preserves_many_entries() {
-        let mut file = VaultFile::create().expect("OS 随机源可用");
+        let mut file = VaultFile::create().expect("OS randomness available");
         let mut ids = Vec::new();
         for i in 0..64 {
             ids.push(
                 file.vault_mut()
                     .insert(sample_entry(&format!("entry-{i}")))
-                    .expect("可插入"),
+                    .expect("insertion succeeds"),
             );
         }
-        let bytes = file.serialize().expect("可序列化");
+        let bytes = file.serialize().expect("serialization succeeds");
         let reopened = VaultFile::parse(
-            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("长度正确"),
+            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("correct length"),
             &bytes,
         )
-        .expect("可解析");
+        .expect("parsing succeeds");
         assert_eq!(reopened.vault().len(), 64);
         for id in ids {
-            assert!(reopened.vault().get(&id).is_some(), "缺少条目 {id}");
+            assert!(reopened.vault().get(&id).is_some(), "missing entry {id}");
         }
     }
 
@@ -1188,38 +1200,41 @@ mod tests {
     /// content after parsing back, which is what this checks.
     #[test]
     fn serialization_is_deterministic_in_structure() {
-        let mut file = VaultFile::create().expect("OS 随机源可用");
+        let mut file = VaultFile::create().expect("OS randomness available");
         for i in 0..16 {
             file.vault_mut()
                 .insert(sample_entry(&format!("e{i}")))
-                .expect("可插入");
+                .expect("insertion succeeds");
         }
-        let a = file.serialize().expect("可序列化");
-        let b = file.serialize().expect("可序列化");
+        let a = file.serialize().expect("serialization succeeds");
+        let b = file.serialize().expect("serialization succeeds");
 
-        assert_eq!(a.len(), b.len(), "两次序列化长度不同");
-        assert_eq!(a[..9], b[..9], "魔数与版本应一致");
-        assert_eq!(a[9], b[9], "保留字节应一致");
+        assert_eq!(a.len(), b.len(), "two serializations differ in length");
+        assert_eq!(a[..9], b[..9], "magic and version must match");
+        assert_eq!(a[9], b[9], "the reserved byte must match");
 
         let names = |bytes: &[u8]| -> Vec<String> {
             let f = VaultFile::parse(
-                MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("长度正确"),
+                MasterKey::from_bytes(master_key_to_bytes(file.master_key()))
+                    .expect("correct length"),
                 bytes,
             )
-            .expect("可解析");
+            .expect("parsing succeeds");
             f.vault().iter().map(|(_, e)| e.name.clone()).collect()
         };
-        assert_eq!(names(&a), names(&b), "条目顺序不确定");
+        assert_eq!(names(&a), names(&b), "the entry order is nondeterministic");
     }
 
     /// A different master key cannot open the file.
     #[test]
     fn wrong_master_key_cannot_open() {
-        let mut file = VaultFile::create().expect("OS 随机源可用");
-        file.vault_mut().insert(sample_entry("x")).expect("可插入");
-        let bytes = file.serialize().expect("可序列化");
+        let mut file = VaultFile::create().expect("OS randomness available");
+        file.vault_mut()
+            .insert(sample_entry("x"))
+            .expect("insertion succeeds");
+        let bytes = file.serialize().expect("serialization succeeds");
 
-        let other = MasterKey::generate().expect("OS 随机源可用");
+        let other = MasterKey::generate().expect("OS randomness available");
         let err = VaultFile::parse(other, &bytes);
         assert!(matches!(err, Err(Error::VaultDecryptionFailed)));
     }
@@ -1231,24 +1246,26 @@ mod tests {
     /// Both are a refusal - no single flipped byte may still decrypt into plausible data.
     #[test]
     fn tampering_any_byte_is_rejected() {
-        let mut file = VaultFile::create().expect("OS 随机源可用");
-        file.vault_mut().insert(sample_entry("x")).expect("可插入");
+        let mut file = VaultFile::create().expect("OS randomness available");
+        file.vault_mut()
+            .insert(sample_entry("x"))
+            .expect("insertion succeeds");
         file.vault_mut()
             .insert(sample_hotp_entry())
-            .expect("可插入");
-        let bytes = file.serialize().expect("可序列化");
+            .expect("insertion succeeds");
+        let bytes = file.serialize().expect("serialization succeeds");
         let key_bytes = master_key_to_bytes(file.master_key());
 
         for index in 0..bytes.len() {
             let mut tampered = bytes.clone();
             tampered[index] ^= 0x01;
             let result = VaultFile::parse(
-                MasterKey::from_bytes(key_bytes.clone()).expect("长度正确"),
+                MasterKey::from_bytes(key_bytes.clone()).expect("correct length"),
                 &tampered,
             );
             assert!(
                 result.is_err(),
-                "第 {index} 字节被翻转（{:#04x} → {:#04x}）却仍被接受",
+                "byte {index} was flipped ({:#04x} -> {:#04x}) yet still accepted",
                 bytes[index],
                 tampered[index]
             );
@@ -1258,22 +1275,27 @@ mod tests {
     /// Truncating the file at any position is rejected.
     #[test]
     fn truncation_at_any_point_is_rejected() {
-        let mut file = VaultFile::create().expect("OS 随机源可用");
-        file.vault_mut().insert(sample_entry("x")).expect("可插入");
+        let mut file = VaultFile::create().expect("OS randomness available");
+        file.vault_mut()
+            .insert(sample_entry("x"))
+            .expect("insertion succeeds");
         file.vault_mut()
             .insert(sample_hotp_entry())
-            .expect("可插入");
-        let first_id = *file.vault().iter().next().expect("有条目").0;
+            .expect("insertion succeeds");
+        let first_id = *file.vault().iter().next().expect("has an entry").0;
         file.vault_mut().remove(&first_id, 1);
-        let bytes = file.serialize().expect("可序列化");
+        let bytes = file.serialize().expect("serialization succeeds");
         let key_bytes = master_key_to_bytes(file.master_key());
 
         for cut in 1..bytes.len() {
             let result = VaultFile::parse(
-                MasterKey::from_bytes(key_bytes.clone()).expect("长度正确"),
+                MasterKey::from_bytes(key_bytes.clone()).expect("correct length"),
                 &bytes[..cut],
             );
-            assert!(result.is_err(), "截断到 {cut} 字节却仍被接受");
+            assert!(
+                result.is_err(),
+                "truncating to {cut} bytes was still accepted"
+            );
         }
     }
 
@@ -1281,13 +1303,15 @@ mod tests {
     /// modified" disappear.
     #[test]
     fn trailing_bytes_are_rejected() {
-        let mut file = VaultFile::create().expect("OS 随机源可用");
-        file.vault_mut().insert(sample_entry("x")).expect("可插入");
-        let mut bytes = file.serialize().expect("可序列化");
+        let mut file = VaultFile::create().expect("OS randomness available");
+        file.vault_mut()
+            .insert(sample_entry("x"))
+            .expect("insertion succeeds");
+        let mut bytes = file.serialize().expect("serialization succeeds");
         bytes.push(0x00);
 
         let err = VaultFile::parse(
-            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("长度正确"),
+            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("correct length"),
             &bytes,
         );
         assert!(matches!(err, Err(Error::VaultTrailingBytes { count: 1 })));
@@ -1295,11 +1319,11 @@ mod tests {
 
     #[test]
     fn bad_magic_is_rejected() {
-        let file = VaultFile::create().expect("OS 随机源可用");
-        let mut bytes = file.serialize().expect("可序列化");
+        let file = VaultFile::create().expect("OS randomness available");
+        let mut bytes = file.serialize().expect("serialization succeeds");
         bytes[0] = b'X';
         let err = VaultFile::parse(
-            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("长度正确"),
+            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("correct length"),
             &bytes,
         );
         assert!(matches!(err, Err(Error::VaultBadMagic)));
@@ -1307,26 +1331,29 @@ mod tests {
 
     #[test]
     fn unsupported_version_is_rejected() {
-        let file = VaultFile::create().expect("OS 随机源可用");
-        let mut bytes = file.serialize().expect("可序列化");
+        let file = VaultFile::create().expect("OS randomness available");
+        let mut bytes = file.serialize().expect("serialization succeeds");
         bytes[8] = 99;
         let err = VaultFile::parse(
-            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("长度正确"),
+            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("correct length"),
             &bytes,
         );
         match err {
             Err(Error::VaultUnsupportedVersion { version }) => assert_eq!(version, 99),
-            other => panic!("应拒绝未知版本，实际 ok={}", other.is_ok()),
+            other => panic!(
+                "an unknown version must be rejected, actual ok={}",
+                other.is_ok()
+            ),
         }
     }
 
     #[test]
     fn nonzero_reserved_byte_is_rejected() {
-        let file = VaultFile::create().expect("OS 随机源可用");
-        let mut bytes = file.serialize().expect("可序列化");
+        let file = VaultFile::create().expect("OS randomness available");
+        let mut bytes = file.serialize().expect("serialization succeeds");
         bytes[9] = 1;
         let err = VaultFile::parse(
-            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("长度正确"),
+            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("correct length"),
             &bytes,
         );
         assert!(matches!(
@@ -1337,12 +1364,14 @@ mod tests {
 
     #[test]
     fn unknown_record_kind_is_rejected() {
-        let mut file = VaultFile::create().expect("OS 随机源可用");
-        file.vault_mut().insert(sample_entry("x")).expect("可插入");
-        let mut bytes = file.serialize().expect("可序列化");
+        let mut file = VaultFile::create().expect("OS randomness available");
+        file.vault_mut()
+            .insert(sample_entry("x"))
+            .expect("insertion succeeds");
+        let mut bytes = file.serialize().expect("serialization succeeds");
         bytes[14] = 0x7F;
         let err = VaultFile::parse(
-            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("长度正确"),
+            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("correct length"),
             &bytes,
         );
         assert!(matches!(
@@ -1353,18 +1382,21 @@ mod tests {
 
     #[test]
     fn duplicate_entry_id_is_rejected() {
-        let mut file = VaultFile::create().expect("OS 随机源可用");
-        let id = file.vault_mut().insert(sample_entry("x")).expect("可插入");
+        let mut file = VaultFile::create().expect("OS randomness available");
+        let id = file
+            .vault_mut()
+            .insert(sample_entry("x"))
+            .expect("insertion succeeds");
 
         let mut vault = Vault::new();
         vault
             .insert_with_id(id, sample_entry("a"))
-            .expect("首次插入");
+            .expect("first insertion");
         let err = vault.insert_with_id(id, sample_entry("b"));
         assert!(matches!(err, Err(Error::VaultDuplicateEntryId)));
 
         assert_eq!(vault.len(), 1);
-        assert_eq!(vault.get(&id).expect("条目存在").name, "a");
+        assert_eq!(vault.get(&id).expect("entry exists").name, "a");
     }
 
     /// `replace` renames in place: the ID stays, no tombstone is left, and the caller can
@@ -1372,21 +1404,30 @@ mod tests {
     #[test]
     fn replace_keeps_the_id_and_leaves_no_tombstone() {
         let mut vault = Vault::new();
-        let id = vault.insert(sample_entry("original")).expect("可插入");
-        let created = vault.get(&id).expect("条目存在").created_at;
+        let id = vault
+            .insert(sample_entry("original"))
+            .expect("insertion succeeds");
+        let created = vault.get(&id).expect("entry exists").created_at;
 
         let mut renamed = sample_entry("renamed");
         renamed.created_at = created;
-        vault.replace(id, renamed).expect("替换应当成功");
+        vault
+            .replace(id, renamed)
+            .expect("replacement must succeed");
 
-        let entry = vault.get(&id).expect("标识必须仍然指向该条目");
+        let entry = vault
+            .get(&id)
+            .expect("the identifier must still point at that entry");
         assert_eq!(entry.name, "renamed");
-        assert_eq!(entry.created_at, created, "创建时间应当被保留");
-        assert_eq!(vault.len(), 1, "替换不该多出一条");
+        assert_eq!(
+            entry.created_at, created,
+            "the creation time must be preserved"
+        );
+        assert_eq!(vault.len(), 1, "a replacement must not add an entry");
         assert_eq!(
             vault.tombstone_count(),
             0,
-            "改名不是删除，不该留下墓碑——墓碑会被同步出去，另一端可能据此真的删掉条目"
+            "a rename is not a deletion and must not leave a tombstone: the tombstone gets synced out and the other side may really delete the entry because of it"
         );
     }
 
@@ -1398,25 +1439,25 @@ mod tests {
         let missing = EntryId::from_bytes([0x5A; EntryId::LEN]);
         let err = vault.replace(missing, sample_entry("ghost"));
         assert!(matches!(err, Err(Error::VaultEntryNotFound)));
-        assert!(vault.is_empty(), "失败不得凭空插入条目");
+        assert!(vault.is_empty(), "a failure must not conjure up an entry");
     }
 
     /// An empty vault round-trips, and its file is the 14-byte header plus the master key
     /// check value.
     #[test]
     fn empty_vault_roundtrips() {
-        let file = VaultFile::create().expect("OS 随机源可用");
-        let bytes = file.serialize().expect("可序列化");
+        let file = VaultFile::create().expect("OS randomness available");
+        let bytes = file.serialize().expect("serialization succeeds");
         assert_eq!(
             bytes.len(),
             14 + crypto::KEY_CHECK_LEN,
-            "空文件应是文件头加主密钥检查值"
+            "an empty file must be the header plus the master key check value"
         );
         let reopened = VaultFile::parse(
-            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("长度正确"),
+            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("correct length"),
             &bytes,
         )
-        .expect("可解析");
+        .expect("parsing succeeds");
         assert!(reopened.vault().is_empty());
         assert_eq!(reopened.vault().tombstone_count(), 0);
     }
@@ -1425,21 +1466,24 @@ mod tests {
     /// when there are zero records to authenticate.
     #[test]
     fn an_empty_vault_detects_a_wrong_master_key() {
-        let file = VaultFile::create().expect("OS 随机源可用");
-        assert!(file.vault().is_empty(), "前提：这个保险库确实是空的");
-        let bytes = file.serialize().expect("可序列化");
+        let file = VaultFile::create().expect("OS randomness available");
+        assert!(
+            file.vault().is_empty(),
+            "precondition: this vault really is empty"
+        );
+        let bytes = file.serialize().expect("serialization succeeds");
 
-        let wrong = MasterKey::generate().expect("OS 随机源可用");
+        let wrong = MasterKey::generate().expect("OS randomness available");
         assert_ne!(
             wrong.expose(),
             file.master_key().expose(),
-            "两把密钥必须不同"
+            "the two keys must differ"
         );
 
         let err = VaultFile::parse(wrong, &bytes);
         assert!(
             matches!(err, Err(Error::VaultDecryptionFailed)),
-            "空保险库用错误的密钥也必须被拒绝，实际 ok={}",
+            "an empty vault must be rejected with the wrong key too, actual ok={}",
             err.is_ok()
         );
     }
@@ -1449,12 +1493,12 @@ mod tests {
     /// property pinned here is the byte layout itself.
     #[test]
     fn version_1_files_are_still_readable() {
-        let master = MasterKey::generate().expect("OS 随机源可用");
-        let id = EntryId::generate().expect("OS 随机源可用");
+        let master = MasterKey::generate().expect("OS randomness available");
+        let id = EntryId::generate().expect("OS randomness available");
         let entry = sample_entry("old-format");
-        let plaintext = encode_entry(&entry).expect("可编码");
+        let plaintext = encode_entry(&entry).expect("encoding succeeds");
         let (nonce, ciphertext) =
-            crypto::seal(&master, RecordKind::Entry, &id, 1, &plaintext).expect("可加密");
+            crypto::seal(&master, RecordKind::Entry, &id, 1, &plaintext).expect("sealing succeeds");
 
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
@@ -1466,25 +1510,25 @@ mod tests {
         out.extend_from_slice(&nonce);
         put_u32(
             &mut out,
-            u32::try_from(ciphertext.len()).expect("测试数据远小于 u32::MAX"),
+            u32::try_from(ciphertext.len()).expect("the test data is far below u32::MAX"),
         );
         out.extend_from_slice(&ciphertext);
 
         let reopened = VaultFile::parse(
-            MasterKey::from_bytes(master_key_to_bytes(&master)).expect("长度正确"),
+            MasterKey::from_bytes(master_key_to_bytes(&master)).expect("correct length"),
             &out,
         )
-        .expect("版本 1 的文件必须仍可解析");
-        assert_eq!(reopened.vault().len(), 1, "条目应当被读出来");
+        .expect("a version 1 file must still parse");
+        assert_eq!(reopened.vault().len(), 1, "the entry must be read back");
         assert_eq!(
-            reopened.vault().iter().next().expect("一条").1.name,
+            reopened.vault().iter().next().expect("one entry").1.name,
             "old-format"
         );
 
-        let wrong = MasterKey::generate().expect("OS 随机源可用");
+        let wrong = MasterKey::generate().expect("OS randomness available");
         assert!(
             VaultFile::parse(wrong, &out).is_err(),
-            "有内容的版本 1 文件用错误密钥必须失败"
+            "a version 1 file with content must fail under the wrong key"
         );
     }
 
@@ -1498,33 +1542,33 @@ mod tests {
         out.push(0);
         put_u32(&mut out, 0);
 
-        let wrong = MasterKey::generate().expect("OS 随机源可用");
+        let wrong = MasterKey::generate().expect("OS randomness available");
         let parsed = VaultFile::parse(wrong, &out);
         assert!(
             parsed.is_ok(),
-            "版本 1 的空文件没有检查值，因此任何密钥都能解析——这是该格式的已知限制"
+            "an empty version 1 file has no check value, so any key parses it; that is a known limitation of that format"
         );
     }
 
     /// Flipping any byte of the key check value is rejected.
     #[test]
     fn a_tampered_key_check_is_rejected() {
-        let file = VaultFile::create().expect("OS 随机源可用");
+        let file = VaultFile::create().expect("OS randomness available");
         let master =
-            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("长度正确");
-        let bytes = file.serialize().expect("可序列化");
+            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("correct length");
+        let bytes = file.serialize().expect("serialization succeeds");
 
         for index in 0..crypto::KEY_CHECK_LEN {
             let mut tampered = bytes.clone();
             let last = tampered.len() - crypto::KEY_CHECK_LEN + index;
             tampered[last] ^= 0x01;
             let err = VaultFile::parse(
-                MasterKey::from_bytes(master_key_to_bytes(&master)).expect("长度正确"),
+                MasterKey::from_bytes(master_key_to_bytes(&master)).expect("correct length"),
                 &tampered,
             );
             assert!(
                 matches!(err, Err(Error::VaultDecryptionFailed)),
-                "检查值第 {index} 字节被翻转却仍被接受"
+                "check value byte {index} was flipped yet still accepted"
             );
         }
     }
@@ -1534,40 +1578,40 @@ mod tests {
     /// so merging them would send the user after the wrong problem.
     #[test]
     fn a_truncated_key_check_is_a_structural_error() {
-        let file = VaultFile::create().expect("OS 随机源可用");
+        let file = VaultFile::create().expect("OS randomness available");
         let master =
-            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("长度正确");
-        let bytes = file.serialize().expect("可序列化");
+            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("correct length");
+        let bytes = file.serialize().expect("serialization succeeds");
 
         let mut cut = bytes.clone();
         cut.truncate(cut.len() - 3);
         let err = VaultFile::parse(
-            MasterKey::from_bytes(master_key_to_bytes(&master)).expect("长度正确"),
+            MasterKey::from_bytes(master_key_to_bytes(&master)).expect("correct length"),
             &cut,
         );
         assert!(
             matches!(err, Err(Error::VaultTruncated)),
-            "截断的检查值应报截断，实际 ok={}",
+            "a truncated check value must report truncation, actual ok={}",
             err.is_ok()
         );
 
         let err = crypto::verify_key_check(&master, &[0_u8; 8]);
         assert!(
             matches!(err, Err(Error::VaultBadKeyCheck)),
-            "长度不符应报 VaultBadKeyCheck"
+            "a length mismatch must report VaultBadKeyCheck"
         );
     }
 
     /// The file header layout is an external contract, pinned here.
     #[test]
     fn file_header_layout_is_stable() {
-        let file = VaultFile::create().expect("OS 随机源可用");
-        let bytes = file.serialize().expect("可序列化");
+        let file = VaultFile::create().expect("OS randomness available");
+        let bytes = file.serialize().expect("serialization succeeds");
         assert_eq!(&bytes[..8], MAGIC);
         assert_eq!(bytes[8], FORMAT_VERSION);
-        assert_eq!(bytes[9], 0, "保留字节");
+        assert_eq!(bytes[9], 0, "reserved byte");
         assert_eq!(
-            u32::from_be_bytes(bytes[10..14].try_into().expect("4 字节")),
+            u32::from_be_bytes(bytes[10..14].try_into().expect("4 bytes")),
             0
         );
     }
@@ -1577,12 +1621,12 @@ mod tests {
     #[test]
     fn unknown_entry_node_is_skipped() {
         let entry = sample_entry("x");
-        let mut plaintext = encode_entry(&entry).expect("可编码");
+        let mut plaintext = encode_entry(&entry).expect("encoding succeeds");
 
         plaintext.push(0xEE);
         put_bytes(&mut plaintext, b"future field");
 
-        let decoded = decode_entry(&plaintext).expect("未知节点应被跳过");
+        let decoded = decode_entry(&plaintext).expect("unknown nodes must be skipped");
         assert_entry_eq(&entry, &decoded);
     }
 
@@ -1593,9 +1637,9 @@ mod tests {
         let mut plaintext = Vec::new();
         plaintext.push(0xEE);
         put_bytes(&mut plaintext, &[0xAA; 100]);
-        plaintext.extend_from_slice(&encode_entry(&entry).expect("可编码"));
+        plaintext.extend_from_slice(&encode_entry(&entry).expect("encoding succeeds"));
 
-        let decoded = decode_entry(&plaintext).expect("应跳过 100 字节");
+        let decoded = decode_entry(&plaintext).expect("must skip 100 bytes");
         assert_entry_eq(&entry, &decoded);
     }
 
@@ -1688,12 +1732,17 @@ mod tests {
     fn issuer_none_and_empty_normalize() {
         let mut entry = sample_entry("x");
         entry.issuer = None;
-        let decoded = decode_entry(&encode_entry(&entry).expect("可编码")).expect("可解码");
+        let decoded = decode_entry(&encode_entry(&entry).expect("encoding succeeds"))
+            .expect("decoding succeeds");
         assert_eq!(decoded.issuer, None);
 
         entry.issuer = Some(String::new());
-        let decoded = decode_entry(&encode_entry(&entry).expect("可编码")).expect("可解码");
-        assert_eq!(decoded.issuer, None, "空串应归一为 None");
+        let decoded = decode_entry(&encode_entry(&entry).expect("encoding succeeds"))
+            .expect("decoding succeeds");
+        assert_eq!(
+            decoded.issuer, None,
+            "an empty string must normalize to None"
+        );
     }
 
     /// An atomic write leaves exactly the bytes passed in and leaves no temporary file
@@ -1701,23 +1750,26 @@ mod tests {
     #[test]
     fn atomic_write_produces_exact_content() {
         let dir = std::env::temp_dir().join(format!("q2fa-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("可建目录");
+        std::fs::create_dir_all(&dir).expect("directory creation succeeds");
         let path = dir.join("vault.bin");
 
         let data = b"hello atomic world";
-        write_file_atomically(&path, data).expect("可写入");
-        assert_eq!(std::fs::read(&path).expect("可读"), data);
+        write_file_atomically(&path, data).expect("writing succeeds");
+        assert_eq!(std::fs::read(&path).expect("reading succeeds"), data);
 
         let longer = b"a much longer replacement payload";
-        write_file_atomically(&path, longer).expect("可写入");
-        assert_eq!(std::fs::read(&path).expect("可读"), longer);
+        write_file_atomically(&path, longer).expect("writing succeeds");
+        assert_eq!(std::fs::read(&path).expect("reading succeeds"), longer);
 
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
-            .expect("可读目录")
+            .expect("listing the directory succeeds")
             .filter_map(std::result::Result::ok)
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "残留临时文件: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "leftover temporary files: {leftovers:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1726,23 +1778,24 @@ mod tests {
     #[test]
     fn write_then_read_file_roundtrip() {
         let dir = std::env::temp_dir().join(format!("q2fa-rt-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("可建目录");
+        std::fs::create_dir_all(&dir).expect("directory creation succeeds");
         let path = dir.join("vault.bin");
 
-        let mut file = VaultFile::create().expect("OS 随机源可用");
+        let mut file = VaultFile::create().expect("OS randomness available");
         let id = file
             .vault_mut()
             .insert(sample_entry("GitHub"))
-            .expect("可插入");
-        let bytes = file.serialize().expect("可序列化");
-        write_file_atomically(&path, &bytes).expect("可写入");
+            .expect("insertion succeeds");
+        let bytes = file.serialize().expect("serialization succeeds");
+        write_file_atomically(&path, &bytes).expect("writing succeeds");
 
-        let key = MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("长度正确");
-        let reopened = read_file(key, &path).expect("可读回");
+        let key =
+            MasterKey::from_bytes(master_key_to_bytes(file.master_key())).expect("correct length");
+        let reopened = read_file(key, &path).expect("reading back succeeds");
         assert_eq!(reopened.vault().len(), 1);
         assert_entry_eq(
             &sample_entry("GitHub"),
-            reopened.vault().get(&id).expect("条目存在"),
+            reopened.vault().get(&id).expect("entry exists"),
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1751,7 +1804,7 @@ mod tests {
     /// Reading a missing file returns an I/O error rather than panicking.
     #[test]
     fn reading_missing_file_reports_io_error() {
-        let key = MasterKey::generate().expect("OS 随机源可用");
+        let key = MasterKey::generate().expect("OS randomness available");
         let err = read_file(key, Path::new("definitely/not/here/vault.bin"));
         assert!(matches!(err, Err(Error::VaultIo { .. })));
     }
@@ -1759,7 +1812,7 @@ mod tests {
     /// Empty input is rejected without panicking.
     #[test]
     fn empty_input_is_rejected() {
-        let key = MasterKey::generate().expect("OS 随机源可用");
+        let key = MasterKey::generate().expect("OS randomness available");
         assert!(matches!(
             VaultFile::parse(key, &[]),
             Err(Error::VaultTruncated)
@@ -1770,7 +1823,7 @@ mod tests {
     /// attempted**.
     #[test]
     fn absurd_record_count_is_rejected() {
-        let key = MasterKey::generate().expect("OS 随机源可用");
+        let key = MasterKey::generate().expect("OS randomness available");
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
         bytes.push(FORMAT_VERSION);
@@ -1783,7 +1836,7 @@ mod tests {
     /// A file claiming an over-long record is rejected, and no allocation is attempted.
     #[test]
     fn absurd_record_length_is_rejected() {
-        let key = MasterKey::generate().expect("OS 随机源可用");
+        let key = MasterKey::generate().expect("OS randomness available");
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
         bytes.push(FORMAT_VERSION);
@@ -1799,14 +1852,17 @@ mod tests {
                 assert_eq!(limit, MAX_RECORD_LEN);
                 assert_eq!(actual, u32::MAX as usize);
             }
-            other => panic!("应拒绝超长记录，实际 ok={}", other.is_ok()),
+            other => panic!(
+                "an over-long record must be rejected, actual ok={}",
+                other.is_ok()
+            ),
         }
     }
 
     /// Unencrypted garbage is rejected (by the magic or by authentication).
     #[test]
     fn garbage_with_correct_magic_is_rejected() {
-        let key = MasterKey::generate().expect("OS 随机源可用");
+        let key = MasterKey::generate().expect("OS randomness available");
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
         bytes.push(FORMAT_VERSION);

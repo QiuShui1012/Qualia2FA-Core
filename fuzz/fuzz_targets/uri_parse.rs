@@ -106,14 +106,14 @@ fn check(text: &str) {
     let debug = format!("{parsed:?}");
     assert!(
         debug.contains(r#"secret: "<redacted>""#),
-        "Debug 未把 secret 字段脱敏：{debug}"
+        "Debug did not redact the secret field: {debug}"
     );
 
     let base32 = parsed.secret.to_base32();
     let leaked_as_secret_field = debug.contains(&format!(r#"secret: "{base32}""#));
     assert!(
         !leaked_as_secret_field,
-        "Debug 的 secret 字段泄露了 Base32 种子：{debug}"
+        "the secret field of Debug leaked the Base32 seed: {debug}"
     );
 
     if let Some(issuer) = &parsed.issuer {
@@ -121,30 +121,30 @@ fn check(text: &str) {
             let full = format!("{issuer:?}");
             assert!(
                 !debug.contains(&full),
-                "超长 issuer 未被截断，日志可被放大（{} 字节）",
+                "an over-long issuer was not truncated, so logs can be amplified ({} bytes)",
                 issuer.len()
             );
         }
     }
 
-    assert!(parsed.secret.len() > 0, "解析出的种子为空");
+    assert!(parsed.secret.len() > 0, "the parsed seed is empty");
     match parsed.uri_type {
-        uri::UriType::Totp => assert!(parsed.counter.is_none(), "TOTP 不应有 counter"),
-        uri::UriType::Hotp => assert!(parsed.counter.is_some(), "HOTP 应有 counter"),
+        uri::UriType::Totp => assert!(parsed.counter.is_none(), "TOTP must not carry a counter"),
+        uri::UriType::Hotp => assert!(parsed.counter.is_some(), "HOTP must carry a counter"),
     }
-    assert!(parsed.period > 0, "period 不应为 0");
+    assert!(parsed.period > 0, "period must not be 0");
 
     if let Ok(roundtrip) = uri::serialize(&parsed) {
         if let Ok(reparsed) = uri::parse(&roundtrip) {
             assert_eq!(
                 reparsed.secret.to_base32(),
                 base32,
-                "往返后的种子发生了变化"
+                "the seed changed after the round trip"
             );
-            assert_eq!(reparsed.account, parsed.account, "往返后账号发生了变化");
-            assert_eq!(reparsed.issuer, parsed.issuer, "往返后 issuer 发生了变化");
-            let again = uri::serialize(&reparsed).expect("已能序列化一次，应能再次");
-            assert_eq!(again, roundtrip, "序列化不幂等");
+            assert_eq!(reparsed.account, parsed.account, "the account changed after the round trip");
+            assert_eq!(reparsed.issuer, parsed.issuer, "the issuer changed after the round trip");
+            let again = uri::serialize(&reparsed).expect("it serialized once, so it must serialize again");
+            assert_eq!(again, roundtrip, "serialization is not idempotent");
         }
     }
 }

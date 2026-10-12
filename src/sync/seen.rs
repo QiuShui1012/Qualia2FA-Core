@@ -166,7 +166,8 @@ mod tests {
         assert!(log.is_empty());
         assert!(!log.contains(&id(1)));
 
-        log.check_and_record(id(1)).expect("第一次应当接受");
+        log.check_and_record(id(1))
+            .expect("the first call must be accepted");
         assert_eq!(log.len(), 1);
         assert!(log.contains(&id(1)));
     }
@@ -174,24 +175,33 @@ mod tests {
     #[test]
     fn a_repeated_id_is_rejected() {
         let mut log = SeenSyncIds::new();
-        log.check_and_record(id(1)).expect("第一次应当接受");
+        log.check_and_record(id(1))
+            .expect("the first call must be accepted");
         let err = log.check_and_record(id(1));
         assert!(
             matches!(err, Err(Error::SyncAlreadyApplied)),
-            "实际 {err:?}"
+            "actual {err:?}"
         );
-        assert_eq!(log.len(), 1, "重复的标识不得被重复记录");
+        assert_eq!(
+            log.len(),
+            1,
+            "a repeated identifier must not be recorded twice"
+        );
     }
 
     #[test]
     fn many_distinct_ids_are_all_remembered() {
         let mut log = SeenSyncIds::new();
         for seed in 0..200_u8 {
-            log.check_and_record(id(seed)).expect("新标识应当接受");
+            log.check_and_record(id(seed))
+                .expect("a new identifier must be accepted");
         }
         assert_eq!(log.len(), 200);
         for seed in 0..200_u8 {
-            assert!(log.contains(&id(seed)), "标识 {seed} 没被记住");
+            assert!(
+                log.contains(&id(seed)),
+                "identifier {seed} was not remembered"
+            );
         }
     }
 
@@ -206,7 +216,8 @@ mod tests {
         for i in 0..MAX_SEEN_SYNC_IDS {
             let mut sync_id = [0_u8; crate::sync::SYNC_ID_LEN];
             sync_id[..8].copy_from_slice(&(i as u64).to_be_bytes());
-            log.record(sync_id).expect("未满时应当接受");
+            log.record(sync_id)
+                .expect("must be accepted while not full");
         }
         assert_eq!(log.len(), MAX_SEEN_SYNC_IDS);
 
@@ -215,28 +226,30 @@ mod tests {
         let err = log.record(fresh);
         assert!(
             matches!(err, Err(Error::SyncIdLogFull { .. })),
-            "实际 {err:?}"
+            "actual {err:?}"
         );
 
         let mut oldest = [0_u8; crate::sync::SYNC_ID_LEN];
         oldest[..8].copy_from_slice(&0_u64.to_be_bytes());
-        assert!(log.contains(&oldest), "最旧的标识被淘汰了");
+        assert!(log.contains(&oldest), "the oldest identifier was evicted");
     }
 
     #[test]
     fn clear_gives_up_protection_explicitly() {
         let mut log = SeenSyncIds::new();
-        log.check_and_record(id(1)).expect("第一次应当接受");
+        log.check_and_record(id(1))
+            .expect("the first call must be accepted");
         log.clear();
         assert!(log.is_empty());
-        log.check_and_record(id(1)).expect("清空后应当重新接受");
+        log.check_and_record(id(1))
+            .expect("must be accepted again after a reset");
     }
 
     #[test]
     fn iteration_is_oldest_first() {
         let mut log = SeenSyncIds::new();
         for seed in 1..=5_u8 {
-            log.record(id(seed)).expect("应当接受");
+            log.record(id(seed)).expect("must be accepted");
         }
         let order: Vec<u8> = log.iter().map(|s| s[0]).collect();
         assert_eq!(order, vec![1, 2, 3, 4, 5]);

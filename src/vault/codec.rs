@@ -108,12 +108,12 @@ pub(crate) fn put_u32(out: &mut Vec<u8>, value: u32) {
 pub(crate) fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "调用方已保证长度不超过 u32::MAX；下面有断言兜底"
+        reason = "the caller guarantees the length fits in u32; an assertion below backs it up"
     )]
     let len = bytes.len() as u32;
     assert!(
         bytes.len() <= u32::MAX as usize,
-        "字段长度超出 u32 表示范围"
+        "field length exceeds the u32 range"
     );
     put_u32(out, len);
     out.extend_from_slice(bytes);
@@ -176,7 +176,7 @@ mod tests {
         buf.extend_from_slice(b"short");
 
         let mut r = Reader::new(&buf);
-        let claimed = r.u32().expect("长度前缀可读");
+        let claimed = r.u32().expect("length prefix readable");
         assert_eq!(claimed, u32::MAX);
         assert_eq!(r.take(claimed as usize), None);
     }
@@ -187,7 +187,7 @@ mod tests {
             let mut buf = Vec::new();
             put_bytes(&mut buf, payload);
             let mut r = Reader::new(&buf);
-            let len = r.u32().expect("长度可读");
+            let len = r.u32().expect("length readable");
             assert_eq!(len as usize, payload.len());
             assert_eq!(r.take(len as usize), Some(payload));
             assert!(r.is_empty());

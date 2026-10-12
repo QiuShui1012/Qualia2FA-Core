@@ -108,7 +108,7 @@ fn arb_entry() -> impl Strategy<Value = Entry> {
                     name,
                     issuer,
                     account,
-                    OtpSecret::from_bytes(secret_bytes).expect("策略保证非空"),
+                    OtpSecret::from_bytes(secret_bytes).expect("the strategy guarantees non-empty"),
                     algorithm,
                     digits,
                     period,
@@ -117,7 +117,7 @@ fn arb_entry() -> impl Strategy<Value = Entry> {
                     created_at,
                     updated_at,
                 )
-                .expect("策略保证字段合法")
+                .expect("the strategy guarantees valid fields")
             },
         )
 }
@@ -139,14 +139,14 @@ fn arb_vault() -> impl Strategy<Value = (Vault, MasterKey, Vec<EntryId>)> {
         let mut vault = Vault::new();
         let mut live = Vec::new();
         for (index, entry) in entries.into_iter().enumerate() {
-            let id = vault.insert(entry).expect("OS 随机源可用");
+            let id = vault.insert(entry).expect("OS random source is available");
             if deletes.get(index).copied().unwrap_or(false) {
                 vault.remove(&id, 1_700_000_000);
             } else {
                 live.push(id);
             }
         }
-        let master = MasterKey::generate().expect("OS 随机源可用");
+        let master = MasterKey::generate().expect("OS random source is available");
         (vault, master, live)
     })
 }
@@ -165,7 +165,7 @@ fn assert_entry_eq(a: &Entry, b: &Entry) {
     assert_eq!(
         a.secret.to_base32(),
         b.secret.to_base32(),
-        "secret（Base32 形式）"
+        "secret (Base32 form)"
     );
     assert_eq!(a.algorithm, b.algorithm, "algorithm");
     assert_eq!(a.digits, b.digits, "digits");
@@ -181,7 +181,7 @@ fn assert_entry_eq(a: &Entry, b: &Entry) {
 /// `MasterKey` deliberately does not implement `Clone`; going through its bytes keeps the copy
 /// visible in the code instead of hiding it behind a silent `.clone()`.
 fn clone_key(master: &MasterKey) -> MasterKey {
-    MasterKey::from_bytes(vault::master_key_to_bytes(master)).expect("长度正确")
+    MasterKey::from_bytes(vault::master_key_to_bytes(master)).expect("the length is correct")
 }
 
 proptest! {
@@ -195,7 +195,7 @@ proptest! {
             expected.push((*id, entry.name.clone()));
             file.vault_mut()
                 .insert_with_id(*id, clone_entry(entry))
-                .expect("ID 由策略分别生成，互不相同");
+                .expect("the strategy generates distinct IDs");
         }
         for tombstone in vault.iter_tombstones().map(|(_, t)| t) {
             file.vault_mut().record_tombstone(Tombstone {
@@ -207,14 +207,14 @@ proptest! {
         expected.sort_by_key(|(id, _)| *id);
         let expected_tombstones = vault.tombstone_count();
 
-        let bytes = file.serialize().expect("可序列化");
-        let reopened = VaultFile::parse(clone_key(&master), &bytes).expect("可解析");
+        let bytes = file.serialize().expect("serializable");
+        let reopened = VaultFile::parse(clone_key(&master), &bytes).expect("parsable");
 
-        prop_assert_eq!(reopened.vault().len(), expected.len(), "条目数变化");
+        prop_assert_eq!(reopened.vault().len(), expected.len(), "the entry count changed");
         prop_assert_eq!(
             reopened.vault().tombstone_count(),
             expected_tombstones,
-            "墓碑数变化"
+            "the tombstone count changed"
         );
 
         let mut actual: Vec<(EntryId, String)> = reopened
@@ -223,16 +223,16 @@ proptest! {
             .map(|(id, entry)| (*id, entry.name.clone()))
             .collect();
         actual.sort_by_key(|(id, _)| *id);
-        prop_assert_eq!(&actual, &expected, "条目 ID 或名称集合变化");
+        prop_assert_eq!(&actual, &expected, "the set of entry IDs or names changed");
 
         for (id, _) in &expected {
-            let before = vault.get(id).expect("原条目存在");
-            let after = reopened.vault().get(id).expect("读回条目存在");
+            let before = vault.get(id).expect("the original entry exists");
+            let after = reopened.vault().get(id).expect("the entry read back exists");
             assert_entry_eq(before, after);
         }
 
         for id in &live_ids {
-            prop_assert!(reopened.vault().get(id).is_some(), "未删除的条目丢失");
+            prop_assert!(reopened.vault().get(id).is_some(), "a surviving entry was lost");
         }
     }
 
@@ -244,7 +244,7 @@ proptest! {
     fn any_single_byte_flip_is_detected((vault, master, _live) in arb_vault(), flip_seed in any::<prop::sample::Index>()) {
         let mut file = VaultFile::with_master_key(clone_key(&master));
         for (id, entry) in vault.iter() {
-            file.vault_mut().insert_with_id(*id, clone_entry(entry)).expect("ID 互不相同");
+            file.vault_mut().insert_with_id(*id, clone_entry(entry)).expect("IDs are distinct");
         }
         for (id, tombstone) in vault.iter_tombstones() {
             file.vault_mut().record_tombstone(Tombstone {
@@ -253,7 +253,7 @@ proptest! {
                 deleted_by: tombstone.deleted_by,
             });
         }
-        let bytes = file.serialize().expect("可序列化");
+        let bytes = file.serialize().expect("serializable");
         prop_assume!(!bytes.is_empty());
 
         let index = flip_seed.index(bytes.len());
@@ -263,7 +263,7 @@ proptest! {
         let result = VaultFile::parse(clone_key(&master), &tampered);
         prop_assert!(
             result.is_err(),
-            "第 {} 字节被翻转（{:#04x} → {:#04x}）却仍被接受",
+            "byte {} was flipped ({:#04x} -> {:#04x}) yet still accepted",
             index,
             bytes[index],
             tampered[index]
@@ -286,7 +286,7 @@ proptest! {
         for (id, entry) in vault.iter() {
             file.vault_mut()
                 .insert_with_id(*id, clone_entry(entry))
-                .expect("ID 由策略分别生成，互不相同");
+                .expect("the strategy generates distinct IDs");
         }
         for tombstone in vault.iter_tombstones().map(|(_, t)| t) {
             file.vault_mut().record_tombstone(Tombstone {
@@ -295,7 +295,7 @@ proptest! {
                 deleted_by: tombstone.deleted_by,
             });
         }
-        let bytes = file.serialize().expect("可序列化");
+        let bytes = file.serialize().expect("serializable");
         prop_assume!(!bytes.is_empty());
 
         let cut = cut_seed.index(bytes.len());
@@ -305,13 +305,13 @@ proptest! {
                 prop_assert_eq!(
                     parsed.vault().len(),
                     0,
-                    "截断到 {} 字节后仍有条目存活",
+                    "an entry survived truncation to {} bytes",
                     cut
                 );
                 prop_assert_eq!(
                     parsed.vault().tombstone_count(),
                     0,
-                    "截断到 {} 字节后仍有墓碑存活",
+                    "a tombstone survived truncation to {} bytes",
                     cut
                 );
             }
@@ -322,7 +322,7 @@ proptest! {
     /// legal truncation of anything.
     #[test]
     fn empty_input_is_always_rejected(_seed in any::<u64>()) {
-        let master = MasterKey::generate().expect("OS 随机源可用");
+        let master = MasterKey::generate().expect("OS random source is available");
         prop_assert!(VaultFile::parse(master, &[]).is_err());
     }
 
@@ -330,7 +330,7 @@ proptest! {
     /// panics.
     #[test]
     fn parsing_arbitrary_bytes_never_panics(data in prop::collection::vec(any::<u8>(), 0..=512)) {
-        let master = MasterKey::generate().expect("OS 随机源可用");
+        let master = MasterKey::generate().expect("OS random source is available");
         let _ = VaultFile::parse(master, &data);
     }
 
@@ -351,9 +351,9 @@ proptest! {
     ) {
         let mut file = VaultFile::with_master_key(clone_key(&master));
         for (id, entry) in vault.iter() {
-            file.vault_mut().insert_with_id(*id, clone_entry(entry)).expect("ID 互不相同");
+            file.vault_mut().insert_with_id(*id, clone_entry(entry)).expect("IDs are distinct");
         }
-        let mut bytes = file.serialize().expect("可序列化");
+        let mut bytes = file.serialize().expect("serializable");
 
         if magic_flip {
             bytes[0] ^= 0xFF;
@@ -361,14 +361,14 @@ proptest! {
                 VaultFile::parse(clone_key(&master), &bytes),
                 Err(qualia2fa_core::Error::VaultBadMagic)
             );
-            prop_assert!(is_bad_magic, "魔数被破坏却未被拒绝");
+            prop_assert!(is_bad_magic, "the magic was corrupted but not rejected");
         } else {
             bytes[8] = version;
             let is_unsupported = matches!(
                 VaultFile::parse(clone_key(&master), &bytes),
                 Err(qualia2fa_core::Error::VaultUnsupportedVersion { .. })
             );
-            prop_assert!(is_unsupported, "版本 {} 未被拒绝", version);
+            prop_assert!(is_unsupported, "version {} was not rejected", version);
         }
     }
 
@@ -385,15 +385,15 @@ proptest! {
         prop_assume!(!vault.is_empty());
         let mut file = VaultFile::with_master_key(clone_key(&master));
         for (id, entry) in vault.iter() {
-            file.vault_mut().insert_with_id(*id, clone_entry(entry)).expect("ID 互不相同");
+            file.vault_mut().insert_with_id(*id, clone_entry(entry)).expect("IDs are distinct");
         }
-        let bytes = file.serialize().expect("可序列化");
+        let bytes = file.serialize().expect("serializable");
 
         let mut other = vault::master_key_to_bytes(&master).expose_secret().to_vec();
         other[0] ^= delta;
-        let other = MasterKey::from_bytes(other.into()).expect("长度正确");
+        let other = MasterKey::from_bytes(other.into()).expect("the length is correct");
 
-        prop_assert!(VaultFile::parse(other, &bytes).is_err(), "另一把主密钥竟能解开");
+        prop_assert!(VaultFile::parse(other, &bytes).is_err(), "a different master key could open it");
     }
 }
 
@@ -407,7 +407,7 @@ fn clone_entry(entry: &Entry) -> Entry {
         entry.name.clone(),
         entry.issuer.clone(),
         entry.account.clone(),
-        OtpSecret::from_base32(&entry.secret.to_base32()).expect("原种子合法"),
+        OtpSecret::from_base32(&entry.secret.to_base32()).expect("the original seed is valid"),
         entry.algorithm,
         entry.digits,
         entry.period,
@@ -416,7 +416,7 @@ fn clone_entry(entry: &Entry) -> Entry {
         entry.created_at,
         entry.updated_at,
     )
-    .expect("原条目合法，重建后仍合法")
+    .expect("the rebuilt entry is still valid")
 }
 
 /// The file header layout is an external contract: these assertions do not drift with the
@@ -427,19 +427,19 @@ fn clone_entry(entry: &Entry) -> Entry {
 /// format cannot change.
 #[test]
 fn file_format_constants_are_stable() {
-    assert_eq!(MAGIC, b"Q2FAVLT\0", "魔数是对外契约");
+    assert_eq!(MAGIC, b"Q2FAVLT\0", "the magic is an external contract");
     assert_eq!(
         FORMAT_VERSION, 2,
-        "版本号参与 AAD，改动会让所有旧文件解不开"
+        "the version takes part in the AAD, so changing it makes every old file unopenable"
     );
     assert_eq!(
         READABLE_VERSIONS,
         &[1, 2],
-        "可读版本只增不减：移除一个会让用户手里的旧文件突然打不开"
+        "readable versions only grow: removing one would suddenly make users' old files unopenable"
     );
-    assert_eq!(vault::MASTER_KEY_LEN, 32, "主密钥长度");
-    assert_eq!(vault::NONCE_LEN, 24, "XChaCha20 的 nonce 长度");
-    assert_eq!(vault::TAG_LEN, 16, "Poly1305 标签长度");
-    assert_eq!(vault::KEY_CHECK_LEN, 32, "主密钥检查值长度");
-    assert_eq!(EntryId::LEN, 16, "128-bit 条目标识");
+    assert_eq!(vault::MASTER_KEY_LEN, 32, "master key length");
+    assert_eq!(vault::NONCE_LEN, 24, "XChaCha20 nonce length");
+    assert_eq!(vault::TAG_LEN, 16, "Poly1305 tag length");
+    assert_eq!(vault::KEY_CHECK_LEN, 32, "master key check value length");
+    assert_eq!(EntryId::LEN, 16, "128-bit entry identifier");
 }

@@ -50,11 +50,11 @@ fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         assert!(
             base32::decode("").is_err(),
-            "空输入必须被拒绝（空种子无意义）"
+            "empty input must be rejected (an empty seed is meaningless)"
         );
         assert!(
             base32::decode_strict("").is_err(),
-            "空输入必须被严格模式拒绝"
+            "empty input must be rejected by strict mode"
         );
         return;
     }
@@ -62,26 +62,26 @@ fuzz_target!(|data: &[u8]| {
     // ── 1. Arbitrary bytes → Base32 → decode must round-trip exactly ────────
     let encoded = base32::encode(data);
     let decoded = base32::decode_strict(&encoded)
-        .expect("自己编码出的规范形式必须能被严格模式解码");
+        .expect("the canonical form of our own encoding must decode in strict mode");
     assert_eq!(
         decoded.expose_secret(),
         data,
-        "Base32 往返不精确：原文 {} 字节，编码 {encoded}",
+        "Base32 round trip is imprecise: input {} bytes, encoded {encoded}",
         data.len()
     );
 
     let unpadded = encoded.trim_end_matches('=');
-    let decoded_unpadded = base32::decode(unpadded).expect("无填充形式必须可解码");
+    let decoded_unpadded = base32::decode(unpadded).expect("the unpadded form must decode");
     assert_eq!(
         decoded_unpadded.expose_secret(),
         data,
-        "无填充往返不精确：{unpadded}"
+        "unpadded round trip is imprecise: {unpadded}"
     );
 
     assert_eq!(
         base32::encode(decoded_unpadded.expose_secret()),
         encoded,
-        "重新编码的结果与首次编码不一致"
+        "re-encoding does not match the first encoding"
     );
 
     // ── 2. Arbitrary text → both decode modes, neither may panic ────────────
@@ -93,12 +93,12 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(from_strict) = &strict {
         assert!(
             lenient.is_ok(),
-            "严格模式接受了 {text:?}，宽容模式却拒绝"
+            "strict mode accepted {text:?} but lenient mode rejected it"
         );
         assert_eq!(
             from_strict.expose_secret(),
-            lenient.expect("已确认成功").expose_secret(),
-            "两种模式对同一输入给出不同结果：{text:?}"
+            lenient.expect("already confirmed to succeed").expose_secret(),
+            "the two modes disagree on the same input: {text:?}"
         );
     }
 
@@ -107,7 +107,7 @@ fuzz_target!(|data: &[u8]| {
         && !bytes.expose_secret().is_empty()
     {
         let secret = OtpSecret::from_bytes(bytes.expose_secret().to_vec())
-            .expect("已确认非空");
+            .expect("already confirmed non-empty");
 
         let counter = u64::from_le_bytes([
             data.first().copied().unwrap_or(0),
@@ -126,16 +126,16 @@ fuzz_target!(|data: &[u8]| {
                 assert_eq!(
                     code.len(),
                     digits.count() as usize,
-                    "码长不符：{code}（{algorithm:?}/{digits:?}）"
+                    "code width mismatch: {code} ({algorithm:?}/{digits:?})"
                 );
                 assert!(
                     code.bytes().all(|b| b.is_ascii_digit()),
-                    "码含非数字字符：{code}"
+                    "the code contains a non-digit character: {code}"
                 );
-                let numeric: u64 = code.parse().expect("码应可解析为数字");
+                let numeric: u64 = code.parse().expect("the code should parse as a number");
                 assert!(
                     numeric < 10_u64.pow(digits.count()),
-                    "码超出位数范围：{code}"
+                    "the code is outside the digit range: {code}"
                 );
                 assert_eq!(
                     otp::format_code(otp::hotp(&secret, counter, algorithm, digits), digits),
@@ -146,16 +146,16 @@ fuzz_target!(|data: &[u8]| {
 
         let time = counter;
         let totp_code = otp::totp_code(&secret, time, 30, Algorithm::Sha1, Digits::Six)
-            .expect("周期非零");
+            .expect("period is non-zero");
         assert_eq!(totp_code.len(), 6);
 
         let steam = otp::steam_guard_code(&secret, time, 30, Algorithm::Sha1)
-            .expect("周期非零");
+            .expect("period is non-zero");
         assert_eq!(steam.chars().count(), otp::STEAM_DIGITS);
         const STEAM_ALPHABET: &str = "23456789BCDFGHJKMNPQRTVWXY";
         assert!(
             steam.chars().all(|c| STEAM_ALPHABET.contains(c)),
-            "Steam 码含字母表外字符：{steam}"
+            "the Steam code contains a character outside the alphabet: {steam}"
         );
 
         assert!(otp::verify_code(&totp_code, &totp_code));

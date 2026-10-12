@@ -228,27 +228,27 @@ impl KdfParams {
     pub const fn new(memory_kib: u32, iterations: u32, parallelism: u32) -> Result<Self> {
         if memory_kib < Params::MIN_M_COST {
             return Err(Error::RecoveryParametersInvalid {
-                reason: "内存开销低于 Argon2 允许的下限",
+                reason: "the memory cost is below the Argon2 minimum",
             });
         }
         if memory_kib > MAX_MEMORY_KIB {
             return Err(Error::RecoveryParametersInvalid {
-                reason: "内存开销超出本实现允许的上限",
+                reason: "the memory cost is above the maximum this implementation allows",
             });
         }
         if iterations < Params::MIN_T_COST {
             return Err(Error::RecoveryParametersInvalid {
-                reason: "迭代次数不得为 0",
+                reason: "the iteration count must not be zero",
             });
         }
         if iterations > MAX_ITERATIONS {
             return Err(Error::RecoveryParametersInvalid {
-                reason: "迭代次数超出本实现允许的上限",
+                reason: "the iteration count is above the maximum this implementation allows",
             });
         }
         if parallelism != PARALLELISM {
             return Err(Error::RecoveryParametersInvalid {
-                reason: "本实现只支持并行度为 1",
+                reason: "this implementation only supports a parallelism of 1",
             });
         }
         Ok(Self {
@@ -369,12 +369,12 @@ pub fn export(
 pub fn import(file: &[u8], passphrase: &SecretString) -> Result<MasterKey> {
     if file.len() != FILE_LEN {
         return Err(Error::RecoveryFileMalformed {
-            reason: "长度不是恢复文件的固定长度",
+            reason: "the length is not the fixed recovery file length",
         });
     }
     if &file[offset::MAGIC..offset::VERSION] != MAGIC {
         return Err(Error::RecoveryFileMalformed {
-            reason: "magic 不匹配，这不是本应用的恢复文件",
+            reason: "magic mismatch: this is not a recovery file of this application",
         });
     }
     if file[offset::VERSION] != FORMAT_VERSION {
@@ -392,21 +392,21 @@ pub fn import(file: &[u8], passphrase: &SecretString) -> Result<MasterKey> {
         file[offset::MEMORY..offset::MEMORY + 4]
             .try_into()
             .map_err(|_| Error::RecoveryFileMalformed {
-                reason: "内存开销字段读取失败",
+                reason: "failed to read the memory cost field",
             })?,
     );
     let iterations = u32::from_be_bytes(
         file[offset::ITERATIONS..offset::ITERATIONS + 4]
             .try_into()
             .map_err(|_| Error::RecoveryFileMalformed {
-                reason: "迭代次数字段读取失败",
+                reason: "failed to read the iteration count field",
             })?,
     );
     let parallelism = u32::from_be_bytes(
         file[offset::PARALLELISM..offset::PARALLELISM + 4]
             .try_into()
             .map_err(|_| Error::RecoveryFileMalformed {
-                reason: "并行度字段读取失败",
+                reason: "failed to read the parallelism field",
             })?,
     );
     let params = KdfParams::new(memory_kib, iterations, parallelism)?;
@@ -447,7 +447,7 @@ fn derive_key(
         Some(DERIVED_KEY_LEN),
     )
     .map_err(|_| Error::RecoveryParametersInvalid {
-        reason: "Argon2 拒绝了这组参数",
+        reason: "Argon2 rejected these parameters",
     })?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
@@ -478,7 +478,7 @@ mod tests {
     ///
     /// The memory lower bound comes from Argon2 (8 KiB).
     fn fast_params() -> KdfParams {
-        KdfParams::new(Params::MIN_M_COST, 1, 1).expect("下限参数应当合法")
+        KdfParams::new(Params::MIN_M_COST, 1, 1).expect("the minimum parameters should be valid")
     }
 
     /// Builds a passphrase.
@@ -489,37 +489,37 @@ mod tests {
     /// Export followed by import restores the same master key.
     #[test]
     fn export_import_roundtrip() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let file = export(
             &master,
             &passphrase("correct horse battery staple"),
             &fast_params(),
         )
-        .expect("导出应当成功");
-        assert_eq!(file.len(), FILE_LEN, "文件长度必须恒定");
+        .expect("export should succeed");
+        assert_eq!(file.len(), FILE_LEN, "the file length must be constant");
 
-        let restored =
-            import(&file, &passphrase("correct horse battery staple")).expect("导入应当成功");
+        let restored = import(&file, &passphrase("correct horse battery staple"))
+            .expect("import should succeed");
         assert_eq!(restored.expose(), master.expose());
     }
 
     /// **A wrong passphrase must fail.**
     #[test]
     fn wrong_passphrase_fails() {
-        let master = MasterKey::generate().expect("随机源可用");
-        let file = export(&master, &passphrase("right"), &fast_params()).expect("导出");
+        let master = MasterKey::generate().expect("randomness should be available");
+        let file = export(&master, &passphrase("right"), &fast_params()).expect("export");
 
         let result = import(&file, &passphrase("wrong"));
         assert!(
             matches!(result, Err(Error::RecoveryAuthenticationFailed)),
-            "错误口令应被拒绝"
+            "a wrong passphrase must be rejected"
         );
     }
 
     /// An empty passphrase is rejected **at export time**.
     #[test]
     fn empty_passphrase_is_rejected_on_export() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let result = export(&master, &passphrase(""), &fast_params());
         assert!(matches!(result, Err(Error::RecoveryPassphraseEmpty)));
     }
@@ -535,9 +535,9 @@ mod tests {
     /// them to be rejected **without allocating**.
     #[test]
     fn any_single_byte_flip_is_detected() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let phrase = passphrase("tamper test");
-        let file = export(&master, &phrase, &fast_params()).expect("导出");
+        let file = export(&master, &phrase, &fast_params()).expect("export");
 
         let param_range = offset::MEMORY..offset::PARALLELISM + 4;
         for index in 0..FILE_LEN {
@@ -549,7 +549,7 @@ mod tests {
             match import(&tampered, &phrase) {
                 Err(_) => {}
                 Ok(restored) => panic!(
-                    "第 {index} 字节被翻转却成功导入（还原出的密钥与原密钥相同 = {}）",
+                    "byte {index} was flipped but the import succeeded (the restored key equals the original = {})",
                     restored.expose() == master.expose()
                 ),
             }
@@ -563,9 +563,9 @@ mod tests {
     /// unnoticed), or a huge allocation (the import becomes a denial of service).
     #[test]
     fn flipping_parameter_bytes_is_rejected_by_the_limits() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let phrase = passphrase("param tamper test");
-        let file = export(&master, &phrase, &fast_params()).expect("导出");
+        let file = export(&master, &phrase, &fast_params()).expect("export");
 
         for index in offset::MEMORY..offset::PARALLELISM + 4 {
             let mut tampered = file.clone();
@@ -573,9 +573,9 @@ mod tests {
             match import(&tampered, &phrase) {
                 Err(Error::RecoveryParametersInvalid { .. }) => {}
                 Err(Error::RecoveryAuthenticationFailed) => {}
-                Err(other) => panic!("第 {index} 字节：意外的错误类型 {other}"),
+                Err(other) => panic!("byte {index}: unexpected error type {other}"),
                 Ok(restored) => panic!(
-                    "第 {index} 字节被翻转却成功导入（密钥相同 = {}）",
+                    "byte {index} was flipped but the import succeeded (same key = {})",
                     restored.expose() == master.expose()
                 ),
             }
@@ -585,9 +585,9 @@ mod tests {
     /// Input of the wrong length is rejected and never panics.
     #[test]
     fn wrong_length_is_rejected() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let phrase = passphrase("length test");
-        let file = export(&master, &phrase, &fast_params()).expect("导出");
+        let file = export(&master, &phrase, &fast_params()).expect("export");
 
         for cut in [0_usize, 1, FILE_LEN - 1] {
             assert!(
@@ -595,7 +595,7 @@ mod tests {
                     import(&file[..cut], &phrase),
                     Err(Error::RecoveryFileMalformed { .. })
                 ),
-                "长度 {cut} 应被拒绝"
+                "length {cut} must be rejected"
             );
         }
         let mut longer = file.clone();
@@ -610,9 +610,9 @@ mod tests {
     /// passphrase"; the two mean completely different things to the user.
     #[test]
     fn wrong_magic_is_reported_as_malformed_not_wrong_passphrase() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let phrase = passphrase("magic test");
-        let mut file = export(&master, &phrase, &fast_params()).expect("导出");
+        let mut file = export(&master, &phrase, &fast_params()).expect("export");
         file[0] = b'X';
 
         assert!(matches!(
@@ -625,23 +625,26 @@ mod tests {
     /// this version's layout.
     #[test]
     fn unknown_version_is_rejected() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let phrase = passphrase("version test");
-        let mut file = export(&master, &phrase, &fast_params()).expect("导出");
+        let mut file = export(&master, &phrase, &fast_params()).expect("export");
         file[offset::VERSION] = 0x7F;
 
         match import(&file, &phrase) {
             Err(Error::UnsupportedFormatVersion { version }) => assert_eq!(version, 0x7F),
-            other => panic!("应报版本不支持，实际 is_ok={}", other.is_ok()),
+            other => panic!(
+                "an unsupported version should be reported, got is_ok={}",
+                other.is_ok()
+            ),
         }
     }
 
     /// An unknown algorithm identifier is rejected as well.
     #[test]
     fn unknown_algorithm_is_rejected() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let phrase = passphrase("algorithm test");
-        let mut file = export(&master, &phrase, &fast_params()).expect("导出");
+        let mut file = export(&master, &phrase, &fast_params()).expect("export");
         file[offset::ALGORITHM] = 0x7F;
         assert!(import(&file, &phrase).is_err());
     }
@@ -653,9 +656,9 @@ mod tests {
     /// denial of service that drags the whole machine down.
     #[test]
     fn absurd_memory_cost_is_rejected_without_allocating() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let phrase = passphrase("memory bomb");
-        let file = export(&master, &phrase, &fast_params()).expect("导出");
+        let file = export(&master, &phrase, &fast_params()).expect("export");
 
         for memory in [0_u32, 1, Params::MIN_M_COST - 1] {
             assert!(
@@ -663,7 +666,7 @@ mod tests {
                     import_with_memory(&file, &phrase, memory),
                     Err(Error::RecoveryParametersInvalid { .. })
                 ),
-                "内存参数 {memory} 应报「参数非法」"
+                "memory parameter {memory} must report invalid parameters"
             );
         }
         for memory in [MAX_MEMORY_KIB + 1, u32::MAX, u32::MAX / 2] {
@@ -672,16 +675,16 @@ mod tests {
                     import_with_memory(&file, &phrase, memory),
                     Err(Error::RecoveryParametersInvalid { .. })
                 ),
-                "内存参数 {memory} 应报「参数非法」，而不是真的去分配"
+                "memory parameter {memory} must report invalid parameters instead of actually allocating"
             );
         }
         assert!(
             KdfParams::new(MAX_MEMORY_KIB, 1, 1).is_ok(),
-            "上限值本身应当合法"
+            "the limit itself should be valid"
         );
         assert!(
             KdfParams::new(MAX_MEMORY_KIB + 1, 1, 1).is_err(),
-            "超过上限应被拒绝"
+            "above the limit must be rejected"
         );
     }
 
@@ -698,9 +701,9 @@ mod tests {
     /// `u32::MAX` would still make an import never finish.
     #[test]
     fn absurd_iteration_count_is_rejected_without_running_forever() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let phrase = passphrase("iteration bomb");
-        let file = export(&master, &phrase, &fast_params()).expect("导出");
+        let file = export(&master, &phrase, &fast_params()).expect("export");
 
         for iterations in [MAX_ITERATIONS + 1, u32::MAX, u32::MAX / 2] {
             let mut tampered = file.clone();
@@ -711,12 +714,12 @@ mod tests {
                     import(&tampered, &phrase),
                     Err(Error::RecoveryParametersInvalid { .. })
                 ),
-                "迭代次数 {iterations} 应报「参数非法」"
+                "iteration count {iterations} must report invalid parameters"
             );
         }
         assert!(
             KdfParams::new(1024, MAX_ITERATIONS, 1).is_ok(),
-            "上限值本身应当合法"
+            "the limit itself should be valid"
         );
         assert!(KdfParams::new(1024, MAX_ITERATIONS + 1, 1).is_err());
     }
@@ -724,9 +727,9 @@ mod tests {
     /// An iteration count of 0 is rejected.
     #[test]
     fn zero_iterations_is_rejected() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let phrase = passphrase("iterations test");
-        let mut file = export(&master, &phrase, &fast_params()).expect("导出");
+        let mut file = export(&master, &phrase, &fast_params()).expect("export");
         file[offset::ITERATIONS..offset::ITERATIONS + 4].copy_from_slice(&0_u32.to_be_bytes());
 
         assert!(matches!(
@@ -738,8 +741,14 @@ mod tests {
     /// Any parallelism other than 1 is rejected.
     #[test]
     fn parallelism_other_than_one_is_rejected() {
-        assert!(KdfParams::new(1024, 1, 2).is_err(), "并行度 2 应被拒绝");
-        assert!(KdfParams::new(1024, 1, 0).is_err(), "并行度 0 应被拒绝");
+        assert!(
+            KdfParams::new(1024, 1, 2).is_err(),
+            "parallelism 2 must be rejected"
+        );
+        assert!(
+            KdfParams::new(1024, 1, 0).is_err(),
+            "parallelism 0 must be rejected"
+        );
         assert!(KdfParams::new(1024, 1, 1).is_ok());
     }
 
@@ -774,21 +783,24 @@ mod tests {
             .output_len(32)
             .data(AssociatedData::new(&[0x04_u8; 12]).expect("12 ≤ MAX_DATA_LEN"))
             .build()
-            .expect("RFC 向量参数合法");
+            .expect("the RFC vector parameters should be valid");
         let secret = [0x03_u8; 8];
         let context = Argon2::new_with_secret(&secret, Algorithm::Argon2id, Version::V0x13, params)
-            .expect("构造成功");
+            .expect("construction should succeed");
         let mut out = [0_u8; 32];
         context
             .hash_password_into(&[0x01_u8; 32], &[0x02_u8; 16], &mut out)
-            .expect("计算成功");
+            .expect("the computation should succeed");
 
         let expected: [u8; 32] = [
             0x0d, 0x64, 0x0d, 0xf5, 0x8d, 0x78, 0x76, 0x6c, 0x08, 0xc0, 0x37, 0xa3, 0x4a, 0x8b,
             0x53, 0xc9, 0xd0, 0x1e, 0xf0, 0x45, 0x2d, 0x75, 0xb6, 0x5e, 0xb5, 0x25, 0x20, 0xe9,
             0x6b, 0x01, 0xe6, 0x59,
         ];
-        assert_eq!(out, expected, "Argon2id 输出与 RFC 9106 §5.3 的向量不符");
+        assert_eq!(
+            out, expected,
+            "the Argon2id output does not match the RFC 9106 §5.3 vector"
+        );
     }
 
     /// This module's derivation is **deterministic** and input changes change the
@@ -803,23 +815,26 @@ mod tests {
         let salt = [0x11_u8; SALT_LEN];
         let params = fast_params();
 
-        let a = derive_key(&phrase, &salt, &params).expect("派生成功");
-        let b = derive_key(&phrase, &salt, &params).expect("派生成功");
-        assert_eq!(a, b, "同一个口令与 salt 必须派生出同一个密钥");
+        let a = derive_key(&phrase, &salt, &params).expect("derivation should succeed");
+        let b = derive_key(&phrase, &salt, &params).expect("derivation should succeed");
+        assert_eq!(
+            a, b,
+            "the same passphrase and salt must derive the same key"
+        );
 
         let mut other_salt = salt;
         other_salt[0] ^= 0x01;
         assert_ne!(
-            derive_key(&phrase, &other_salt, &params).expect("派生成功"),
+            derive_key(&phrase, &other_salt, &params).expect("derivation should succeed"),
             a,
-            "salt 改变却派生出同一个密钥"
+            "changing the salt derived the same key"
         );
 
-        let other_params = KdfParams::new(Params::MIN_M_COST * 2, 1, 1).expect("合法");
+        let other_params = KdfParams::new(Params::MIN_M_COST * 2, 1, 1).expect("valid");
         assert_ne!(
-            derive_key(&phrase, &salt, &other_params).expect("派生成功"),
+            derive_key(&phrase, &salt, &other_params).expect("derivation should succeed"),
             a,
-            "内存参数改变却派生出同一个密钥"
+            "changing the memory parameter derived the same key"
         );
 
         assert_eq!(a.len(), DERIVED_KEY_LEN);
@@ -833,13 +848,14 @@ mod tests {
     fn output_length_is_explicitly_requested() {
         let phrase = passphrase("output length");
         let salt = [0x22_u8; SALT_LEN];
-        let mut key = derive_key(&phrase, &salt, &fast_params()).expect("派生成功");
+        let mut key =
+            derive_key(&phrase, &salt, &fast_params()).expect("derivation should succeed");
 
-        let params = Params::new(Params::MIN_M_COST, 1, 1, Some(DERIVED_KEY_LEN)).expect("合法");
+        let params = Params::new(Params::MIN_M_COST, 1, 1, Some(DERIVED_KEY_LEN)).expect("valid");
         let mut expected = [0_u8; DERIVED_KEY_LEN];
         Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
             .hash_password_into(phrase.expose_secret().as_bytes(), &salt, &mut expected)
-            .expect("计算成功");
+            .expect("the computation should succeed");
 
         assert_eq!(key, expected);
         key.zeroize();
@@ -851,15 +867,15 @@ mod tests {
     /// compare ciphertexts to tell whether two devices use the same passphrase.
     #[test]
     fn same_passphrase_yields_different_files() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let phrase = passphrase("same passphrase");
-        let a = export(&master, &phrase, &fast_params()).expect("导出");
-        let b = export(&master, &phrase, &fast_params()).expect("导出");
+        let a = export(&master, &phrase, &fast_params()).expect("export");
+        let b = export(&master, &phrase, &fast_params()).expect("export");
 
-        assert_ne!(a, b, "salt 或 nonce 被复用");
+        assert_ne!(a, b, "the salt or nonce was reused");
         assert_eq!(
-            import(&a, &phrase).expect("a 可导入").expose(),
-            import(&b, &phrase).expect("b 可导入").expose()
+            import(&a, &phrase).expect("a should import").expose(),
+            import(&b, &phrase).expect("b should import").expose()
         );
     }
 
@@ -868,12 +884,12 @@ mod tests {
     /// decoration.
     #[test]
     fn file_never_contains_the_master_key_in_clear() {
-        let master = MasterKey::generate().expect("随机源可用");
-        let file = export(&master, &passphrase("cleartext test"), &fast_params()).expect("导出");
+        let master = MasterKey::generate().expect("randomness should be available");
+        let file = export(&master, &passphrase("cleartext test"), &fast_params()).expect("export");
 
         assert!(
             !file.windows(MASTER_KEY_LEN).any(|w| w == master.expose()),
-            "恢复文件里出现了主密钥明文"
+            "the recovery file contains the master key in clear"
         );
     }
 
@@ -882,12 +898,19 @@ mod tests {
     #[test]
     fn default_params_are_expensive() {
         let params = KdfParams::recommended();
-        assert_eq!(params.memory_kib(), 64 * 1024, "默认内存不是 64 MiB");
-        assert!(params.iterations() >= 3, "默认迭代次数过低");
+        assert_eq!(
+            params.memory_kib(),
+            64 * 1024,
+            "the default memory is not 64 MiB"
+        );
+        assert!(
+            params.iterations() >= 3,
+            "the default iteration count is too low"
+        );
         assert_eq!(params.parallelism(), 1);
         assert!(
             params.memory_kib() >= Params::DEFAULT_M_COST,
-            "默认内存低于 Argon2 自己的默认值"
+            "the default memory is below Argon2's own default"
         );
     }
 
@@ -895,10 +918,10 @@ mod tests {
     /// no parameters passed to the import.
     #[test]
     fn parameters_travel_with_the_file() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let phrase = passphrase("params travel");
-        let params = KdfParams::new(Params::MIN_M_COST * 4, 2, 1).expect("合法参数");
-        let file = export(&master, &phrase, &params).expect("导出");
+        let params = KdfParams::new(Params::MIN_M_COST * 4, 2, 1).expect("valid parameters");
+        let file = export(&master, &phrase, &params).expect("export");
 
         assert_eq!(
             u32::from_be_bytes(file[offset::MEMORY..offset::MEMORY + 4].try_into().unwrap()),
@@ -913,7 +936,7 @@ mod tests {
             params.iterations()
         );
         assert_eq!(
-            import(&file, &phrase).expect("导入").expose(),
+            import(&file, &phrase).expect("import").expose(),
             master.expose()
         );
     }
@@ -922,9 +945,10 @@ mod tests {
     /// `pairing`.
     #[test]
     fn master_key_storage_roundtrip() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let bytes = master_key_for_storage(&master);
-        let rebuilt = crate::pairing::master_key_from_storage(bytes).expect("长度正确");
+        let rebuilt =
+            crate::pairing::master_key_from_storage(bytes).expect("the length is correct");
         assert_eq!(master.expose(), rebuilt.expose());
     }
 
@@ -933,7 +957,10 @@ mod tests {
     /// deliberate and part of a version upgrade.
     #[test]
     fn file_layout_is_stable() {
-        assert_eq!(FILE_LEN, 110, "恢复文件长度变了，已导出的文件会失效");
+        assert_eq!(
+            FILE_LEN, 110,
+            "the recovery file length changed, which invalidates already-exported files"
+        );
         assert_eq!(offset::MAGIC, 0);
         assert_eq!(offset::VERSION, 8);
         assert_eq!(offset::ALGORITHM, 9);

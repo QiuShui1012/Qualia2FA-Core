@@ -891,7 +891,7 @@ mod tests {
                 seed[31] = scalar;
                 self.keys.insert(
                     label.to_owned(),
-                    SigningKey::from_slice(&seed).expect("测试用的标量必须合法"),
+                    SigningKey::from_slice(&seed).expect("the test scalar must be valid"),
                 );
                 self.creates += 1;
             }
@@ -920,20 +920,22 @@ mod tests {
 
     impl SecureStore for FakeStore {
         fn load_master_key(&self) -> Result<Option<MasterKey>> {
-            Ok(self
-                .master
-                .as_ref()
-                .map(|k| MasterKey::from_bytes(master_key_to_bytes(k)).expect("长度由构造保证")))
+            Ok(self.master.as_ref().map(|k| {
+                MasterKey::from_bytes(master_key_to_bytes(k))
+                    .expect("the length is guaranteed by construction")
+            }))
         }
 
         fn store_master_key(&mut self, key: &MasterKey) -> Result<()> {
             if self.fail_store {
                 return Err(Error::SecureStoreWriteFailed {
-                    reason: "测试注入的失败",
+                    reason: "failure injected by the test",
                 });
             }
-            self.master =
-                Some(MasterKey::from_bytes(master_key_to_bytes(key)).expect("长度由构造保证"));
+            self.master = Some(
+                MasterKey::from_bytes(master_key_to_bytes(key))
+                    .expect("the length is guaranteed by construction"),
+            );
             Ok(())
         }
 
@@ -953,7 +955,8 @@ mod tests {
     fn registered() -> (FakeKeys, FakeStore, Registered) {
         let mut keys = FakeKeys::new();
         let mut store = FakeStore::default();
-        let result = registration(&mut keys, &mut store, LABEL).expect("注册应当成功");
+        let result =
+            registration(&mut keys, &mut store, LABEL).expect("registration should succeed");
         (keys, store, result)
     }
 
@@ -962,15 +965,22 @@ mod tests {
     #[test]
     fn registration_produces_a_usable_device() {
         let (keys, store, result) = registered();
-        assert!(store.master.is_some(), "主密钥必须已经写入平台存储");
+        assert!(
+            store.master.is_some(),
+            "the master key must be in the platform store"
+        );
         assert!(
             keys.keys.contains_key(LABEL),
-            "设备身份必须已经创建并可由同一个 label 取回"
+            "the device identity must have been created and be retrievable by the same label"
         );
         assert!(!result.is_hardware_backed());
 
-        let data = result.vault.serialize().expect("序列化应当成功");
-        let opened = open_vault(&store, &data).expect("用存住的主密钥应当能打开保险库");
+        let data = result
+            .vault
+            .serialize()
+            .expect("serialization should succeed");
+        let opened =
+            open_vault(&store, &data).expect("the stored master key should open the vault");
         assert!(opened.vault().is_empty());
         assert_eq!(
             opened.master_key().expose(),
@@ -996,10 +1006,14 @@ mod tests {
     #[test]
     fn device_identity_is_stable_across_calls() {
         let mut keys = FakeKeys::new();
-        let first = keys.get_or_create(LABEL).expect("首次创建应当成功");
-        let second = keys.get_or_create(LABEL).expect("再次取得应当成功");
+        let first = keys
+            .get_or_create(LABEL)
+            .expect("the first creation should succeed");
+        let second = keys
+            .get_or_create(LABEL)
+            .expect("the second retrieval should succeed");
         assert_eq!(first.as_sec1_bytes(), second.as_sec1_bytes());
-        assert_eq!(keys.creates, 1, "不得重复创建");
+        assert_eq!(keys.creates, 1, "must not create a second identity");
     }
 
     /// A failed master key write creates **no** vault.
@@ -1013,10 +1027,10 @@ mod tests {
             fail_store: true,
             ..FakeStore::default()
         };
-        let error = registration(&mut keys, &mut store, LABEL).expect_err("应当失败");
+        let error = registration(&mut keys, &mut store, LABEL).expect_err("should fail");
         assert!(
             matches!(error, Error::SecureStoreWriteFailed { .. }),
-            "错误应当是写入失败，实际是 {error:?}"
+            "the error should be a write failure, got {error:?}"
         );
         assert!(store.master.is_none());
     }
@@ -1031,12 +1045,12 @@ mod tests {
     fn opening_without_a_stored_key_reports_not_registered() {
         let store = FakeStore::default();
         let (_k, _s, result) = registered();
-        let data = result.vault.serialize().expect("序列化应当成功");
-        let error = open_vault(&store, &data).expect_err("没有主密钥时必须失败");
-        assert!(
-            matches!(error, Error::DeviceNotRegistered),
-            "实际是 {error:?}"
-        );
+        let data = result
+            .vault
+            .serialize()
+            .expect("serialization should succeed");
+        let error = open_vault(&store, &data).expect_err("must fail without a stored master key");
+        assert!(matches!(error, Error::DeviceNotRegistered), "got {error:?}");
     }
 
     /// **An empty vault also detects a wrong master key.**
@@ -1052,21 +1066,25 @@ mod tests {
         let (_k, _s, result) = registered();
         assert!(
             result.vault.vault().is_empty(),
-            "前提：这个保险库确实是空的"
+            "precondition: this vault really is empty"
         );
-        let data = result.vault.serialize().expect("序列化应当成功");
+        let data = result
+            .vault
+            .serialize()
+            .expect("serialization should succeed");
 
         let (_k2, store, device2) = registered();
         assert_ne!(
             device2.vault().master_key().expose(),
             result.vault.master_key().expose(),
-            "两台设备的主密钥必须不同，否则这个测试没有意义"
+            "the two devices must have different master keys, or this test proves nothing"
         );
 
-        let error = open_vault(&store, &data).expect_err("空保险库用错误的密钥必须被拒");
+        let error =
+            open_vault(&store, &data).expect_err("an empty vault must reject the wrong key");
         assert!(
             matches!(error, Error::VaultDecryptionFailed),
-            "实际是 {error:?}"
+            "got {error:?}"
         );
     }
 
@@ -1083,21 +1101,25 @@ mod tests {
 
         let (_k, _s, mut result) = registered();
         let parsed = uri::parse("otpauth://totp/ACME:alice?secret=JBSWY3DPEHPK3PXP&issuer=ACME")
-            .expect("URI 应当合法");
+            .expect("the URI should be valid");
         const NOW: Timestamp = 1_700_000_000;
-        let entry = entry_from_parsed_uri(&parsed, NOW).expect("条目应当能构造");
+        let entry = entry_from_parsed_uri(&parsed, NOW).expect("the entry should be built");
         result
             .vault_mut()
             .vault_mut()
             .insert(entry)
-            .expect("插入应当成功");
-        let data = result.vault.serialize().expect("序列化应当成功");
+            .expect("the insert should succeed");
+        let data = result
+            .vault
+            .serialize()
+            .expect("serialization should succeed");
 
         let (_k2, store, _device2) = registered();
-        let error = open_vault(&store, &data).expect_err("有内容时错误的主密钥必须被拒绝");
+        let error =
+            open_vault(&store, &data).expect_err("a vault with entries must reject the wrong key");
         assert!(
             matches!(error, Error::VaultDecryptionFailed),
-            "实际是 {error:?}"
+            "got {error:?}"
         );
     }
 
@@ -1113,24 +1135,29 @@ mod tests {
         let (_old_keys, _old_store, account) = registered();
         let master = account.vault.master_key();
 
-        let mut login = Login::new().expect("应当能开始登录");
+        let mut login = Login::new().expect("the login should start");
         let payload = login.payload().clone();
         let mut keys = FakeKeys::new();
-        let mut joiner = Joiner::new(&payload, "new-device").expect("应当能开始扫码");
-        let request = joiner.request(&mut keys).expect("应当能发出请求");
-        let reply = login.authorize(&request, master).expect("应当能授权");
+        let mut joiner =
+            Joiner::new(&payload, "new-device").expect("the joiner session should start");
+        let request = joiner
+            .request(&mut keys)
+            .expect("the request should be produced");
+        let reply = login
+            .authorize(&request, master)
+            .expect("authorization should succeed");
 
         let mut store = FakeStore::default();
         joiner
             .complete(&reply, &mut keys, &mut store)
-            .expect("第一次应当成功");
+            .expect("the first call should succeed");
 
         let error = joiner
             .complete(&reply, &mut keys, &mut store)
-            .expect_err("第二次必须失败");
+            .expect_err("the second call must fail");
         assert!(
             matches!(error, Error::PairingAuthenticationFailed),
-            "必须与伪造应答报同一个错误，实际是 {error:?}"
+            "must report the same error as a forged reply, got {error:?}"
         );
 
         assert!(joiner.identity().is_none());
@@ -1144,35 +1171,42 @@ mod tests {
         let (_old_keys, old_store, account) = registered();
         let master = account.vault.master_key();
 
-        let mut login = Login::new().expect("应当能开始登录");
+        let mut login = Login::new().expect("the login should start");
         let payload = login.payload().clone();
 
         let mut joiner_keys = FakeKeys::new();
-        let mut joiner = Joiner::new(&payload, "new-device").expect("应当能开始扫码");
-        let request = joiner.request(&mut joiner_keys).expect("应当能发出请求");
+        let mut joiner =
+            Joiner::new(&payload, "new-device").expect("the joiner session should start");
+        let request = joiner
+            .request(&mut joiner_keys)
+            .expect("the request should be produced");
 
         let reply = login
             .authorize(&request, master)
-            .expect("应当能授权")
+            .expect("authorization should succeed")
             .to_vec();
 
         let mut joiner_store = FakeStore::default();
         let received = joiner
             .complete(&reply, &mut joiner_keys, &mut joiner_store)
-            .expect("应当能完成登录");
+            .expect("the login should complete");
 
         assert_eq!(
             received.expose(),
             master.expose(),
-            "新设备拿到的主密钥必须与老设备完全一致"
+            "the new device's master key must equal the old device's"
         );
         assert!(
             joiner_store.master.is_some(),
-            "主密钥必须已经写入新设备的平台存储"
+            "the master key must be in the new device's platform store"
         );
 
-        let data = account.vault.serialize().expect("序列化应当成功");
-        let opened = open_vault(&joiner_store, &data).expect("新设备应当能打开老设备的保险库");
+        let data = account
+            .vault
+            .serialize()
+            .expect("serialization should succeed");
+        let opened = open_vault(&joiner_store, &data)
+            .expect("the new device should open the old device's vault");
         assert_eq!(
             opened.master_key().expose(),
             old_store.master.as_ref().unwrap().expose()
@@ -1184,24 +1218,37 @@ mod tests {
     #[test]
     fn login_reports_the_session_for_persistence() {
         let (_k, _s, account) = registered();
-        let mut login = Login::new().expect("应当能开始登录");
-        assert!(login.session_id().is_none(), "授权前没有会话标识");
+        let mut login = Login::new().expect("the login should start");
+        assert!(
+            login.session_id().is_none(),
+            "no session identifier before authorization"
+        );
         assert!(login.joiner_device().is_none());
 
         let payload = login.payload().clone();
         let mut keys = FakeKeys::new();
-        let mut joiner = Joiner::new(&payload, "new-device").expect("应当能开始扫码");
-        let request = joiner.request(&mut keys).expect("应当能发出请求");
+        let mut joiner =
+            Joiner::new(&payload, "new-device").expect("the joiner session should start");
+        let request = joiner
+            .request(&mut keys)
+            .expect("the request should be produced");
         let _reply = login
             .authorize(&request, account.vault.master_key())
-            .expect("应当能授权");
+            .expect("authorization should succeed");
 
-        let session_id = login.session_id().expect("授权后应当有会话标识");
+        let session_id = login
+            .session_id()
+            .expect("a session identifier should exist after authorization");
         assert_eq!(
             session_id,
-            joiner.session_id().expect("双方必须得出同一个标识")
+            joiner
+                .session_id()
+                .expect("both sides must derive the same identifier")
         );
-        assert!(login.joiner_device().is_some(), "应当能拿到对方的身份");
+        assert!(
+            login.joiner_device().is_some(),
+            "the peer identity should be available"
+        );
         assert_eq!(login.used_sessions().len(), 1);
     }
 
@@ -1209,23 +1256,28 @@ mod tests {
     #[test]
     fn the_same_request_cannot_be_authorized_twice() {
         let (_k, _s, account) = registered();
-        let mut login = Login::new().expect("应当能开始登录");
+        let mut login = Login::new().expect("the login should start");
         let payload = login.payload().clone();
         let mut keys = FakeKeys::new();
-        let mut joiner = Joiner::new(&payload, "new-device").expect("应当能开始扫码");
-        let request = joiner.request(&mut keys).expect("应当能发出请求");
+        let mut joiner =
+            Joiner::new(&payload, "new-device").expect("the joiner session should start");
+        let request = joiner
+            .request(&mut keys)
+            .expect("the request should be produced");
         let master = account.vault.master_key();
 
-        login.authorize(&request, master).expect("第一次应当成功");
+        login
+            .authorize(&request, master)
+            .expect("the first call should succeed");
         let error = login
             .authorize(&request, master)
-            .expect_err("第二次必须失败");
+            .expect_err("the second call must fail");
         assert!(
             matches!(
                 error,
                 Error::PairingAuthenticationFailed | Error::AuthMessageMalformed { .. }
             ),
-            "实际是 {error:?}"
+            "got {error:?}"
         );
     }
 
@@ -1243,22 +1295,28 @@ mod tests {
     #[test]
     fn a_request_from_another_login_is_rejected() {
         let (_k, _s, account) = registered();
-        let first = Login::new().expect("应当能开始登录");
+        let first = Login::new().expect("the login should start");
         let payload_from_first = first.payload().clone();
 
-        let mut second = Login::new().expect("应当能开始登录");
+        let mut second = Login::new().expect("the login should start");
         let mut keys = FakeKeys::new();
-        let mut joiner = Joiner::new(&payload_from_first, "new-device").expect("应当能开始扫码");
-        let request = joiner.request(&mut keys).expect("应当能发出请求");
+        let mut joiner = Joiner::new(&payload_from_first, "new-device")
+            .expect("the joiner session should start");
+        let request = joiner
+            .request(&mut keys)
+            .expect("the request should be produced");
 
         let error = second
             .authorize(&request, account.vault.master_key())
-            .expect_err("另一台设备的载荷产生的请求不应被接受");
+            .expect_err("a request from another device's payload must not be accepted");
         assert!(
             matches!(error, Error::PairingAuthenticationFailed),
-            "实际是 {error:?}"
+            "got {error:?}"
         );
-        assert!(second.session_id().is_none(), "失败不得留下会话标识");
+        assert!(
+            second.session_id().is_none(),
+            "a failure must leave no session identifier"
+        );
     }
 
     /// A reply encrypted for **another session** cannot be opened by the joiner.
@@ -1271,58 +1329,70 @@ mod tests {
         let (_k, _s, account) = registered();
         let mut keys = FakeKeys::new();
 
-        let mut login_a = Login::new().expect("应当能开始登录");
+        let mut login_a = Login::new().expect("the login should start");
         let payload_a = login_a.payload().clone();
-        let mut joiner_a = Joiner::new(&payload_a, "new-device").expect("应当能开始扫码");
-        let request_a = joiner_a.request(&mut keys).expect("应当能发出请求");
+        let mut joiner_a =
+            Joiner::new(&payload_a, "new-device").expect("the joiner session should start");
+        let request_a = joiner_a
+            .request(&mut keys)
+            .expect("the request should be produced");
         login_a
             .authorize(&request_a, account.vault.master_key())
-            .expect("会话 A 应当能授权");
+            .expect("session A should authorize");
 
-        let mut login_b = Login::new().expect("应当能开始登录");
+        let mut login_b = Login::new().expect("the login should start");
         let payload_b = login_b.payload().clone();
-        let mut joiner_b = Joiner::new(&payload_b, "new-device").expect("应当能开始扫码");
-        let request_b = joiner_b.request(&mut keys).expect("应当能发出请求");
+        let mut joiner_b =
+            Joiner::new(&payload_b, "new-device").expect("the joiner session should start");
+        let request_b = joiner_b
+            .request(&mut keys)
+            .expect("the request should be produced");
         let reply_b = login_b
             .authorize(&request_b, account.vault.master_key())
-            .expect("应当能授权");
+            .expect("authorization should succeed");
 
         let mut store = FakeStore::default();
         let error = joiner_a
             .complete(&reply_b, &mut keys, &mut store)
-            .expect_err("来自另一次会话的回复不应被接受");
+            .expect_err("a reply from another session must not be accepted");
         assert!(
             matches!(error, Error::PairingAuthenticationFailed),
-            "实际是 {error:?}"
+            "got {error:?}"
         );
-        assert!(store.master.is_none(), "失败不得留下主密钥");
+        assert!(store.master.is_none(), "a failure must leave no master key");
     }
 
     /// A tampered reply from the old device is rejected.
     #[test]
     fn tampering_with_the_reply_is_detected() {
         let (_k, _s, account) = registered();
-        let mut login = Login::new().expect("应当能开始登录");
+        let mut login = Login::new().expect("the login should start");
         let payload = login.payload().clone();
         let mut keys = FakeKeys::new();
-        let mut joiner = Joiner::new(&payload, "new-device").expect("应当能开始扫码");
-        let request = joiner.request(&mut keys).expect("应当能发出请求");
+        let mut joiner =
+            Joiner::new(&payload, "new-device").expect("the joiner session should start");
+        let request = joiner
+            .request(&mut keys)
+            .expect("the request should be produced");
         let reply = login
             .authorize(&request, account.vault.master_key())
-            .expect("应当能授权")
+            .expect("authorization should succeed")
             .to_vec();
 
         for index in 0..reply.len() {
-            let mut joiner = Joiner::new(&payload, "new-device").expect("应当能开始扫码");
-            let _ = joiner.request(&mut keys).expect("应当能发出请求");
+            let mut joiner =
+                Joiner::new(&payload, "new-device").expect("the joiner session should start");
+            let _ = joiner
+                .request(&mut keys)
+                .expect("the request should be produced");
             let mut tampered = reply.clone();
             tampered[index] ^= 0x01;
             let mut store = FakeStore::default();
             assert!(
                 joiner.complete(&tampered, &mut keys, &mut store).is_err(),
-                "翻转第 {index} 字节后仍被接受"
+                "byte {index} was flipped, yet still accepted"
             );
-            assert!(store.master.is_none(), "失败不得留下主密钥");
+            assert!(store.master.is_none(), "a failure must leave no master key");
         }
     }
 
@@ -1330,14 +1400,22 @@ mod tests {
     /// signing again.
     #[test]
     fn requesting_twice_returns_the_same_message() {
-        let login = Login::new().expect("应当能开始登录");
+        let login = Login::new().expect("the login should start");
         let payload = login.payload().clone();
         let mut keys = FakeKeys::new();
-        let mut joiner = Joiner::new(&payload, "new-device").expect("应当能开始扫码");
-        let first = joiner.request(&mut keys).expect("应当能发出请求");
-        let second = joiner.request(&mut keys).expect("应当能发出请求");
+        let mut joiner =
+            Joiner::new(&payload, "new-device").expect("the joiner session should start");
+        let first = joiner
+            .request(&mut keys)
+            .expect("the request should be produced");
+        let second = joiner
+            .request(&mut keys)
+            .expect("the request should be produced");
         assert_eq!(first, second);
-        assert_eq!(keys.creates, 1, "不得为第二次请求创建新身份");
+        assert_eq!(
+            keys.creates, 1,
+            "the second request must not create a new identity"
+        );
     }
 
     /// Recovery round trip: export, import, and write to storage, with the master key
@@ -1346,45 +1424,53 @@ mod tests {
     fn recovery_roundtrip_restores_the_master_key() {
         let (_k, mut store, account) = registered();
         let master = account.vault.master_key();
-        let params = KdfParams::new(8, 1, 1).expect("最低参数应当合法");
+        let params = KdfParams::new(8, 1, 1).expect("the minimum parameters should be valid");
         let passphrase = SecretString::from("correct horse battery staple");
 
-        let file = export_recovery_key(master, &passphrase, Some(params)).expect("导出应当成功");
-        let restored = import_recovery_key(&file, &passphrase, &mut store).expect("导入应当成功");
+        let file =
+            export_recovery_key(master, &passphrase, Some(params)).expect("export should succeed");
+        let restored =
+            import_recovery_key(&file, &passphrase, &mut store).expect("import should succeed");
 
         assert_eq!(restored.expose(), master.expose());
-        let data = account.vault.serialize().expect("序列化应当成功");
-        open_vault(&store, &data).expect("恢复后应当能打开保险库");
+        let data = account
+            .vault
+            .serialize()
+            .expect("serialization should succeed");
+        open_vault(&store, &data).expect("the vault should open after recovery");
     }
 
     /// A wrong passphrase writes no master key at all.
     #[test]
     fn recovery_with_a_wrong_passphrase_leaves_storage_untouched() {
         let mut store = FakeStore::default();
-        let master = MasterKey::generate().expect("随机源可用");
-        let params = KdfParams::new(8, 1, 1).expect("最低参数应当合法");
+        let master = MasterKey::generate().expect("randomness should be available");
+        let params = KdfParams::new(8, 1, 1).expect("the minimum parameters should be valid");
         let file = export_recovery_key(&master, &SecretString::from("right"), Some(params))
-            .expect("导出应当成功");
+            .expect("export should succeed");
 
         let error = import_recovery_key(&file, &SecretString::from("wrong"), &mut store)
-            .expect_err("口令错误时必须失败");
+            .expect_err("must fail with the wrong passphrase");
         assert!(
             matches!(error, Error::RecoveryAuthenticationFailed),
-            "实际是 {error:?}"
+            "got {error:?}"
         );
-        assert!(store.master.is_none(), "失败不得写入主密钥");
+        assert!(
+            store.master.is_none(),
+            "a failure must not write a master key"
+        );
     }
 
     /// Export fails on an empty passphrase; otherwise the whole cost of Argon2id would
     /// be wasted.
     #[test]
     fn an_empty_passphrase_is_rejected() {
-        let master = MasterKey::generate().expect("随机源可用");
+        let master = MasterKey::generate().expect("randomness should be available");
         let error = export_recovery_key(&master, &SecretString::from(""), None)
-            .expect_err("空口令必须被拒绝");
+            .expect_err("an empty passphrase must be rejected");
         assert!(
             matches!(error, Error::RecoveryPassphraseEmpty),
-            "实际是 {error:?}"
+            "got {error:?}"
         );
     }
 
@@ -1393,7 +1479,7 @@ mod tests {
     fn hardware_backing_is_reported_truthfully() {
         let mut keys = FakeKeys::new();
         let mut soft = FakeStore::default();
-        let result = registration(&mut keys, &mut soft, LABEL).expect("应当成功");
+        let result = registration(&mut keys, &mut soft, LABEL).expect("should succeed");
         assert!(!result.is_hardware_backed());
 
         let mut keys = FakeKeys::new();
@@ -1401,7 +1487,7 @@ mod tests {
             hardware: true,
             ..FakeStore::default()
         };
-        let result = registration(&mut keys, &mut hard, LABEL).expect("应当成功");
+        let result = registration(&mut keys, &mut hard, LABEL).expect("should succeed");
         assert!(result.is_hardware_backed());
     }
 
@@ -1410,14 +1496,15 @@ mod tests {
     #[test]
     fn device_identity_comparison_works_both_ways() {
         let mut keys = FakeKeys::new();
-        let actual = keys.get_or_create(LABEL).expect("应当成功");
-        expect_device(&actual, actual.as_sec1_bytes()).expect("同一个身份应当通过");
+        let actual = keys.get_or_create(LABEL).expect("should succeed");
+        expect_device(&actual, actual.as_sec1_bytes()).expect("the same identity should pass");
 
-        let other = keys.get_or_create("other").expect("应当成功");
-        let error = expect_device(&other, actual.as_sec1_bytes()).expect_err("不同身份必须失败");
+        let other = keys.get_or_create("other").expect("should succeed");
+        let error = expect_device(&other, actual.as_sec1_bytes())
+            .expect_err("a different identity must fail");
         assert!(
             matches!(error, Error::DeviceIdentityMismatch),
-            "实际是 {error:?}"
+            "got {error:?}"
         );
     }
 
@@ -1426,11 +1513,11 @@ mod tests {
     #[test]
     fn signatures_verify_and_have_a_stable_length() {
         let mut keys = FakeKeys::new();
-        let public = keys.get_or_create(LABEL).expect("应当成功");
+        let public = keys.get_or_create(LABEL).expect("should succeed");
         let message = b"hello";
-        let signature = keys.sign(LABEL, message).expect("应当能签名");
+        let signature = keys.sign(LABEL, message).expect("signing should succeed");
         assert_eq!(signature.as_bytes().len(), SIGNATURE_LEN);
-        verify_device(&public, message, &signature).expect("应当验签通过");
+        verify_device(&public, message, &signature).expect("verification should pass");
         assert!(verify_device(&public, b"other", &signature).is_err());
     }
 
@@ -1438,15 +1525,15 @@ mod tests {
     #[test]
     fn signing_without_an_identity_fails_cleanly() {
         let mut keys = FakeKeys::new();
-        let error = keys.sign("missing", b"x").expect_err("应当失败");
-        assert!(matches!(error, Error::DeviceKeyMissing), "实际是 {error:?}");
+        let error = keys.sign("missing", b"x").expect_err("should fail");
+        assert!(matches!(error, Error::DeviceKeyMissing), "got {error:?}");
     }
 
     /// A timestamp of `0` is rejected: it usually means the caller forgot to pass one.
     #[test]
     fn a_zero_timestamp_is_rejected() {
         assert!(check_now(0).is_err());
-        assert_eq!(check_now(1).expect("非零应当通过"), 1);
+        assert_eq!(check_now(1).expect("a non-zero timestamp should pass"), 1);
     }
 
     /// The passphrase length can be queried, while the passphrase itself appears in no
@@ -1463,11 +1550,14 @@ mod tests {
     #[test]
     fn debug_output_is_redacted() {
         let (_k, _s, account) = registered();
-        let login = Login::new().expect("应当能开始登录");
+        let login = Login::new().expect("the login should start");
         let payload = login.payload().clone();
         let mut keys = FakeKeys::new();
-        let mut joiner = Joiner::new(&payload, "new-device").expect("应当能开始扫码");
-        let _ = joiner.request(&mut keys).expect("应当能发出请求");
+        let mut joiner =
+            Joiner::new(&payload, "new-device").expect("the joiner session should start");
+        let _ = joiner
+            .request(&mut keys)
+            .expect("the request should be produced");
 
         let texts: [(&str, String); 3] = [
             ("Login", format!("{login:?}")),
@@ -1476,7 +1566,7 @@ mod tests {
         ];
         let secrets: [(&str, String); 2] = [
             (
-                "主密钥十六进制",
+                "master key hex",
                 account
                     .vault
                     .master_key()
@@ -1489,7 +1579,7 @@ mod tests {
                     }),
             ),
             (
-                "主密钥十进制",
+                "master key decimal",
                 account
                     .vault
                     .master_key()
@@ -1504,7 +1594,7 @@ mod tests {
             for (secret_name, secret) in &secrets {
                 assert!(
                     !text.contains(secret.as_str()),
-                    "{name} 的 Debug 输出里出现了{secret_name}：{text}"
+                    "{name} Debug output contains the {secret_name}: {text}"
                 );
             }
         }
@@ -1513,13 +1603,16 @@ mod tests {
     /// The empty-vault helper produces a valid, openable file.
     #[test]
     fn an_empty_vault_is_openable() {
-        let master = MasterKey::generate().expect("随机源可用");
-        let vault =
-            empty_vault(MasterKey::from_bytes(master_key_to_bytes(&master)).expect("长度正确"));
-        let data = vault.serialize().expect("序列化应当成功");
+        let master = MasterKey::generate().expect("randomness should be available");
+        let vault = empty_vault(
+            MasterKey::from_bytes(master_key_to_bytes(&master)).expect("the length is correct"),
+        );
+        let data = vault.serialize().expect("serialization should succeed");
         let mut store = FakeStore::default();
-        store.store_master_key(&master).expect("写入应当成功");
-        let opened = open_vault(&store, &data).expect("应当能打开");
+        store
+            .store_master_key(&master)
+            .expect("the write should succeed");
+        let opened = open_vault(&store, &data).expect("the vault should open");
         assert!(opened.vault().is_empty());
     }
 
@@ -1532,8 +1625,8 @@ mod tests {
             let dynamic: &mut dyn DeviceKeys = borrowed;
             dynamic.get_or_create(LABEL)
         }
-        .expect("应当成功");
-        let direct = keys.get_or_create(LABEL).expect("应当成功");
+        .expect("should succeed");
+        let direct = keys.get_or_create(LABEL).expect("should succeed");
         assert_eq!(via_ref.as_sec1_bytes(), direct.as_sec1_bytes());
         assert_eq!(keys.creates, 1);
     }

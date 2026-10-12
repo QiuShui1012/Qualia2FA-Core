@@ -538,7 +538,7 @@ impl Payload {
         let mut plaintext = Vec::new();
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "已在上面与 MAX_RECORDS 比较过，它远小于 u32::MAX"
+            reason = "already compared against MAX_RECORDS above, which is far below u32::MAX"
         )]
         let count = self.records.len() as u32;
         plaintext.extend_from_slice(&count.to_be_bytes());
@@ -546,7 +546,7 @@ impl Payload {
             plaintext.extend_from_slice(record.entry_id.as_bytes());
             plaintext.extend_from_slice(&record.nonce);
             let len = u32::try_from(record.ciphertext.len()).map_err(|_| Error::SyncMalformed {
-                reason: "单条记录的密文超过 4 GiB",
+                reason: "a single record ciphertext exceeds 4 GiB",
             })?;
             plaintext.extend_from_slice(&len.to_be_bytes());
             plaintext.extend_from_slice(&record.ciphertext);
@@ -554,7 +554,7 @@ impl Payload {
 
         if plaintext.len() > MAX_PLAINTEXT_LEN {
             return Err(Error::SyncMalformed {
-                reason: "载荷明文超过上限",
+                reason: "the payload plaintext exceeds the limit",
             });
         }
 
@@ -657,7 +657,7 @@ impl Payload {
             let len = reader.u32_bare().ok_or(Error::SyncTruncated)? as usize;
             if len < TAG_LEN {
                 return Err(Error::SyncMalformed {
-                    reason: "记录密文短于认证标签",
+                    reason: "the record ciphertext is shorter than the authentication tag",
                 });
             }
             let ciphertext = reader.take(len).ok_or(Error::SyncTruncated)?.to_vec();
@@ -667,14 +667,14 @@ impl Payload {
                 ciphertext,
             }) {
                 return Err(Error::SyncMalformed {
-                    reason: "载荷里同一个条目出现了两条记录",
+                    reason: "the payload holds two records for the same entry",
                 });
             }
         }
 
         if !reader.is_empty() {
             return Err(Error::SyncMalformed {
-                reason: "载荷明文含超出声明记录数的内容",
+                reason: "the payload plaintext holds content beyond the declared record count",
             });
         }
 
@@ -894,7 +894,7 @@ mod tests {
             format!("服务 {seed}"),
             Some("组织".into()),
             format!("user{seed}@example.com"),
-            OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("合法 Base32"),
+            OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("valid Base32"),
             Algorithm::Sha1,
             Digits::Six,
             30,
@@ -903,7 +903,7 @@ mod tests {
             Timestamp::from(1_700_000_000_u64),
             Timestamp::from(1_700_000_000_u64),
         )
-        .expect("字段合法")
+        .expect("valid fields")
     }
 
     /// Build one device identifier. The sync "sender" is a [`DeviceId`], not a 16-byte
@@ -913,7 +913,7 @@ mod tests {
     }
 
     fn a_master_key() -> MasterKey {
-        MasterKey::generate().expect("OS 随机源可用")
+        MasterKey::generate().expect("OS randomness available")
     }
 
     /// Open a payload record by record, yielding `(identifier, is_live_entry)` per record.
@@ -926,7 +926,7 @@ mod tests {
     fn opened_kinds(payload: &Payload, master: &MasterKey) -> Vec<(EntryId, bool)> {
         payload
             .open_records(master)
-            .expect("逐条解密")
+            .expect("opening record by record")
             .into_iter()
             .map(|record| match record {
                 OpenedRecord::Entry { id, .. } => (id, true),
@@ -944,45 +944,45 @@ mod tests {
     /// alongside `Payload::open`: what it checks is the layout, not internal consistency.
     fn plaintext_of(sealed: &[u8], master: &MasterKey) -> Vec<u8> {
         let mut reader = Reader::new(sealed);
-        assert_eq!(reader.take(MAGIC.len()), Some(&MAGIC[..]), "魔数");
-        let version = reader.u8_bare().expect("版本");
-        assert_eq!(version, FORMAT_VERSION, "版本");
-        let kind = PayloadKind::from_byte(reader.u8_bare().expect("种类")).expect("种类合法");
+        assert_eq!(reader.take(MAGIC.len()), Some(&MAGIC[..]), "magic");
+        let version = reader.u8_bare().expect("version");
+        assert_eq!(version, FORMAT_VERSION, "version");
+        let kind = PayloadKind::from_byte(reader.u8_bare().expect("kind")).expect("valid kind");
         let sync_id = reader.take(SYNC_ID_LEN).expect("sync_id");
-        let sender = reader.take(DEVICE_ID_LEN).expect("发送方");
+        let sender = reader.take(DEVICE_ID_LEN).expect("sender");
         let nonce = reader.take(NONCE_LEN).expect("nonce");
         let ciphertext = reader.rest();
-        assert!(reader.is_empty(), "密文之后还有多余字节");
+        assert!(reader.is_empty(), "extra bytes follow the ciphertext");
 
-        let sync_id = <[u8; SYNC_ID_LEN]>::try_from(sync_id).expect("长度正确");
-        let sender = DeviceId::from_bytes(<[u8; DEVICE_ID_LEN]>::try_from(sender).expect("长度"));
-        let nonce = <[u8; NONCE_LEN]>::try_from(nonce).expect("长度正确");
+        let sync_id = <[u8; SYNC_ID_LEN]>::try_from(sync_id).expect("correct length");
+        let sender = DeviceId::from_bytes(<[u8; DEVICE_ID_LEN]>::try_from(sender).expect("length"));
+        let nonce = <[u8; NONCE_LEN]>::try_from(nonce).expect("correct length");
 
         let aad = header_aad(version, kind, &sync_id, &sender);
-        let envelope_key = derive_envelope_key(master).expect("可派生");
+        let envelope_key = derive_envelope_key(master).expect("derivation succeeds");
         let compressed = crate::vault::crypto::open_bytes(&envelope_key, &aad, &nonce, ciphertext)
-            .expect("外层应当解得开");
-        compress::decompress(&compressed).expect("应当解得开")
+            .expect("the outer layer must open");
+        compress::decompress(&compressed).expect("must decompress")
     }
 
     /// Read the record segment of the plaintext as bytes, yielding
     /// `(entry_id, nonce, ciphertext length)` per record.
     fn parse_record_frames(plaintext: &[u8]) -> Vec<([u8; EntryId::LEN], [u8; NONCE_LEN], usize)> {
         let mut reader = Reader::new(plaintext);
-        let count = reader.u32_bare().expect("记录数") as usize;
+        let count = reader.u32_bare().expect("record count") as usize;
         let mut frames = Vec::with_capacity(count);
         for _ in 0..count {
-            let id = reader.take(EntryId::LEN).expect("标识");
+            let id = reader.take(EntryId::LEN).expect("identifier");
             let nonce = reader.take(NONCE_LEN).expect("nonce");
-            let len = reader.u32_bare().expect("长度") as usize;
-            reader.take(len).expect("密文");
+            let len = reader.u32_bare().expect("length") as usize;
+            reader.take(len).expect("ciphertext");
             frames.push((
-                <[u8; EntryId::LEN]>::try_from(id).expect("长度"),
-                <[u8; NONCE_LEN]>::try_from(nonce).expect("长度"),
+                <[u8; EntryId::LEN]>::try_from(id).expect("length"),
+                <[u8; NONCE_LEN]>::try_from(nonce).expect("length"),
                 len,
             ));
         }
-        assert!(reader.is_empty(), "记录段之后还有多余字节");
+        assert!(reader.is_empty(), "extra bytes follow the record section");
         frames
     }
 
@@ -998,40 +998,49 @@ mod tests {
 
         let mut vault = Vault::new();
         for seed in 0..3_u8 {
-            vault.insert(sample_entry(seed)).expect("随机源可用");
+            vault
+                .insert(sample_entry(seed))
+                .expect("randomness available");
         }
-        let doomed = vault.insert(sample_entry(9)).expect("随机源可用");
+        let doomed = vault.insert(sample_entry(9)).expect("randomness available");
         vault.remove(&doomed, Timestamp::from(1_700_000_100_u64));
 
-        let payload = Payload::from_vault(&master, sender, &vault).expect("打包");
-        let sealed = payload.seal(&master).expect("封装");
+        let payload = Payload::from_vault(&master, sender, &vault).expect("packing succeeds");
+        let sealed = payload.seal(&master).expect("sealing succeeds");
 
         let plaintext = plaintext_of(&sealed, &master);
         let frames = parse_record_frames(&plaintext);
 
-        assert_eq!(frames.len(), payload.len(), "记录数不一致");
+        assert_eq!(frames.len(), payload.len(), "record count mismatch");
         assert_eq!(
             frames.len(),
             vault.len() + vault.tombstone_count(),
-            "载荷里的记录数应当等于条目数加墓碑数"
+            "the record count in the payload must equal entries plus tombstones"
         );
 
         for (id_bytes, nonce, len) in &frames {
             let id = EntryId::from_bytes(*id_bytes);
-            let record = payload.records.get(&id).expect("载荷里应当有这条记录");
-            assert_eq!(record.nonce, *nonce, "nonce 对不上");
-            assert_eq!(record.ciphertext.len(), *len, "密文长度对不上");
+            let record = payload
+                .records
+                .get(&id)
+                .expect("the payload must hold this record");
+            assert_eq!(record.nonce, *nonce, "nonce mismatch");
+            assert_eq!(record.ciphertext.len(), *len, "ciphertext length mismatch");
             assert_eq!(
                 record.encoded_len(),
                 EntryId::LEN + NONCE_LEN + 4 + len,
-                "encoded_len 与线格式的实际字节数不一致"
+                "encoded_len does not match the actual byte count of the wire format"
             );
         }
 
         let expected: usize = 4
             + frames.len() * (EntryId::LEN + NONCE_LEN + 4)
             + frames.iter().map(|f| f.2).sum::<usize>();
-        assert_eq!(plaintext.len(), expected, "明文总长度与线格式不一致");
+        assert_eq!(
+            plaintext.len(),
+            expected,
+            "the plaintext total length does not match the wire format"
+        );
     }
 
     /// The plaintext contains **no** kind byte.
@@ -1045,11 +1054,11 @@ mod tests {
         let sender = device(7);
 
         let mut vault = Vault::new();
-        let id = vault.insert(sample_entry(1)).expect("随机源可用");
+        let id = vault.insert(sample_entry(1)).expect("randomness available");
         vault.remove(&id, Timestamp::from(1_700_000_100_u64));
 
-        let payload = Payload::from_vault(&master, sender, &vault).expect("打包");
-        let sealed = payload.seal(&master).expect("封装");
+        let payload = Payload::from_vault(&master, sender, &vault).expect("packing succeeds");
+        let sealed = payload.seal(&master).expect("sealing succeeds");
         let plaintext = plaintext_of(&sealed, &master);
 
         assert_eq!(
@@ -1062,13 +1071,13 @@ mod tests {
         assert_eq!(
             &plaintext[4..4 + EntryId::LEN],
             id.as_bytes(),
-            "记录数之后紧接着的应当是标识，没有种类字节"
+            "the identifier must follow the record count immediately, with no kind byte"
         );
 
         assert_ne!(
             RecordKind::SyncTombstone.as_byte(),
             plaintext[3],
-            "第 4 字节是标识的一部分"
+            "byte 4 is part of the identifier"
         );
     }
 
@@ -1082,7 +1091,7 @@ mod tests {
         assert_eq!(FORMAT_VERSION, 2);
         assert!(
             crate::vault::READABLE_VERSIONS.contains(&crate::vault::FORMAT_VERSION),
-            "文件格式自己声明的版本必须在自己可读的版本列表里"
+            "the version a file format declares must be in its own readable version list"
         );
     }
 
@@ -1100,9 +1109,9 @@ mod tests {
     fn a_version_1_payload_is_rejected() {
         let master = a_master_key();
         let mut vault = Vault::new();
-        vault.insert(sample_entry(1)).expect("随机源可用");
-        let payload = Payload::from_vault(&master, device(1), &vault).expect("打包");
-        let sealed = payload.seal(&master).expect("封装");
+        vault.insert(sample_entry(1)).expect("randomness available");
+        let payload = Payload::from_vault(&master, device(1), &vault).expect("packing succeeds");
+        let sealed = payload.seal(&master).expect("sealing succeeds");
 
         let mut legacy = sealed.clone();
         legacy[MAGIC.len()] = LEGACY_FORMAT_VERSION_1;
@@ -1115,7 +1124,7 @@ mod tests {
                 Err(Error::SyncUnsupportedVersion { version }) => {
                     assert_eq!(version, LEGACY_FORMAT_VERSION_1);
                 }
-                other => panic!("版本 1 未被按版本拒绝，实际 {other:?}"),
+                other => panic!("version 1 was not rejected as a version, actual {other:?}"),
             }
         }
     }
@@ -1125,13 +1134,13 @@ mod tests {
     fn a_request_payload_carries_no_records_and_keeps_its_kind() {
         let master = a_master_key();
         let sender = device(3);
-        let payload = Payload::request(sender).expect("造请求");
+        let payload = Payload::request(sender).expect("building a request");
 
         assert_eq!(payload.kind(), PayloadKind::Request);
-        assert!(payload.is_empty(), "请求不该带记录");
+        assert!(payload.is_empty(), "a request must not carry records");
         assert_eq!(payload.sender, sender);
 
-        let sealed = payload.seal(&master).expect("封装");
+        let sealed = payload.seal(&master).expect("sealing succeeds");
 
         let header = Payload::peek(&sealed).expect("peek");
         assert_eq!(header.kind, PayloadKind::Request);
@@ -1139,7 +1148,7 @@ mod tests {
         assert_eq!(header.sync_id, payload.sync_id);
         assert_eq!(header.version, FORMAT_VERSION);
 
-        let opened = Payload::open(&master, &sealed).expect("拆包");
+        let opened = Payload::open(&master, &sealed).expect("opening the payload");
         assert_eq!(opened.kind(), PayloadKind::Request);
         assert!(opened.is_empty());
     }
@@ -1154,9 +1163,9 @@ mod tests {
     fn flipping_the_payload_kind_breaks_authentication() {
         let master = a_master_key();
         let mut vault = Vault::new();
-        vault.insert(sample_entry(1)).expect("随机源可用");
-        let payload = Payload::from_vault(&master, device(1), &vault).expect("打包");
-        let sealed = payload.seal(&master).expect("封装");
+        vault.insert(sample_entry(1)).expect("randomness available");
+        let payload = Payload::from_vault(&master, device(1), &vault).expect("packing succeeds");
+        let sealed = payload.seal(&master).expect("sealing succeeds");
 
         let kind_offset = MAGIC.len() + 1;
         assert_eq!(sealed[kind_offset], PayloadKind::Vault.as_byte());
@@ -1164,13 +1173,13 @@ mod tests {
         let mut flipped = sealed.clone();
         flipped[kind_offset] = PayloadKind::Request.as_byte();
 
-        let peeked = Payload::peek(&flipped).expect("peek 只看明文，应当成功");
+        let peeked = Payload::peek(&flipped).expect("peek only reads plaintext and must succeed");
         assert_eq!(peeked.kind, PayloadKind::Request);
 
         let result = Payload::open(&master, &flipped);
         assert!(
             matches!(result, Err(Error::SyncAuthenticationFailed)),
-            "篡改种类之后仍能打开，实际 {result:?}"
+            "the payload still opened after the kind was tampered with, actual {result:?}"
         );
 
         assert!(Payload::open(&master, &sealed).is_ok());
@@ -1181,9 +1190,9 @@ mod tests {
     fn an_unknown_payload_kind_is_rejected() {
         let master = a_master_key();
         let mut vault = Vault::new();
-        vault.insert(sample_entry(1)).expect("随机源可用");
-        let payload = Payload::from_vault(&master, device(1), &vault).expect("打包");
-        let sealed = payload.seal(&master).expect("封装");
+        vault.insert(sample_entry(1)).expect("randomness available");
+        let payload = Payload::from_vault(&master, device(1), &vault).expect("packing succeeds");
+        let sealed = payload.seal(&master).expect("sealing succeeds");
 
         for bogus in [0x00_u8, 0x03, 0x80, 0xFF] {
             let mut bad = sealed.clone();
@@ -1191,7 +1200,7 @@ mod tests {
             let result = Payload::peek(&bad);
             match result {
                 Err(Error::SyncUnknownPayloadKind { value }) => assert_eq!(value, bogus),
-                other => panic!("未知种类 {bogus:#04x} 未被拒绝，实际 {other:?}"),
+                other => panic!("unknown kind {bogus:#04x} was not rejected, actual {other:?}"),
             }
         }
     }
@@ -1212,8 +1221,8 @@ mod tests {
             let _ = Payload::peek(case);
         }
         let master = a_master_key();
-        let payload = Payload::request(device(1)).expect("请求");
-        let sealed = payload.seal(&master).expect("封装");
+        let payload = Payload::request(device(1)).expect("request");
+        let sealed = payload.seal(&master).expect("sealing succeeds");
         assert!(Payload::peek(&sealed).is_ok());
     }
 
@@ -1225,30 +1234,30 @@ mod tests {
     fn the_payload_header_is_laid_out_byte_for_byte() {
         let master = a_master_key();
         let sender = device(0xAB);
-        let payload = Payload::request(sender).expect("请求");
-        let sealed = payload.seal(&master).expect("封装");
+        let payload = Payload::request(sender).expect("request");
+        let sealed = payload.seal(&master).expect("sealing succeeds");
 
-        assert_eq!(&sealed[..8], b"Q2FASYNC", "魔数");
-        assert_eq!(sealed[8], FORMAT_VERSION, "版本");
-        assert_eq!(sealed[9], PayloadKind::Request.as_byte(), "种类");
+        assert_eq!(&sealed[..8], b"Q2FASYNC", "magic");
+        assert_eq!(sealed[8], FORMAT_VERSION, "version");
+        assert_eq!(sealed[9], PayloadKind::Request.as_byte(), "kind");
         assert_eq!(&sealed[10..42], &payload.sync_id, "sync_id");
-        assert_eq!(&sealed[42..74], sender.as_bytes(), "发送方");
+        assert_eq!(&sealed[42..74], sender.as_bytes(), "sender");
 
         let plaintext = plaintext_of(&sealed, &master);
         assert_eq!(
             plaintext,
             0_u32.to_be_bytes(),
-            "空请求的明文应当就是一个「零条记录」的计数"
+            "the plaintext of an empty request must be just a zero record count"
         );
         assert!(
             sealed.len() >= HEADER_LEN + NONCE_LEN + TAG_LEN,
-            "连「头 + nonce + 认证标签」都不够长：{} < {}",
+            "not even long enough for header + nonce + authentication tag: {} < {}",
             sealed.len(),
             HEADER_LEN + NONCE_LEN + TAG_LEN
         );
         assert_eq!(
             HEADER_LEN, 74,
-            "头的字节数：8 魔数 + 1 版本 + 1 种类 + 32 sync_id + 32 发送方"
+            "header byte count: 8 magic + 1 version + 1 kind + 32 sync_id + 32 sender"
         );
     }
 
@@ -1256,13 +1265,22 @@ mod tests {
     #[test]
     fn the_sync_and_vault_keys_are_different() {
         let master = a_master_key();
-        let record = derive_record_key(&master).expect("可派生");
-        let envelope = derive_envelope_key(&master).expect("可派生");
-        let vault_key = crate::vault::crypto::entry_key(&master).expect("可派生");
+        let record = derive_record_key(&master).expect("derivation succeeds");
+        let envelope = derive_envelope_key(&master).expect("derivation succeeds");
+        let vault_key = crate::vault::crypto::entry_key(&master).expect("derivation succeeds");
 
-        assert_ne!(record, envelope, "记录密钥与信封密钥撞上了");
-        assert_ne!(record, vault_key, "同步记录密钥与保险库条目密钥撞上了");
-        assert_ne!(envelope, vault_key, "信封密钥与保险库条目密钥撞上了");
+        assert_ne!(
+            record, envelope,
+            "the record key collided with the envelope key"
+        );
+        assert_ne!(
+            record, vault_key,
+            "the sync record key collided with the vault entry key"
+        );
+        assert_ne!(
+            envelope, vault_key,
+            "the envelope key collided with the vault entry key"
+        );
     }
 
     /// An empty vault can be sealed and opened, and stays empty across the round trip.
@@ -1270,19 +1288,23 @@ mod tests {
     fn an_empty_vault_roundtrips() {
         let master = a_master_key();
         let sender = device(1);
-        let payload = Payload::from_vault(&master, sender, &Vault::new()).expect("打包");
+        let payload =
+            Payload::from_vault(&master, sender, &Vault::new()).expect("packing succeeds");
 
-        assert!(payload.is_empty(), "空保险库不该产生记录");
+        assert!(payload.is_empty(), "an empty vault must produce no records");
         assert_eq!(payload.len(), 0);
 
-        let sealed = payload.seal(&master).expect("封装");
-        let opened = Payload::open(&master, &sealed).expect("拆包");
+        let sealed = payload.seal(&master).expect("sealing succeeds");
+        let opened = Payload::open(&master, &sealed).expect("opening the payload");
         assert!(opened.is_empty());
         assert_eq!(opened.sender, sender);
         assert_eq!(opened.sync_id, payload.sync_id);
         assert!(
-            opened.open_records(&master).expect("逐条解密").is_empty(),
-            "空载荷不该解开出任何记录"
+            opened
+                .open_records(&master)
+                .expect("opening record by record")
+                .is_empty(),
+            "an empty payload must not open any record"
         );
     }
 
@@ -1293,15 +1315,19 @@ mod tests {
         let master = a_master_key();
         let sender = device(1);
         let mut vault = Vault::new();
-        vault.insert(sample_entry(1)).expect("随机源可用");
+        vault.insert(sample_entry(1)).expect("randomness available");
 
-        let first = Payload::from_vault(&master, sender, &vault).expect("打包");
-        let second = Payload::from_vault(&master, sender, &vault).expect("打包");
+        let first = Payload::from_vault(&master, sender, &vault).expect("packing succeeds");
+        let second = Payload::from_vault(&master, sender, &vault).expect("packing succeeds");
         assert_ne!(
             first.sync_id, second.sync_id,
-            "两次打包拿到了同一个载荷标识"
+            "two packings produced the same payload identifier"
         );
-        assert_eq!(first.len(), second.len(), "两次打包的记录数应当相同");
+        assert_eq!(
+            first.len(),
+            second.len(),
+            "two packings must yield the same record count"
+        );
     }
 
     /// Sealing the same vault twice must produce different ciphertext (the nonce is random
@@ -1315,14 +1341,17 @@ mod tests {
         let master = a_master_key();
         let sender = device(1);
         let mut vault = Vault::new();
-        vault.insert(sample_entry(1)).expect("随机源可用");
+        vault.insert(sample_entry(1)).expect("randomness available");
 
-        let first = Payload::from_vault(&master, sender, &vault).expect("打包");
-        let second = Payload::from_vault(&master, sender, &vault).expect("打包");
+        let first = Payload::from_vault(&master, sender, &vault).expect("packing succeeds");
+        let second = Payload::from_vault(&master, sender, &vault).expect("packing succeeds");
 
-        let a = first.seal(&master).expect("封装");
-        let b = second.seal(&master).expect("封装");
-        assert_ne!(a, b, "两次封装的字节完全相同，nonce 很可能被复用了");
+        let a = first.seal(&master).expect("sealing succeeds");
+        let b = second.seal(&master).expect("sealing succeeds");
+        assert_ne!(
+            a, b,
+            "two sealings produced identical bytes, the nonce was most likely reused"
+        );
 
         let ra = plaintext_of(&a, &master);
         let rb = plaintext_of(&b, &master);
@@ -1330,8 +1359,8 @@ mod tests {
         let fb = parse_record_frames(&rb);
         assert_eq!(fa.len(), fb.len());
         for (x, y) in fa.iter().zip(fb.iter()) {
-            assert_eq!(x.0, y.0, "同一条目");
-            assert_ne!(x.1, y.1, "同一条记录的 nonce 被复用了");
+            assert_eq!(x.0, y.0, "same entry");
+            assert_ne!(x.1, y.1, "the same record reused its nonce");
         }
     }
 
@@ -1357,8 +1386,8 @@ mod tests {
         let sender = device(1);
 
         let mut vault = Vault::new();
-        let kept = vault.insert(sample_entry(1)).expect("随机源可用");
-        let disputed = vault.insert(sample_entry(2)).expect("随机源可用");
+        let kept = vault.insert(sample_entry(1)).expect("randomness available");
+        let disputed = vault.insert(sample_entry(2)).expect("randomness available");
 
         vault.record_tombstone(crate::vault::Tombstone {
             entry_id: disputed,
@@ -1366,16 +1395,31 @@ mod tests {
             deleted_by: None,
         });
 
-        assert_eq!(vault.len(), 2, "前提不成立：两条活条目都应当还在");
-        assert_eq!(vault.tombstone_count(), 1, "前提不成立：应当有墓碑");
+        assert_eq!(
+            vault.len(),
+            2,
+            "precondition failed: both live entries must still be there"
+        );
+        assert_eq!(
+            vault.tombstone_count(),
+            1,
+            "precondition failed: a tombstone must exist"
+        );
         assert!(
             vault.get(&disputed).is_some(),
-            "前提不成立：`record_tombstone` 不该删掉活条目"
+            "precondition failed: `record_tombstone` must not delete a live entry"
         );
 
-        let payload = Payload::from_vault(&master, sender, &vault).expect("打包");
-        assert_eq!(payload.len(), 2, "应当只有「保留的条目 + 墓碑」两条记录");
-        assert!(payload.records.get(&kept).is_some(), "保留的条目应当被发出");
+        let payload = Payload::from_vault(&master, sender, &vault).expect("packing succeeds");
+        assert_eq!(
+            payload.len(),
+            2,
+            "there must be exactly two records: the kept entry plus the tombstone"
+        );
+        assert!(
+            payload.records.get(&kept).is_some(),
+            "the kept entry must be sent"
+        );
 
         let records = opened_kinds(&payload, &master);
         let mut entries = Vec::new();
@@ -1390,12 +1434,16 @@ mod tests {
         assert_eq!(
             entries,
             vec![kept],
-            "应当只发出一条活条目，而且是保留的那条"
+            "exactly one live entry must be sent, and it must be the kept one"
         );
-        assert_eq!(tombstones, vec![disputed], "应当只发出一条墓碑");
+        assert_eq!(
+            tombstones,
+            vec![disputed],
+            "exactly one tombstone must be sent"
+        );
         assert!(
             !entries.contains(&disputed),
-            "有墓碑的活条目被当成条目发出了"
+            "a live entry with a tombstone was sent as an entry"
         );
     }
 
@@ -1409,14 +1457,14 @@ mod tests {
     fn an_absurd_record_count_is_rejected_before_allocating() {
         let master = a_master_key();
         let mut vault = Vault::new();
-        vault.insert(sample_entry(1)).expect("随机源可用");
-        let payload = Payload::from_vault(&master, device(1), &vault).expect("打包");
+        vault.insert(sample_entry(1)).expect("randomness available");
+        let payload = Payload::from_vault(&master, device(1), &vault).expect("packing succeeds");
 
         let mut plaintext = u32::MAX.to_be_bytes().to_vec();
         plaintext.extend_from_slice(&[0_u8; 64]);
-        let compressed = compress::compress(&plaintext).expect("可压缩");
+        let compressed = compress::compress(&plaintext).expect("compression succeeds");
 
-        let envelope_key = derive_envelope_key(&master).expect("可派生");
+        let envelope_key = derive_envelope_key(&master).expect("derivation succeeds");
         let aad = header_aad(
             FORMAT_VERSION,
             PayloadKind::Vault,
@@ -1424,7 +1472,8 @@ mod tests {
             &payload.sender,
         );
         let (nonce, ciphertext) =
-            crate::vault::crypto::seal_bytes(&envelope_key, &aad, &compressed).expect("可加密");
+            crate::vault::crypto::seal_bytes(&envelope_key, &aad, &compressed)
+                .expect("sealing succeeds");
 
         let mut sealed = Vec::new();
         sealed.extend_from_slice(MAGIC);
@@ -1438,7 +1487,7 @@ mod tests {
         let result = Payload::open(&master, &sealed);
         assert!(
             matches!(result, Err(Error::SyncTooManyRecords { .. })),
-            "超限的记录数未被拒绝，实际 {result:?}"
+            "an over-limit record count was not rejected, actual {result:?}"
         );
     }
 
@@ -1446,11 +1495,11 @@ mod tests {
     #[test]
     fn the_master_key_roundtrips_through_bytes() {
         let master = a_master_key();
-        let copy = MasterKey::from_bytes(master_key_to_bytes(&master)).expect("长度正确");
+        let copy = MasterKey::from_bytes(master_key_to_bytes(&master)).expect("correct length");
         assert_eq!(
-            derive_record_key(&master).expect("可派生"),
-            derive_record_key(&copy).expect("可派生"),
-            "同一把主密钥的副本应当派生出同一把记录密钥"
+            derive_record_key(&master).expect("derivation succeeds"),
+            derive_record_key(&copy).expect("derivation succeeds"),
+            "a copy of the same master key must derive the same record key"
         );
     }
 }

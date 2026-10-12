@@ -77,11 +77,14 @@ mod tests {
         let debug = format!("{secret:?}");
         let lower = debug.to_lowercase();
 
-        assert!(lower.contains("redacted"), "Debug 未标注脱敏：{debug}");
+        assert!(
+            lower.contains("redacted"),
+            "Debug output is not marked as redacted: {debug}"
+        );
         for leak in ["222", "173", "190", "239", "dead", "beef", "de ad"] {
             assert!(
                 !lower.contains(leak),
-                "Debug 输出泄露明文痕迹 {leak:?}：{debug}"
+                "Debug output leaks a plaintext trace {leak:?}: {debug}"
             );
         }
     }
@@ -92,7 +95,7 @@ mod tests {
     fn nested_in_derived_debug_still_safe() {
         #[expect(
             dead_code,
-            reason = "字段仅用于构造 Debug 输出，不参与读取；这是本测试的全部意图"
+            reason = "the field exists only to build the Debug output and is never read; that is the entire point of this test"
         )]
         #[derive(Debug)]
         struct Wrapper {
@@ -107,8 +110,14 @@ mod tests {
             secret: vec![0xde_u8, 0xad].into(),
         };
         let text = format!("{w:?}");
-        assert!(text.contains("github"), "非秘密字段应正常打印：{text}");
-        assert!(!text.contains("222"), "嵌套 Debug 泄露明文：{text}");
+        assert!(
+            text.contains("github"),
+            "a non-secret field must print normally: {text}"
+        );
+        assert!(
+            !text.contains("222"),
+            "nested Debug output leaks plaintext: {text}"
+        );
     }
 
     /// Contract: secret types must be `ZeroizeOnDrop` (erased on drop).
