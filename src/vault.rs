@@ -426,6 +426,32 @@ impl Vault {
     pub fn iter_tombstones(&self) -> impl Iterator<Item = (&EntryId, &Tombstone)> {
         self.tombstones.iter()
     }
+
+    /// Drops a tombstone, so this ID is no longer marked as deleted.
+    ///
+    /// Returns the tombstone that was dropped, or `None` when this ID had none.
+    ///
+    /// # What it is for
+    ///
+    /// A tombstone records a deletion that **has happened**. Dropping it overrules that
+    /// deletion: the ID becomes unknown again, and an entry arriving under it later is
+    /// taken as content this device does not have rather than as something a device failed
+    /// to delete.
+    ///
+    /// Only a user may overrule a deletion. The case it exists for is an entry this device
+    /// deleted while a peer still held a copy: the peer's record arrives, the user is asked,
+    /// and "the entry should not have been deleted" is answered by putting the entry back.
+    /// A library deciding this on its own would be undoing an explicit user action.
+    ///
+    /// # A live entry with the same ID is not touched
+    ///
+    /// The two states mean different things: a tombstone on its own is "deleted", while a
+    /// tombstone next to a live entry is "the deletion has not been adjudicated yet" (see
+    /// [`crate::sync`]). Deleting the live entry is [`Vault::remove`], and neither is a side
+    /// effect of the other.
+    pub fn forget_tombstone(&mut self, id: &EntryId) -> Option<Tombstone> {
+        self.tombstones.remove(id)
+    }
 }
 
 /// A vault file together with the master key that opens it.
@@ -499,6 +525,21 @@ impl VaultFile {
     /// Mutable reference to the contents.
     pub const fn vault_mut(&mut self) -> &mut Vault {
         &mut self.vault
+    }
+
+    /// The master key and the contents together.
+    ///
+    /// # Why this entry point exists
+    ///
+    /// An operation that needs both at once cannot be written with [`VaultFile::master_key`]
+    /// and [`VaultFile::vault_mut`]: the first borrows the whole value, so the second is
+    /// refused even though the two fields are disjoint. Synchronization is exactly such an
+    /// operation — the key seals and opens payloads while the contents are what gets merged —
+    /// and the alternative would be copying the master key, which a caller that only wants
+    /// to borrow has no reason to do.
+    #[must_use]
+    pub fn split_mut(&mut self) -> (&MasterKey, &mut Vault) {
+        (&self.master, &mut self.vault)
     }
 
     /// Serializes to the file bytes.

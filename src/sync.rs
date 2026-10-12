@@ -68,6 +68,7 @@
 //! shown in the UI to any value. [`SeenSyncIds`] therefore records the identifiers that
 //! were processed, and rejects repeats outright.
 
+mod adjudicate;
 pub mod compress;
 mod merge;
 pub mod record;
@@ -76,6 +77,7 @@ mod seen;
 use crate::vault::crypto;
 use crate::vault::{EntryId, MasterKey, NONCE_LEN, TAG_LEN};
 use crate::{Error, Result};
+pub use adjudicate::{Adjudicated, Decision, adjudicate};
 pub use merge::{
     Conflict, ConflictKind, HasEntryId, MergeOutcome, MergedRecord, RecordSet, merge_into,
 };
