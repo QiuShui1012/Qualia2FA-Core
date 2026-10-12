@@ -1,6 +1,6 @@
-# 开发工具链固定为 stable，避免各人本机工具链漂移。
-# 注意：这里的 channel 是「开发用」，不是 MSRV。
-# MSRV 声明在 Cargo.toml 的 rust-version 字段（= 1.89），两者含义不同。
+# Development toolchain, pinned to stable so that it does not drift per machine.
+# Note: this channel is the **development** toolchain, not the MSRV.
+# The MSRV is `rust-version` in Cargo.toml (= 1.89); the two are different things.
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]

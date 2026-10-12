@@ -1,34 +1,40 @@
-# cargo-deny 配置。
+# cargo-deny configuration.
 #
-# 本项目的依赖策略依据（见 TODO.md §4.1）：RustSec 库 2026 年新增 334 条公告，
-# 而上游每一次严重问题都是补丁/次版本修掉的。因此「依赖审计」是安全控制，不是杂事。
+# The dependency policy rests on the RustSec database adding 334 advisories in 2026,
+# while every serious upstream problem was fixed in a patch or minor release. Dependency
+# auditing is therefore a security control, not a chore.
 #
-# 参考：https://embarkstudios.github.io/cargo-deny/
+# Reference: https://embarkstudios.github.io/cargo-deny/
 
 [graph]
-# 按目标平台分别评估依赖，避免把 Linux 专有依赖算到 Windows 构建上。
+# Dependencies are evaluated per target platform, so that Linux-only dependencies are
+# not counted against a Windows build.
 targets = [
     { triple = "x86_64-pc-windows-msvc" },
     { triple = "aarch64-linux-android" },
     { triple = "aarch64-apple-ios" },
 ]
-# 开发依赖也要审：它们不进产物，但可能带着漏洞进 CI 环境。
+# Development dependencies are audited too: they do not enter the artifact, but can
+# carry a vulnerability into the CI environment.
 all-features = true
 
 [advisories]
-# 发现任何未处理的漏洞即失败。
-# 注意：`vulnerability` 是硬失败，不接受「先记账」。
+# Any unhandled vulnerability fails the check.
+# Note: `vulnerability` is a hard failure and never accepts a deferral.
 version = 2
 ignore = [
-    # 如有必须暂时接受的公告，在此列出并**附上理由与到期时间**，例如：
-    # { id = "RUSTSEC-0000-0000", reason = "无可利用路径，等上游 0.3.x 修复（复审：2026-12-31）" },
+    # List any advisory that must be accepted temporarily, with a reason and an expiry
+    # date, for example:
+    # { id = "RUSTSEC-0000-0000", reason = "no exploitable path, waiting for upstream 0.3.x (review: 2026-12-31)" },
 ]
 
 [licenses]
 version = 2
-# 本项目以 LGPL-3.0-or-later 发布。
-# 允许清单覆盖常见宽松许可证 + 与 LGPL 兼容的 copyleft 许可证。
-# 注意：**不包含** GPL-2.0-only / SSPL / BUSL 等与 LGPL-3.0 不兼容或非自由的许可证。
+# This project is released under LGPL-3.0-or-later.
+# The allowlist covers common permissive licenses plus the copyleft licenses compatible
+# with LGPL.
+# Note: it does **not** include GPL-2.0-only / SSPL / BUSL or other licenses that are
+# incompatible with LGPL-3.0 or non-free.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -40,58 +46,62 @@ allow = [
     "LGPL-3.0-or-later",
     "MIT",
     "MIT-0",
-    "MPL-2.0",        # Gobley 与 uniffi 均为 MPL-2.0（文件级 copyleft，与 LGPL 兼容）
+    "MPL-2.0",        # file-level copyleft, compatible with LGPL
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
 ]
-# 遇到清单外的许可证时给出明确失败，而不是静默放过。
+# A license outside the list fails explicitly rather than being quietly accepted.
 confidence-threshold = 0.9
 
-# 白名单是**预先**为后续要引入的 crypto 栈（rustls/aws-lc-rs/p256 等）放行的，
-# 因此当前必然有一批许可证尚未被任何依赖用到。这不代表配置有问题，
-# 故把「白名单条目未命中」降级为允许，避免每次加依赖前都被噪音淹没。
+# The allowlist pre-clears licenses for the crypto stack planned next (rustls /
+# aws-lc-rs / p256 and friends), so some entries are not yet used by any dependency.
+# That is not a configuration error, hence unmatched allowlist entries are tolerated
+# instead of drowning every new dependency in noise.
 unused-allowed-license = "allow"
 
-# 若将来某个依赖的许可证无法被自动识别（例如自带 LICENSE 文件但 SPDX 声明缺失），
-# 在此逐条澄清它**实际**的许可证，而不是把可疑许可证整个加进 allow 清单：
+# If a dependency's license cannot be detected automatically (for example it ships a
+# LICENSE file but no SPDX declaration), clarify its actual license here entry by entry
+# rather than adding the whole suspect license to the allow list:
 #
 # [[licenses.clarify]]
-# name = "某个crate"
+# name = "some-crate"
 # expression = "MIT"
 # license-files = [{ path = "LICENSE", hash = 0x0000_0000 }]
 
 [bans]
 multiple-versions = "warn"
-# 同一依赖出现多个版本时给出警告（crypto crate 尤其重要：
-# 两个版本的 `aes` 可能意味着一个未打补丁）。
+# Warn when one dependency appears in several versions (especially important for crypto
+# crates: two versions of `aes` can mean one of them is unpatched).
 wildcards = "deny"
-# 明确禁止的 crate 及其理由（见 TODO.md §4.2）。
+# Crates that are explicitly banned, with the reason.
 deny = [
-    # 上游 PQClean 已归档；RUSTSEC-2026-0164 标记为不再维护。
+    # Upstream PQClean is archived; RUSTSEC-2026-0164 marks it unmaintained.
     { name = "pqcrypto" },
     { name = "pqcrypto-kyber" },
     { name = "pqcrypto-dilithium" },
-    # AVX2 后端跳过 Fujisaki–Okamoto 隐式拒绝，破坏 CCA 证明。
+    # The AVX2 backend skips the Fujisaki–Okamoto implicit rejection, breaking the CCA
+    # proof.
     { name = "pqc_kyber" },
     { name = "cosmian_kyber" },
-    # 混合 KEM 为 pre-verification 且实现旧草案；10 个月 21 条公告。
+    # Hybrid KEMs that are pre-verification and implement an old draft.
     { name = "libcrux-kem" },
     { name = "libcrux-aesgcm" },
-    # CPace：Rust 生态无可用实现。
+    # CPace: no usable implementation in the Rust ecosystem.
     { name = "cpace" },
     { name = "pake-cpace" },
-    # 已并入 `aes`。
+    # Merged into `aes`.
     { name = "aes-soft" },
     { name = "aesni" },
 ]
 
-# 说明：`anyhow` 不在禁令里。它是库 API 风格问题（库公共签名用 thiserror），
-# 由 code review 把关；写进依赖黑名单会波及开发依赖与构建脚本，得不偿失。
+# `anyhow` is not banned: it is a library API-style question (public signatures use
+# thiserror) and is handled in code review, while listing it here would also hit
+# development dependencies and build scripts.
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# 允许 git 依赖留空：本项目当前不依赖任何 git 源。
+# allow-git is left empty: the project currently depends on no git source.
 allow-git = []

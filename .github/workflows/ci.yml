@@ -1,30 +1,31 @@
 name: CI
 
-# 说明：本仓库根目录是 `Core/`（crate `qualia2fa-core`）。
-# 因此所有 job 都显式设置 `working-directory: .`（即仓库根），
-# 且 `paths` 过滤器无需前缀。
+# Note: the repository root is `Core/` (crate `qualia2fa-core`), so every job sets
+# `working-directory: .` (that is, the repository root) explicitly and the `paths`
+# filters need no prefix.
 #
-# 核心信条：CI 必须能挡住「看起来对」的密码学代码。
-# 因此除常规 fmt/clippy/test 外，还有依赖审计与 MSRV 两关。
+# Core tenet: CI must stop cryptographic code that merely looks right, so besides the
+# usual fmt/clippy/test there are dependency audit and MSRV gates.
 
 on:
   push:
     branches: ["**"]
   pull_request:
 
-# 同一分支的新推送取消旧运行，避免排队浪费。
+# A new push to the same branch cancels the older run instead of queueing.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  # 让 CI 的构建结果可复现：不隐式下载新版本、不改锁文件。
+  # Make CI build results reproducible: no implicit download of new versions, no
+  # lockfile rewriting.
   CARGO_NET_RETRY: 10
   RUST_BACKTRACE: 1
 
 jobs:
-  # ── 第一关：格式、lint、测试 ────────────────────────────────────────────
+  # ── Gate 1: formatting, lint, tests ────────────────────────────────────
   check:
     name: fmt + clippy + test
     runs-on: windows-latest
@@ -46,8 +47,9 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      # 关键：--locked 保证 CI 用的就是提交进仓库的锁定版本。
-      # 若有人本地升级依赖却忘了提交 Cargo.lock，这里会直接失败。
+      # Key point: --locked makes CI use exactly the versions committed to the
+      # repository. If someone upgrades a dependency locally without committing
+      # Cargo.lock, this fails outright.
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
@@ -62,9 +64,9 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # ── 第二关：MSRV ──────────────────────────────────────────────────────
-  # Cargo.toml 声明的 rust-version 必须真的能编译通过，
-  # 否则这个声明就是谎言：下游会踩坑而我们本地发现不了。
+  # ── Gate 2: MSRV ──────────────────────────────────────────────────────
+  # The rust-version declared in Cargo.toml must actually compile, or the declaration
+  # is a lie: downstream users would hit the problem and no local run would reveal it.
   msrv:
     name: MSRV 1.89
     runs-on: windows-latest
@@ -75,16 +77,16 @@ jobs:
       - name: 安装 1.89 工具链
         run: rustup toolchain install 1.89 --profile minimal
 
-      # 注意 --locked 在 MSRV 下可能因依赖提升 MSRV 而失败，
-      # 这正是我们想知道的信号：说明 Cargo.toml 的 rust-version 需要上调，
-      # 或某个依赖需要降级。
+      # Note: --locked may fail under the MSRV because a dependency raised its own MSRV,
+      # which is exactly the signal wanted here: the rust-version in Cargo.toml must be
+      # raised, or some dependency must be downgraded.
       - name: 用 1.89 编译
         run: cargo +1.89 check --all-targets
 
-  # ── 第三关：依赖安全审计 ───────────────────────────────────────────────
-  # 依据：RustSec 库 2026 年新增 334 条公告（2025 年 172 条），
-  # 且本项目的 crypto 依赖历史上每一次严重问题都是补丁/次版本修掉的。
-  # 因此「依赖审计」不是可选项，而是安全控制。
+  # ── Gate 3: dependency security audit ─────────────────────────────────
+  # Basis: the RustSec database added 334 advisories in 2026 (172 in 2025), and every
+  # serious problem in this project's crypto dependencies was fixed in a patch or minor
+  # release. Dependency auditing is therefore a security control, not an option.
   deny:
     name: cargo-deny（依赖审计 + 许可证）
     runs-on: ubuntu-latest
@@ -95,12 +97,12 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
-          # 让 cargo-deny 用仓库里的 deny.toml 与 Cargo.lock
+          # Make cargo-deny use the repository's deny.toml and Cargo.lock
           arguments: --all-features
 
-  # ── 第四关：fuzz 冒烟 ─────────────────────────────────────────────────
-  # 只跑有限轮数：CI 不可能做长时间 fuzz，但短跑能抓住明显的 panic，
-  # 并保证 fuzz 目标本身始终可编译（否则它会悄悄腐烂）。
+  # ── Gate 4: fuzz smoke run ────────────────────────────────────────────
+  # Only a bounded number of rounds: CI cannot fuzz for long, but a short run catches
+  # obvious panics and keeps the fuzz targets compiling instead of rotting away.
   fuzz-smoke:
     name: fuzz 冒烟（限时）
     runs-on: ubuntu-latest
@@ -121,11 +123,12 @@ jobs:
           set -euo pipefail
           for target in $(cargo +nightly fuzz list); do
             echo "::group::fuzz $target"
-            # 先把入库的回归样本喂进语料库。
+            # Seed the corpus with the checked-in regression inputs first.
             #
-            # 这些是历史上真实触发过崩溃（或断言失败）的输入，必须每轮都跑到，
-            # 否则同一个缺陷会在后续改动里悄悄复发。自动生成的 corpus/ 不入库，
-            # 所以它是每次从零开始的；regressions/ 是唯一的持久化保证。
+            # These are inputs that really did trigger a crash (or a failed assertion),
+            # so they must run every round or the same defect would quietly return. The
+            # generated corpus/ is not checked in and therefore starts empty each time;
+            # regressions/ is the only durable guarantee.
             if [ -d "regressions/$target" ]; then
               mkdir -p "corpus/$target"
               cp -n "regressions/$target"/* "corpus/$target"/ 2>/dev/null || true

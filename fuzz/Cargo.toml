@@ -1,7 +1,8 @@
-# cargo-fuzz 目标 crate。
+# The cargo-fuzz target crate.
 #
-# 注意：本 crate **不是** `../Cargo.toml` 的 workspace 成员，cargo-fuzz 会独立处理它。
-# 因此 `cargo test` / `cargo clippy` 在 Core/ 下不会编译到本目录。
+# Note: this crate is **not** a workspace member of `../Cargo.toml`; cargo-fuzz handles
+# it separately, so `cargo test` / `cargo clippy` under Core/ never compile this
+# directory.
 
 [package]
 name = "qualia2fa-core-fuzz"
@@ -13,15 +14,17 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-# fuzz 目标把任意字节喂给库的公共解析入口。
+# The fuzz targets feed arbitrary bytes to the library's public parsing entry points.
 libfuzzer-sys = "0.4.13"
 qualia2fa-core = { path = ".." }
-# 设备身份类型（`DevicePublicKey` / `DeviceSignature`）住在 `qualia-dik` 里，
-# Core 只是**再导出**它们。fuzz 目标直接依赖原 crate 更清楚，也避免依赖一个
-# 只为便利而存在的再导出。
+# The device identity types (`DevicePublicKey` / `DeviceSignature`) live in `qualia-dik`
+# and Core merely re-exports them; a fuzz target is clearer depending on the original
+# crate, and avoids depending on a re-export that exists only for convenience.
 qualia-dik = "0.1"
-# `login_handshake` 需要一条真实的设备身份（合法的 P-256 公钥与签名），而库刻意
-# 不导出「生成一把设备私钥」——那属于 `qualia2fa-keystore`，本目标用固定标量代替。
+# `login_handshake` needs a real device identity (a valid P-256 public key and
+# signature), while the library deliberately does not export "generate a device private
+# key" — that belongs to the platform key store — so this target substitutes a fixed
+# scalar.
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 
 [[bin]]
@@ -31,7 +34,8 @@ test = false
 doc = false
 bench = false
 
-# 攻击者可控输入面：二维码 / 剪贴板 / 手输链接都进这里。
+# Attacker-controlled input surface: QR codes, the clipboard and manually typed links
+# all arrive here.
 [[bin]]
 name = "uri_parse"
 path = "fuzz_targets/uri_parse.rs"
@@ -39,7 +43,8 @@ test = false
 doc = false
 bench = false
 
-# 所有种子的必经之路：位对齐、尾部余数、填充校验。
+# The only path every secret passes through: bit alignment, trailing remainder and
+# padding validation.
 [[bin]]
 name = "base32_and_otp"
 path = "fuzz_targets/base32_and_otp.rs"
@@ -47,8 +52,8 @@ test = false
 doc = false
 bench = false
 
-# 攻击者可控输入面：保险库文件会被同步到不受控的位置（网盘、二维码、另一台
-# 设备），因此每个长度字段都由对手决定。
+# Attacker-controlled input surface: a vault file reaches uncontrolled places (cloud
+# drives, QR codes, another device), so the adversary chooses every length field.
 [[bin]]
 name = "vault_parse"
 path = "fuzz_targets/vault_parse.rs"
@@ -56,8 +61,9 @@ test = false
 doc = false
 bench = false
 
-# 攻击者可控输入面：登录握手的 Msg1 与 Msg2。二维码是公开的（贴在屏幕上），
-# 因此任何能看到它的人都能往这两条路径上送任意字节。
+# Attacker-controlled input surface: Msg1 and Msg2 of the login handshake. A QR code is
+# public (it is displayed on screen), so anyone who can see it can send arbitrary bytes
+# down these two paths.
 [[bin]]
 name = "login_handshake"
 path = "fuzz_targets/login_handshake.rs"
@@ -65,9 +71,10 @@ test = false
 doc = false
 bench = false
 
-# 攻击者可控输入面：同步载荷。它比保险库文件更宽——**同一个局域网里任何一台设备**
-# 都能主动把字节送过来，不需要用户做任何事。目标同时覆盖外层信封、解压上限与解压后
-# 的变长明文解析。
+# Attacker-controlled input surface: the sync payload. It is wider than a vault file —
+# **any device on the same LAN** can push bytes at it without the user doing anything.
+# The target covers the outer envelope, the decompression limit and the variable-length
+# plaintext parsing after decompression.
 [[bin]]
 name = "sync_payload"
 path = "fuzz_targets/sync_payload.rs"

@@ -2,16 +2,16 @@
 name = "qualia2fa-core"
 version = "0.1.0"
 edition = "2024"
-# MSRV 策略：1.89 是「最低支持」的声明，不是开发工具链版本。
-# 开发工具链由 rust-toolchain.toml 固定为 stable（当前 1.99）。
-# 1.89 的下限由后续要引入的 crypto 栈决定（最紧的是 aes 0.9.3）；
-# 本 crate 自身的代码用 1.85 即可编译，故意留出余量以便上游收紧时不被迫跳版。
+# MSRV policy: 1.89 is the minimum supported version, not the development toolchain.
+# The development toolchain is pinned to stable (currently 1.99) by rust-toolchain.toml.
+# The 1.89 floor comes from the crypto stack (the tightest is aes 0.9.3); this crate's
+# own code compiles on 1.85, so 1.89 leaves headroom for upstream tightening.
 rust-version = "1.89"
 description = "Qualia2FA 核心库：TOTP/HOTP 原语、加密保险库与设备同步逻辑"
 license = "LGPL-3.0-or-later"
 
-# 真实仓库地址。本仓库预期被 UI 端以 git submodule 引入，
-# `cargo doc` 与未来的 `cargo publish`（当前 `publish = false`）都要用它。
+# The upstream repository URL. This repository is consumed as a git submodule by the
+# UI side; `cargo doc` and a future `cargo publish` (currently `publish = false`) use it.
 repository = "https://github.com/Qualia2FA/Qualia2FA-Core"
 readme = "README.md"
 keywords = ["2fa", "totp", "hotp", "otp", "authentication"]
@@ -19,151 +19,172 @@ categories = ["authentication", "cryptography"]
 publish = false
 
 [dependencies]
-# ── 恢复密钥的口令派生 ────────────────────────────────────────────────────
-# Argon2id（RFC 9106），用于把用户口令变成恢复文件的加密密钥。
+# ── Passphrase derivation for the recovery key ───────────────────
+# Argon2id (RFC 9106), used to turn a user passphrase into the recovery file's
+# encryption key.
 #
-# 为什么是 Argon2id 而不是 PBKDF2/scrypt：恢复文件会被用户存进网盘、U 盘、
-# 邮件附件，必须假设攻击者拿得到文件本身，唯一的防线就是口令强度。PBKDF2
-# 是纯计算型，GPU 并行破解的收益极高；scrypt 内存硬但参数组合（N/r/p）容易
-# 被配成「看起来贵其实不贵」；Argon2id 是密码哈希竞赛的获胜者、RFC 9106 推荐，
-# 且同时抵抗 GPU 与侧信道（id 变体混合了数据相关与数据无关的内存访问）。
+# Argon2id rather than PBKDF2 or scrypt: a recovery file is stored on cloud drives,
+# USB sticks or mail attachments, so the attacker is assumed to hold the file and
+# passphrase strength is the only defence. PBKDF2 is purely computational, giving GPU
+# cracking a large payoff; scrypt is memory-hard but its N/r/p parameters are easy to
+# configure as "expensive-looking but cheap"; Argon2id won the Password Hashing
+# Competition, is recommended by RFC 9106, and resists GPUs and side channels at once
+# (the id variant mixes data-dependent with data-independent memory access).
 #
-# `password-hash` 无法关闭：argon2 0.6 的 lib.rs 无条件 `use password_hash::...`，
-# 该 feature 是实质必选项（尽管 Cargo.toml 把它列为可选）。它只带来 base64ct
-# 与一个小工具 crate，代价可接受。
+# `password-hash` cannot be switched off: argon2 0.6's lib.rs unconditionally
+# `use password_hash::...`, making the feature effectively mandatory even though
+# Cargo.toml lists it as optional. It pulls in base64ct plus one small utility crate.
 #
-# 开启 `zeroize`：让库内部的工作区（Argon2 的内存块）在析构时被擦除。默认参数
-# 一次要分配 64 MiB，不擦除等于把口令的派生中间态留在堆上。
+# `zeroize` is enabled so that the library's working area (Argon2's memory blocks) is
+# erased on drop. The default parameters allocate 64 MiB at a time, so not erasing
+# would leave the passphrase's derivation state on the heap.
 #
-# 不开 `parallel`：并行度固定为 1，理由见 src/recovery.rs 的 PARALLELISM。
+# `parallel` is not enabled: parallelism is fixed at 1, see PARALLELISM in
+# src/recovery.rs.
 argon2 = { version = "0.6.0", features = ["zeroize"] }
-# ── 认证加密 ──────────────────────────────────────────────────────────────
-# 保险库条目用 XChaCha20-Poly1305（RFC 8439 的 192-bit nonce 变体）。
+# ── Authenticated encryption ──────────────────────────────────────────
+# Vault entries are encrypted with XChaCha20-Poly1305 (the 192-bit nonce variant of
+# RFC 8439).
 #
-# 为什么必须是 192-bit nonce 而不是常见的 96-bit：多设备各自独立加密、彼此
-# 无中心协调，随机 nonce 是唯一现实选择。96-bit nonce 在随机取值下会撞生日界
-# （保险库规模下 `aes-gcm` 属于**不安全用法**）；192-bit 的随机 nonce 余量充足。
-# 另外 ChaCha 系列不依赖 AES-NI 硬件，在任何平台上行为一致。
+# The nonce is 192-bit rather than the usual 96-bit: devices encrypt independently of
+# each other with no central coordination, so random nonces are the only realistic
+# choice, and 96-bit random nonces hit the birthday bound at vault sizes (for
+# `aes-gcm` that is an unsafe usage), whereas 192-bit random nonces keep ample margin.
+# The ChaCha family also needs no AES-NI hardware and behaves identically everywhere.
 #
-# 推荐加密（RustCrypto 系），实现为纯 Rust，无 C/汇编依赖，交叉编译到
-# Android / iOS 不需要额外的工具链配置。
+# The recommended encryption (RustCrypto), implemented in pure Rust with no C or
+# assembly dependency, so cross-compiling to Android / iOS needs no extra toolchain
+# configuration.
 chacha20poly1305 = "0.11.0"
 
 form_urlencoded = "1.2"
-# 随机数只走 getrandom（OS CSPRNG），不经任何用户态 PRNG。
-# Android 上该 syscall 需 API 23；aarch64/arm/x86/x86_64 在更低版本有 /dev/urandom 回退。
+# Randomness comes only from getrandom (the OS CSPRNG), never from a userspace PRNG.
+# On Android the syscall needs API 23; aarch64/arm/x86/x86_64 fall back to
+# /dev/urandom on lower versions.
 getrandom = "0.4.3"
 
-# ── 子密钥派生 ────────────────────────────────────────────────────────────
-# HKDF-SHA256（RFC 5869），用于从主密钥派生用途分离的子密钥。
+# ── Subkey derivation ────────────────────────────────────────────────
+# HKDF-SHA256 (RFC 5869), used to derive purpose-separated subkeys from the master key.
 #
-# 这里**刻意不用 blake3**：blake3 会为每个目标平台编译 C 与手写汇编，
-# 在 Android 的交叉编译矩阵上引入额外的构建风险，而本项目只需要一个标准 KDF。
-# `hkdf` 是纯 Rust，且与已有的 `hmac` 同属 RustCrypto、同为 0.13 系列，
-# 不会引入第二份 `digest`/`hmac` 版本。
+# blake3 is deliberately not used: it compiles C and hand-written assembly for every
+# target platform, adding build risk to the Android cross-compilation matrix, while
+# this project needs only a standard KDF. `hkdf` is pure Rust and shares the
+# RustCrypto 0.13 series with the existing `hmac`, so it adds no second
+# `digest`/`hmac` version.
 #
-# 派生子密钥而非直接用主密钥加密，是为了让主密钥**不出现在任何密文的密钥
-# 位置**：主密钥将来还要参与设备配对与恢复（M3/M4），用途分离能限制单点泄露
-# 的影响范围。
+# Subkeys are derived rather than encrypting with the master key directly so that the
+# master key never occupies a ciphertext's key position: the master key also takes part
+# in device pairing and recovery, and purpose separation limits the blast radius of a
+# single leak.
 hkdf = "0.13"
 
 hmac = "0.13"
 
-# ── 同步载荷的压缩（M4） ──────────────────────────────────────────────────
-# 纯 Rust 的 deflate 实现。**刻意不用 `flate2`**：flate2 只是一层统一门面，它的
-# 默认后端是 C 的 miniz/zlib，要拿到纯 Rust 后端必须显式选 `rust_backend` feature
-# ——而那正是本 crate 唯一需要的东西。直接依赖 `miniz_oxide` 少一层间接，也少一次
-# 「后人动了 feature 就悄悄换成 C 后端」的机会。
+# ── Sync payload compression ──────────────────────────────────────────────
+# A pure-Rust deflate implementation. `flate2` is deliberately not used: it is only a
+# facade whose default backend is C miniz/zlib, and reaching the pure-Rust backend
+# requires explicitly selecting the `rust_backend` feature — which is the only thing
+# this crate needs. Depending on `miniz_oxide` directly removes one layer of
+# indirection and one chance of a later feature edit silently switching to the C
+# backend.
 #
-# 为什么必须纯 Rust：`qualia2fa-core` 有 `#![forbid(unsafe_code)]`，而且要交叉编译
-# 到 Android / iOS。C 依赖会让这两个目标各自需要一套构建配置，而本库的价值恰恰在于
-# 「任何平台行为一致、构建方式一致」。
+# Pure Rust is required because `qualia2fa-core` has `#![forbid(unsafe_code)]` and
+# cross-compiles to Android / iOS: a C dependency would give those two targets a build
+# configuration each, whereas this library's value is identical behaviour and identical
+# build steps on every platform.
 #
-# **刻意不用 `zstd`**：压缩率更好，但它是 C 实现（或一个需要 `unsafe` 的绑定），与
-# 本 crate 的纯度约定直接冲突。同步载荷是几千到几万条短记录，在这个规模上 deflate
-# 与 zstd 的差距不足以抵消引入 C 依赖的代价。
+# `zstd` is deliberately not used: it compresses better but is a C implementation (or a
+# binding that needs `unsafe`), which conflicts with the purity rule above. A sync
+# payload is a few thousand to a few tens of thousands of short records, a scale at
+# which the deflate/zstd gap does not pay for a C dependency.
 #
-# 许可证 `MIT OR Zlib OR Apache-2.0` 三选一，与 LGPL-3.0-or-later 兼容。
+# License `MIT OR Zlib OR Apache-2.0` (a choice of three), compatible with
+# LGPL-3.0-or-later.
 miniz_oxide = "0.9.1"
 
-# ── 设备身份（ECDSA P-256 验签） ──────────────────────────────────────────
-# 只用于**验签**，不用于签名：设备私钥住在平台硬件里，签名由
-# `qualia2fa-keystore` 发起。验证则必须能被任何设备执行，包括那些自己根本不
-# 持有硬件密钥的设备，所以它属于核心库。
+# ── Device identity (ECDSA P-256 verification) ────────────────────────────
+# Used for verification only, never for signing: the device private key lives in
+# platform hardware and signing is initiated by the platform key store. Verification
+# must be executable by any device, including one that holds no hardware key itself,
+# so it belongs to the core library.
 #
-# 版本必须留在 0.14。它的 `ecdsa` feature 依赖 `sha2 ^0.11`，与本库**同代**，
-# 因而不产生第二份 SHA-2。`p256 0.13`（例如 `hardware-enclave` 用的那个）依赖
-# `sha2 ^0.10`，一旦混用，二进制里就会出现两份 SHA-2 与两套互不兼容的 P-256
-# 类型。那不只是体积问题：两份实现意味着「常量时间」这类性质要在两处分别论证，
-# 而我们无法对其中任何一处给出保证。
+# The version must stay at 0.14. Its `ecdsa` feature depends on `sha2 ^0.11`, the same
+# generation as this library, so it adds no second SHA-2. `p256 0.13` depends on
+# `sha2 ^0.10`, and mixing the two puts two SHA-2 implementations and two incompatible
+# sets of P-256 types in one binary. That is not merely a size problem: two
+# implementations mean properties such as constant-time behaviour must be argued twice,
+# and we can guarantee neither.
 #
-# 关掉 default features 再显式开 `ecdsa`：默认集里的 `pem` 会拉进 `pkcs8` 与
-# `elliptic-curve/pem`，而我们的线格式只有 SEC1 未压缩点与原始 r||s 两种，
-# 都不需要 PEM。
+# Default features are off and `ecdsa` is enabled explicitly: the default set's `pem`
+# pulls in `pkcs8` and `elliptic-curve/pem`, whereas our wire format has only SEC1
+# uncompressed points and raw r||s, neither of which needs PEM.
 #
-# `ecdh` 用于 M3 的配对密钥协商（见 `src/pairing.rs`）。**刻意复用 P-256 而不是
-# 引入 X25519**：P-256 的余因子是 1，不存在小阶点，因此 ECDH 结果不像 X25519
-# 那样需要靠「检查输出是否全零」来防小阶点攻击——少一条容易漏掉的检查，也少一份
-# 需要额外审计的椭圆曲线实现。代价是标量乘法比 X25519 慢，而一次配对只做两次，
-# 完全可以忽略。
+# `ecdh` supports the pairing key agreement (see `src/pairing.rs`). P-256 is reused
+# rather than adding X25519: P-256 has cofactor 1 and no small-order points, so an ECDH
+# result needs no "reject an all-zero output" check the way X25519 does — one less
+# check to get wrong, and one less elliptic-curve implementation to audit. The cost is
+# that scalar multiplication is slower than X25519, and a pairing performs it twice.
 #
-# 曲线选择见 `qualia-dik` 的 `device` 模块文档：P-256 是两个移动平台上**唯一**
-# 能进硬件的签名算法，这是强约束而非偏好。
+# Curve choice is documented in `qualia-dik`'s `device` module: P-256 is the only
+# signing algorithm that reaches hardware on both mobile platforms, a hard constraint
+# rather than a preference.
 #
-# 本 crate 直接用到 `p256` 的只有配对协议里的 ECDH（`ecdh` feature）；设备身份的
-# 公钥解析与验签**已经搬到 `qualia-dik`**，由它自己声明 `p256`。两边的版本必须一致，
-# 否则一个二进制里会出现两条 P-256 实现。
+# The only direct use of `p256` in this crate is the pairing protocol's ECDH (`ecdh`
+# feature); device identity public-key parsing and verification live in `qualia-dik`,
+# which declares `p256` itself. The versions on both sides must match, or one binary
+# ends up with two P-256 implementations.
 p256 = { version = "0.14", default-features = false, features = ["ecdh", "ecdsa", "std"] }
 
-# 设备身份：公钥表示、指纹、验签，以及平台硬件密钥库。
+# Device identity: public-key representation, fingerprint and verification, plus the
+# platform hardware key store.
 #
-# # 为什么它是一个独立的、发布到 crates.io 的 crate
+# It is a separate crate published to crates.io because what it does — generate a P-256
+# identity key pair in platform hardware and represent/verify such an identity — is
+# unrelated to this crate's vault format, sync protocol and pairing flow, so any
+# project needing a hardware device identity can use it directly. The dependency
+# direction is therefore qualia-dik ← this crate, never the reverse. It is also the only
+# crate in the project allowed to use `unsafe`, since platform FFI calls are inherently
+# unsafe while this crate has `#![forbid(unsafe_code)]`.
 #
-# 它做的是「在平台硬件里生成一对 P-256 身份密钥」以及「表示与验证这种身份」，两者
-# 都与本 crate 的保险库格式、同步协议、配对流程**无关**。任何需要硬件设备身份的项目
-# 都能直接用它，不需要接受 Qualia2FA 的任何设计。因此依赖方向是它 ← 本 crate，
-# 而不是反过来。
-#
-# 它也承担了「整个项目里唯一允许 `unsafe` 的地方」这个角色——平台 FFI 调用本质上
-# 就是 unsafe，而本 crate 有 `#![forbid(unsafe_code)]`。
-#
-# # 为什么是版本号而不是路径
-#
-# 它已经发布到 crates.io（`qualia-dik 0.1.0`，之后由它自己的 `publish.yml` 在打
-# `v*` 标签时更新）。
-#
-# 版本号是**唯一**能让本地、CI 与第三方消费者看到同一份源码的写法：路径依赖会让
-# 同一个物理目录在不同仓库里被不同的相对路径引用，Cargo 于是把它们当成两个包
-# （`package collision in the lockfile`）；而把上游检出到工作区**之外**的
-# `../Xxx` 在 GitHub Actions 上会被 `actions/checkout` 直接拒绝。
-#
-# 本地要改这个库的代码时，用 `[patch.crates-io]` 临时指到同级目录即可——那是
-# `[patch]` 的正当用途，且它只影响本工作区。
+# A version number is used rather than a path because qualia-dik is published to
+# crates.io and is the only form in which local, CI and third-party consumers see the
+# same source: a path dependency makes one physical directory reachable through
+# different relative paths in different repositories, which Cargo treats as two
+# packages (`package collision in the lockfile`), and an `../Xxx` checkout outside the
+# workspace is rejected outright by `actions/checkout` on GitHub Actions. To work on
+# that crate locally, point `[patch.crates-io]` at the sibling directory temporarily —
+# a legitimate `[patch]` use that affects only this workspace.
 qualia-dik = "0.1"
 
-# 秘密材料容器（`SecretBox` / `SecretSlice` / `SecretString` / `ExposeSecret`）。
-# 依赖审计（人工逐项核过，cargo-deny 不做依赖必要性判断）：
-#   - 唯一必需依赖是 `zeroize ^1.6`，与本 crate 原先所用版本同一 major，
-#     不会产生重复版本（`cargo tree` 实证全树只有一个 zeroize）。
-#   - 可选依赖 `serde ^1` 本 crate 不启用，故不进依赖树。
-#   - 上游 monorepo `iqlusioninc/crates` 活跃（未归档、近期有推送）；
-#     crate 本身自 2024-10 无新版本，属「成熟稳定」而非「废弃」，且实现为
-#     纯逻辑封装（无 unsafe、无 FFI）。库内**仅 src/secret.rs 接触它**，
-#     以便必要时整体替换。详见仓库外的 TODO.md §4.3。
+# Secret-material containers (`SecretBox` / `SecretSlice` / `SecretString` /
+# `ExposeSecret`). Dependency audit, checked item by item (cargo-deny does not judge
+# whether a dependency is necessary):
+#   - The only required dependency is `zeroize ^1.6`, the same major version this crate
+#     used before, so no duplicate version appears (`cargo tree` shows exactly one
+#     zeroize in the whole tree).
+#   - The optional `serde ^1` dependency is not enabled here and stays out of the tree.
+#   - The upstream monorepo `iqlusioninc/crates` is active (not archived, recently
+#     pushed to); the crate itself has had no release since 2024-10, making it mature
+#     and stable rather than abandoned, and it is a pure logic wrapper (no unsafe, no
+#     FFI). Only src/secret.rs touches it, so it can be swapped out wholesale if needed.
 secrecy = "0.10.3"
 sha1 = "0.11"
 sha2 = "0.11"
 subtle = "2.6"
 
-# 库公共 API 的错误类型一律用 thiserror；`anyhow` 禁止进入库的对外签名。
+# The library's public API uses thiserror for all error types; `anyhow` must not appear
+# in a public signature.
 thiserror = "2.0.21"
 
-# 刻意**不**直接依赖 `zeroize`：它已由 `secrecy` 传递引入，且 `secrecy`
-# 自行 `pub use zeroize`，需要用到 `Zeroize` trait 时从 `secrecy::zeroize` 取。
-# 避免直接依赖可防止与 secrecy 的版本要求各自漂移。若将来出现 secrecy 未覆盖
-# 的秘密类型（需自行实现 Drop 擦除），再显式加回并同时开启其 `derive` 特性。
+# `zeroize` is deliberately not a direct dependency: it arrives transitively through
+# `secrecy`, which does its own `pub use zeroize`; reach the `Zeroize` trait as
+# `secrecy::zeroize`. Not depending on it directly keeps the two version requirements
+# from drifting apart. If a secret type ever appears that `secrecy` does not cover (and
+# therefore needs its own `Drop` erasure), add it back explicitly together with its
+# `derive` feature.
 
 [dev-dependencies]
-# 基于属性的测试。用于验证「对任意输入都成立」的性质，
-# 与 fuzz（fuzz/ 目录，找 panic 与内存问题）分工不同，两者都要有。
+# Property-based testing, for properties that must hold for arbitrary input. It
+# complements fuzzing (the fuzz/ directory, which looks for panics and memory
+# problems); both are needed.
 proptest = "1.12.0"
