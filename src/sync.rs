@@ -13,61 +13,60 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! 同步载荷的信封：序列化 → 压缩 → 整体 AEAD。
+//! Envelope for sync payloads: serialize → compress → whole-payload AEAD.
 //!
-//! # 这一层负责什么
+//! # Responsibility
 //!
-//! 把「一台设备的条目与墓碑」变成一段**可以经由任何通道搬运的字节**，以及反过来。
-//! 它不知道载荷会走二维码、局域网还是别的什么，也不知道对面是谁——**传输无关性
-//! 是设计决定，不是巧合**（见 [`crate::sync`] 的模块文档）。
+//! Turn "one device's entries and tombstones" into a byte string that can be carried over
+//! any channel, and back again. It does not know whether a payload travels by QR code, over
+//! a LAN, or by some other means, nor who the peer is: this layer is transport-agnostic and
+//! depends on no transport module.
 //!
-//! # 三层结构，以及每层各自挡住什么
+//! # Three layers, and what each of them stops
 //!
 //! ```text
-//! ┌─ 外层信封（明文头 + 整体 AEAD）──────────────────────────────────┐
-//! │  魔数 8 | 版本 1 | 种类 1 | sync_id 32 | 设备 ID 32 | nonce 24   │
-//! │          | 密文（含认证标签）                                    │
-//! │  ┌─ 内层：压缩 ─────────────────────────────────────────────┐   │
-//! │  │  ┌─ 载荷明文 ────────────────────────────────────────┐  │   │
-//! │  │  │ 记录数 4 | 记录 × N                                │  │   │
-//! │  │  │   每条：entry_id 16 | nonce 24 | 长度 4 | 密文     │  │   │
-//! │  │  └────────────────────────────────────────────────────┘  │   │
-//! │  └──────────────────────────────────────────────────────────┘   │
+//! ┌─ outer envelope (plaintext header + whole-payload AEAD) ─────────┐
+//! │  magic 8 | version 1 | kind 1 | sync_id 32 | device ID 32        │
+//! │  nonce 24 | ciphertext (including authentication tag)            │
+//! │  ┌─ inner: compression ──────────────────────────────────┐       │
+//! │  │  ┌─ payload plaintext ───────────────────────────┐    │       │
+//! │  │  │ record count 4 | record × N                   │    │       │
+//! │  │  │   each: entry_id 16 | nonce 24 | len 4 | ct   │    │       │
+//! │  │  └───────────────────────────────────────────────┘    │       │
+//! │  └───────────────────────────────────────────────────────┘       │
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! 明文头的其余部分（魔数、版本、种类、`sync_id`、设备 ID）整体充当外层 AAD，因此在
-//! 线格式里它们**只出现一次**。
+//! The remainder of the plaintext header (magic, version, kind, `sync_id`, device ID)
+//! serves as the outer AAD as a whole, so on the wire those fields appear exactly once.
 //!
-//! - **内层逐条 AEAD**（种类 + entry_id + 版本入 AAD）：挡住「把条目 A 的密文搬到
-//!   条目 B 的位置」「把墓碑当成条目」。这一层的密钥与保险库文件的**不是同一把**
-//!   （HKDF 的 salt 不同），因此两个域的密文互不可解。见 [`derive_record_key`]。
-//! - **外层整体 AEAD**：挡住「从两份不同的载荷里各取一部分拼起来」。内层逐条认证
-//!   无法发现这种拼接——每一条单独都是合法的。外层的 AAD 含整个明文头，因此任何
-//!   一条挪动都会让外层认证失败。
-//! - **压缩**不参与任何安全性质，只把字节变短。
+//! - **Inner per-record AEAD** (kind + `entry_id` + format version in the AAD): stops
+//!   moving the ciphertext of entry A into the slot of entry B, and stops presenting a
+//!   tombstone as an entry. Its key is **not** the record key of the vault file (the HKDF
+//!   salt differs), so ciphertexts of the two domains cannot be opened across domains. See
+//!   [`derive_record_key`]. Merging accepts records one at a time and stores them verbatim,
+//!   so this per-record binding is what keeps a stored record matching its identifier.
+//! - **Outer whole-payload AEAD**: stops splicing together parts of two different
+//!   payloads. Per-record authentication cannot detect such a splice, because every record
+//!   is valid on its own. The outer AAD covers the entire plaintext header, so moving any
+//!   of those fields makes the outer authentication fail.
+//! - **Compression** takes part in no security property; it only makes the bytes shorter.
 //!
-//! # 明文里为什么**没有**记录种类
+//! # The plaintext carries no record kind
 //!
-//! 一条记录是「活条目」还是「墓碑」只写在**内层 AAD** 里，不在载荷明文里。这样做的
-//! 代价是解密时要按两种种类各试一次（见 [`record`]），换来的是**连「这次同步带了几条
-//! 删除」都看不出来**——而删除的存在本身就是敏感信息。这条设计曾经留下一个真实的 bug：
-//! 记录头长度的常量里多算了一个种类字节，而当时那条「盯着线格式」的测试是恒等式，
-//! 于是它绿了很久。
+//! Whether a record is a live entry or a tombstone is written only in the **inner AAD**,
+//! not in the payload plaintext. The cost is that opening a record tries both kinds (see
+//! [`record`]); the benefit is that not even the number of deletions in a sync is visible,
+//! and the existence of a deletion is itself sensitive information. `RECORD_HEADER_LEN`
+//! therefore counts no kind byte.
 //!
-//! # 为什么内层还要逐条认证（外层不是已经整体认证了吗）
+//! # Replay
 //!
-//! 外层保证了「这一整份载荷确实来自持有主密钥的设备」，但**合并是逐条进行的**：
-//! 一条条目被接受之后，它的密文会被原样收进本地保险库。若内层不逐条认证，一份
-//! 合法的载荷就能让接收方**永久存下**一条内容与标识不匹配的记录——外层的保护在
-//! 那一刻已经用完了。
-//!
-//! # 重放
-//!
-//! 载荷带一个 32 字节随机 `sync_id`。合并本身是幂等的（重复合并同一份数据结果
-//! 不变），因此重放**不破坏正确性**；但它会白做一次完整的解密与合并，还会让界面上
-//! 的「上次同步时间」变成攻击者可任意推动的值。因此 [`SeenSyncIds`] 记住处理过的
-//! 标识，重复的直接拒绝。
+//! Every payload carries a 32-byte random `sync_id`. Merging is idempotent (merging the
+//! same data twice yields the same result), so a replay does not break correctness; it does
+//! waste a full decryption and merge, and it lets an attacker move the "last sync time"
+//! shown in the UI to any value. [`SeenSyncIds`] therefore records the identifiers that
+//! were processed, and rejects repeats outright.
 
 pub mod compress;
 mod merge;
@@ -84,86 +83,81 @@ use qualia_dik::{DEVICE_ID_LEN, DeviceId};
 pub use record::{OpenedRecord, open as open_record, seal_entry, seal_tombstone};
 pub use seen::{MAX_SEEN_SYNC_IDS, SeenSyncIds};
 
-/// 载荷魔数。8 字节，与保险库文件一样留一个 NUL 让它能在十六进制编辑器里认出来。
+/// Payload magic. 8 ASCII bytes, chosen to be recognizable in a hex editor.
 pub const MAGIC: &[u8; 8] = b"Q2FASYNC";
 
-/// 当前写入的同步载荷格式版本。
+/// Payload format version currently written.
 ///
-/// 与 [`crate::vault::FORMAT_VERSION`] **完全独立**：那个管保险库文件的布局，这个管
-/// 载荷的布局。两者各自演进，互不牵连——把「载荷格式变了」与「文件格式变了」绑成
-/// 一件事，会让任一处的改动都要求另一处跟着表态。
+/// **Fully independent** of [`crate::vault::FORMAT_VERSION`]: that one governs the layout of
+/// vault files, this one the layout of payloads. The two evolve separately; binding "the
+/// payload format changed" to "the file format changed" would make any change in one of them
+/// require a statement from the other.
 ///
-/// # 版本 1 → 2：外层 AAD 加了「载荷种类」
+/// # Version 1 → 2: the payload kind joined the outer AAD
 ///
-/// 版本 1 的 AAD 只有 `魔数 || 版本 || sync_id || 发送方`，因此一份「请求对方把它的
-/// 保险库发过来」的载荷与一份「这是我全量状态」的载荷**在外层无法区分**。两者都是
-/// 空记录集时甚至字节结构完全相同，于是接收方只能靠约定猜——而猜错的方向是「把一份
-/// 空的全量状态当成请求」，那会让两端都等着对方先发。
+/// The version 1 AAD was only `magic || version || sync_id || sender`, so a payload asking
+/// the peer to send its vault and a payload saying "this is my full state" were
+/// **indistinguishable in the outer layer**. With an empty record set both even had exactly
+/// the same byte structure, leaving the receiver to guess from convention — and the wrong
+/// guess ("an empty full state" read as a request) makes both sides wait for the other to
+/// start.
 ///
-/// 版本 2 在 [`PayloadKind`] 上把这件事说清楚，并把它绑进 AAD：种类因此是**被认证
-/// 的**，第三方改不了。
+/// Version 2 states this explicitly in [`PayloadKind`] and binds it into the AAD: the kind is
+/// therefore **authenticated** and a third party cannot change it.
 ///
-/// # 它同时参与**内层**记录的 AAD
+/// # It also takes part in the **inner** record AAD
 ///
-/// 改它会让既有载荷的内层记录解不开。这正是跨版本搬运要挡的东西：一个旧版本的内层
-/// 记录不该被塞进新版本的载荷。
+/// Changing it makes the inner records of existing payloads unopenable. That is what stops
+/// cross-version transplanting: an inner record of an older version must not be moved into a
+/// newer payload.
 pub const FORMAT_VERSION: u8 = 2;
 
-/// 只被版本 1 用过的载荷版本号。
+/// Payload version number used only by version 1.
 ///
-/// **没有任何版本 1 的载荷存在于世上**：这个格式从未发布过。留着这个常量只有一个
-/// 用处——让「版本 1 的输入必须被明确拒绝」这件事有一个名字可指，从而能写一条测试
-/// 盯着它。刻意**不**提供按版本 1 还原 AAD 的路径：版本 1 与版本 2 的 AAD 不同长，
-/// 于是 `open` 里会出现「按输入版本选 AAD 长度」这种分支，而那条分支没有任何真实
-/// 输入能走到——它只会成为一个将来某次改动悄悄破坏掉、且没人会发现的地方。
+/// **No version 1 payload has ever existed**: that format was never released. The constant
+/// has exactly one purpose — giving "version 1 input must be rejected explicitly" a name to
+/// refer to, so a test can pin it down. No path reconstructing the version 1 AAD is provided
+/// on purpose: the version 1 and version 2 AADs differ in length, so `open` would grow a
+/// branch selecting the AAD length from the input version, and no real input could ever
+/// reach it.
 ///
-/// 这与 [`crate::vault::READABLE_VERSIONS`] 的「只增不减」不矛盾：那条规则针对的是
-/// **用户文件**（用户手里有旧文件，必须一直能打开）。载荷是即时的，不落盘、不跨版本
-/// 存活。
-/// # 它为什么是 `#[cfg(test)]`
+/// This does not contradict "only grows" in [`crate::vault::READABLE_VERSIONS`]: that rule
+/// covers **user files** (a user holds old files and must keep being able to open them).
+/// Payloads are transient — they never touch disk and need not survive across versions.
 ///
-/// 生产代码**没有**任何理由提到这个版本号——它只会用来构造一份「版本 1」的输入以
-/// 验证那类输入被拒绝。写成 `#[cfg_attr(not(test), expect(dead_code, ...))]` 会失败：
-/// 一个 `pub(crate)` 常量在库构建里**不**触发 `dead_code`，于是那条 `expect` 永远
-/// 不被满足，而 `-D warnings` 把 `unfulfilled_lint_expectations` 变成错误。条件编译
-/// 才是这里正确的表达方式。
+/// Only tests use it, so the constant is `#[cfg(test)]`. A `pub(crate)` constant does **not**
+/// trigger `dead_code` in a library build, so `expect(dead_code, ...)` would be an
+/// unfulfilled expectation and `-D warnings` rejects it.
 #[cfg(test)]
 pub(crate) const LEGACY_FORMAT_VERSION_1: u8 = 1;
 
-/// 一份载荷**要对方做什么**。
+/// What a payload **asks the peer to do**.
 ///
-/// # 为什么要与「记录种类」分开
+/// Separate from the `vault` record kind, which describes one record **inside** a payload
+/// (entry or tombstone); this one describes the payload as a whole.
 ///
-/// `vault` 里那个表示「这一条记录是一条条目还是一条墓碑」的种类描述的是**载荷内部**。
-/// `PayloadKind` 说的是「这整份载荷是一次状态交换还是一次请求」——它描述**载荷本身**。
-/// 把两者合成一个字段会让「一个只装墓碑的请求」这种组合无法表达。
-///
-/// # 为什么它必须被认证
-///
-/// 种类决定接收方**要不要回一份载荷**。若不认证，第三方把一份全量状态改成「请求」，
-/// 就能让接收方把自己整份保险库发回去——一次由攻击者触发的、本不该发生的传输。
+/// It takes part in the outer AAD and is therefore authenticated. The kind decides whether
+/// the receiver **sends a payload back**, and an unauthenticated one could be changed by a
+/// third party into a request that makes the receiver send its entire vault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadKind {
-    /// 这是发送方的**全量状态**，收下并合并即可。
+    /// The sender's **full state**: accept it and merge.
     Vault,
-    /// 这是发送方的**请求**：请把你的全量状态发给我。
+    /// The sender's **request**: send me your full state.
     ///
-    /// # 请求的载荷里为什么没有记录
+    /// A request carries **no** records: "what I want" is a **set**, and in real use that set
+    /// is "everything". The receiver answers with [`Payload::from_vault`]. Incremental sync
+    /// will add a list of wanted IDs here rather than introduce a different format — the same
+    /// convention described on [`Payload::from_vault`].
     ///
-    /// 「我想要什么」是一个**集合**，而集合在真实使用里就是「全部」。因此请求不携带
-    /// 记录，接收方的回应用的是 [`Payload::from_vault`]。将来做增量同步时，这里会
-    /// 加上一个「我要这些 ID」的列表，而不是换一套格式——与
-    /// [`Payload::from_vault`] 的文档里说的是同一个约定。
-    ///
-    /// # 它为什么必须存在，而不是「空载荷就表示请求」
-    ///
-    /// 一台刚注册、没有任何条目的设备发起全量同步时，载荷**也是**空的。靠「空不空」
-    /// 区分这两件事会让新设备加入这条路径上多一个必然错的分支。
+    /// It is a distinct variant rather than "an empty payload means a request": a freshly
+    /// registered device with no entries yet sends a full sync whose payload is **also**
+    /// empty.
     Request,
 }
 
 impl PayloadKind {
-    /// 线格式里的字节值。
+    /// Byte value on the wire.
     #[must_use]
     pub const fn as_byte(self) -> u8 {
         match self {
@@ -172,7 +166,7 @@ impl PayloadKind {
         }
     }
 
-    /// 从线格式的字节还原。
+    /// Restore from a wire byte.
     #[must_use]
     pub const fn from_byte(value: u8) -> Option<Self> {
         match value {
@@ -183,219 +177,219 @@ impl PayloadKind {
     }
 }
 
-/// 载荷明文头的长度：魔数 + 版本 + 种类 + sync_id + 发送方。
+/// Length of the payload plaintext header: magic + version + kind + sync_id + sender.
 ///
-/// 这里**没有**「发送方是谁」之外的字段——发送方标识就在头里，因为它是外层 AAD 的
-/// 一部分（被认证但不是秘密，见 [`Payload::sender`]）。
+/// It holds no field beyond "who the sender is" — the sender identifier is in the header
+/// because it is part of the outer AAD (authenticated but not secret, see
+/// [`Payload::sender`]).
 ///
-/// # 发送方为什么是 32 字节
-///
-/// 它是 [`DeviceId`]（设备身份公钥的 SHA-256），不是 16 字节的
-/// [`EntryId`]。两者容易混：`EntryId` 标识**保险库里的一条记录**，[`DeviceId`] 标识
-/// **一台设备**。同步层要判定「谁在跟我说话」，那只能靠后者——前者是随机的，跨会话
-/// 认不出同一台设备。
+/// The field is a [`DeviceId`] (32 bytes, the SHA-256 of the device identity public key),
+/// not the 16-byte [`EntryId`]: `EntryId` identifies **a record in the vault** and is random,
+/// while [`DeviceId`] identifies **a device** and is what "who is talking to me" resolves to.
 pub const HEADER_LEN: usize = MAGIC.len() + 1 + 1 + SYNC_ID_LEN + DEVICE_ID_LEN;
 
-/// 载荷标识的长度。
+/// Length of a payload identifier.
 ///
-/// 256-bit，与条目 ID 同宽：它只需要抗碰撞，不需要抗猜测（知道别人的载荷标识没有
-/// 任何用处——载荷本身是被 AEAD 保护的）。
+/// 256-bit, as wide as an entry ID: it needs collision resistance, not resistance to
+/// guessing (knowing someone else's payload identifier is of no use — the payload itself is
+/// protected by AEAD).
 pub const SYNC_ID_LEN: usize = 32;
 
-/// 一次同步的标识。
+/// Identifier of one sync.
 ///
-/// 由发起方随机生成，用于**接收方**识别重复载荷。它不是秘密。
+/// Generated randomly by the initiator and used by the **receiver** to recognize duplicate
+/// payloads. It is not a secret.
 pub type SyncId = [u8; SYNC_ID_LEN];
 
-/// 单条记录在载荷明文里的固定部分长度：`entry_id` + nonce + 密文长度。
+/// Length of the fixed part of one record in the payload plaintext: `entry_id` + nonce +
+/// ciphertext length.
 ///
-/// # 为什么这里**没有**种类字节
+/// The record kind byte is part of the inner AAD, but **not** of the plaintext, so not even
+/// the number of deletions in a sync is visible; opening a record tries both kinds (see the
+/// module documentation of [`record`]).
 ///
-/// 种类是内层 AAD 的一部分，但**不**在明文里——这是刻意的，让攻击者连「这次同步
-/// 带了几条删除」都看不出来。代价是解密时要按两种种类各试一次（见 [`record`] 的
-/// 模块文档）。
-///
-/// 这个常量曾经写成 `1 + EntryId::LEN + NONCE_LEN + 4`，那个 `1` 是从更早一版
-/// 「明文里写一个占位种类字节」的设计留下来的。它不会造成解析错误（解析器按长度
-/// 前缀读，不按这个常量），只会让 [`Record::encoded_len`] 每条多报一个字节——也
-/// 就是让任何按它算出来的载荷大小估计偏大。
+/// The parser does not depend on this constant — it reads records by their length prefix.
+/// [`Record::encoded_len`] does, so the constant must count exactly the bytes the framing
+/// actually writes.
 const RECORD_HEADER_LEN: usize = EntryId::LEN + NONCE_LEN + 4;
 
-/// 载荷里允许的记录数上限。
+/// Maximum number of records allowed in a payload.
 ///
-/// 与保险库文件的 [`crate::vault::MAX_RECORDS`] 同源但不共用常量：两者是**不同**的
-/// 限制（文件是本地存储，载荷来自网络）。分开定义让「放宽其中一个」不必同时放宽
-/// 另一个。
+/// Shares its origin with [`crate::vault::MAX_RECORDS`] for vault files but is a separate
+/// constant: the two are **different** limits (a file is local storage, a payload arrives
+/// over the network). Defining them separately means relaxing one does not relax the other.
 pub const MAX_RECORDS: usize = 1_000_000;
 
-/// 载荷明文的长度上限（压缩**前**）。
+/// Length limit of the payload plaintext (**before** compression).
 ///
-/// 记录数上限与实际记录长度共同决定这个值；解压层另有自己的上限
-/// （[`compress::MAX_DECOMPRESSED_LEN`]），两者都要过。这里限制的是**我们自己
-/// 生成**的载荷，用于在生成阶段就拒绝明显不合理的数据集。
+/// The record count limit together with actual record lengths decides this value; the
+/// decompression layer has a limit of its own ([`compress::MAX_DECOMPRESSED_LEN`]) and both
+/// must pass. This one bounds payloads **we generate**, rejecting obviously unreasonable
+/// data sets while they are being built.
 pub const MAX_PLAINTEXT_LEN: usize = 64 * 1024 * 1024;
 
-/// 从主密钥派生**同步记录**子密钥所用的 HKDF salt。
+/// HKDF salt used to derive the **sync record** subkey from the master key.
 ///
-/// # 为什么是两个不同的 salt，而不是两组不同的 info
+/// The two domains are separated at the **key level** by this salt, not by the AAD bytes: the
+/// record kind byte and the format version field can hold the same values in both domains, so
+/// a compile-time assertion at the end of `sync.rs` checks that the kind bytes do not overlap.
 ///
-/// HKDF 的 `salt` 与 `info` 都能做到域分离，但**用 salt 分离是更强的那种**：它让两个
-/// 域的子密钥在计算上完全独立（salt 直接参与 HKDF-Extract），而 info 只参与 Expand。
+/// The vault entry key uses an all-zero salt; changing that derivation would make every
+/// existing `.q2fa` file unopenable.
 ///
-/// 这里必须强分离，因为两个域的**记录种类字节与格式版本字段都可能相同**。若域分离
-/// 只靠那两个字节，就得依赖「同步的记录种类恰好与保险库的不一样」这个巧合一直成立
-/// ——而它是一个可以悄悄失效的性质：后人给同步加一种记录、顺手用了 `0x03`，就与保险
-/// 库将来的某种记录撞上了。用不同的 salt 让两域在**密钥层面**分开，与 AAD 怎么排无关。
-/// （`sync.rs` 末尾另有一个编译期断言盯着种类字节不重叠，那是第二道防线。）
+/// # The value of this constant is an external contract
 ///
-/// 保险库那边的条目密钥用的是全零 salt（那是这个仓库里最早定下的派生，改它会让所有
-/// 既有的 `.q2fa` 文件打不开）。
-///
-/// # 这个常量的值是对外契约
-///
-/// 它就是 32 字节 ASCII，改一个字符会让所有既有同步载荷（含二维码里那些已经发出去的）
-/// 解不开。写成字面量的 32 字节数组而不是字符串常量加断言，是为了让长度错误在**编译
-/// 期**就被 `[u8; 32]` 的类型检查发现——一个写成 31 或 33 的字符串常量在断言版本里
-/// 要等到构建才报错，而报错信息指向断言而不是那个字符串。
+/// It is 32 ASCII bytes, and changing one character makes every existing sync payload
+/// (including those already sent inside QR codes) unopenable. Writing it as a literal
+/// 32-byte array rather than a string constant plus an assertion lets the type check of
+/// `[u8; 32]` catch a wrong length at **compile time**.
 pub const HKDF_SALT_SYNC: [u8; 32] = *b"Qualia2FA sync salt v1 (records)";
 
-/// 从主密钥派生**同步记录**子密钥。
+/// Derive the **sync record** subkey from the master key.
 ///
-/// 与保险库文件的条目子密钥**不是同一把**，理由见 [`HKDF_SALT_SYNC`]。
+/// It is **not** the vault file entry subkey; see [`HKDF_SALT_SYNC`].
 ///
-/// 一次同步只派生一次，然后传给每条记录——载荷里可能有上万条，逐条重新派生会把
-/// 两次 HMAC-SHA256 乘以条目数。
+/// It is derived once per sync and then passed to every record: a payload can hold tens of
+/// thousands of records, and deriving again per record would multiply two HMAC-SHA256
+/// computations by the number of entries.
 pub fn derive_record_key(master: &MasterKey) -> Result<[u8; 32]> {
     crypto::derive_key_with_salt(master, &HKDF_SALT_SYNC, crypto::HKDF_INFO_SYNC_RECORD)
 }
 
-/// 从主密钥派生**外层信封**子密钥。
+/// Derive the **outer envelope** subkey from the master key.
 ///
-/// 与同步记录子密钥、保险库子密钥、检查值派生各自独立。外层与内层用不同的密钥是
-/// 刻意的：外层加密的是「已经逐条加密过的字节」，两层若共用一把密钥，内层密文就
-/// 成了外层明文的一部分，而「同一把密钥既加密明文又加密密文」是教科书式的误用。
+/// Independent of the sync record subkey, of the vault subkeys, and of the check-value
+/// derivation. Outer and inner use different keys on purpose: the outer layer encrypts bytes
+/// that are **already encrypted per record**, and if the two layers shared one key the inner
+/// ciphertext would become part of the outer plaintext — using one key to encrypt both
+/// plaintext and ciphertext is a textbook misuse.
 pub fn derive_envelope_key(master: &MasterKey) -> Result<[u8; 32]> {
     crypto::derive_key_with_salt(master, &HKDF_SALT_SYNC, crypto::HKDF_INFO_SYNC_ENVELOPE)
 }
 
-/// 载荷里的一条记录：一段已经逐条加密的密文，连同它明文部分的定位信息。
+/// One record in a payload: a per-record ciphertext together with the cleartext information
+/// that locates it.
 ///
-/// # 一条记录不知道自己是「条目」还是「墓碑」
+/// # A record does not know whether it is an entry or a tombstone
 ///
-/// 种类在密文里（它是 AAD 的一部分，但**不**在记录头里）。这是刻意的：让攻击者连
-/// 「这次同步带了几条删除」都看不出来。代价是解密时要按两种种类各试一次，理由与代价
-/// 的权衡见 [`record`] 的模块文档。
+/// The kind lives in the ciphertext (it is part of the AAD but **not** of the record
+/// header), so not even the number of deletions in a sync is visible. The cost is that
+/// opening a record tries both kinds; see the module documentation of [`record`] for the
+/// trade-off.
 ///
-/// # `Clone` 为什么可以有
-///
-/// 它只带**密文**，不带任何解密后的内容，因此复制它不扩大密钥材料的泄露面。测试需要
-/// 复制它来逐字节篡改，那是这条 `derive` 存在的主要理由。
+/// It carries **ciphertext only**, never decrypted content, so `Clone` does not widen the
+/// exposure of key material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
-    /// 这条记录属于哪个条目。
+    /// Which entry this record belongs to.
     pub entry_id: EntryId,
-    /// 加密这条记录用的随机 nonce。
+    /// Random nonce used to encrypt this record.
     pub nonce: [u8; NONCE_LEN],
-    /// 密文，**含** 16 字节认证标签。
+    /// Ciphertext, **including** the 16-byte authentication tag.
     pub ciphertext: Vec<u8>,
 }
 
 impl merge::HasEntryId for Record {
-    /// 这条记录讲的是哪一个条目。
+    /// Which entry this record is about.
     ///
-    /// `entry_id` 同时参与内层 AAD，因此它是被认证的——攻击者无法把一条记录的标识改
-    /// 成另一个值而让它仍然解得开。
+    /// `entry_id` also takes part in the inner AAD, so it is authenticated: an attacker
+    /// cannot change a record's identifier to another value and still open it.
     fn entry_id(&self) -> EntryId {
         self.entry_id
     }
 }
 
 impl Record {
-    /// 这条记录在载荷明文里占的字节数。
+    /// Number of bytes this record occupies in the payload plaintext.
     #[must_use]
     pub fn encoded_len(&self) -> usize {
         RECORD_HEADER_LEN + self.ciphertext.len()
     }
 }
 
-/// 一份载荷的内容：本次要送出去的全部记录。
+/// The content of a payload: every record to be sent this time.
 ///
-/// # 为什么用 [`RecordSet`] 而不是 `Vec<Record>`
+/// Records are held in a [`RecordSet`], keyed by [`EntryId`]: union merging treats the same
+/// entry appearing twice in one payload as meaningless, so the set type carries the "at most
+/// one record per entry" invariant and a duplicate is reported as a structural error while
+/// parsing.
 ///
-/// 并集合并以 [`EntryId`] 为键，因此同一条目在一份载荷里出现两次是**没有意义**的
-/// ——而它又是一件载荷生成方可以做到的事。用集合类型表达「每条目至多一条记录」，这个
-/// 不变量就不必靠调用方自觉，解析时也能直接把重复当成结构错误报出来。
+/// # Record order is deterministic
 ///
-/// # 记录的顺序是确定的
-///
-/// [`RecordSet`] 内部是 `BTreeMap`，遍历按 [`EntryId`] 升序，因此**同一份内容序列化
-/// 出的明文逐字节相同**。这不等于「载荷逐字节相同」——每条记录的 nonce 是随机的，
-/// 密文自然不同。确定性在这里的用处是让测试能做精确的字节比较，以及让「两份载荷是否
-/// 承载同样的数据」有一个廉价判据。
+/// [`RecordSet`] is a `BTreeMap` internally and iterates in ascending [`EntryId`] order, so
+/// **the same content serializes to a byte-identical plaintext**. That is not the same as
+/// "byte-identical payload": every record's nonce is random, so the ciphertexts differ.
+/// Determinism is useful for exact byte comparisons in tests and gives a cheap criterion for
+/// "do two payloads carry the same data".
 #[derive(Debug)]
 pub struct Payload {
-    /// 本次同步的标识。接收方用它识别重复载荷。
+    /// Identifier of this sync. The receiver uses it to recognize duplicate payloads.
     pub sync_id: SyncId,
-    /// 发起这次同步的设备。
+    /// The device that started this sync.
     ///
-    /// 参与**外层** AAD，因此它是被认证的：攻击者无法把一份载荷的发送方改成别人。
-    /// 用于 D2 的「裁决冲突由发起方裁定」——合并时要知道是谁在发起。
+    /// Takes part in the **outer** AAD, so it is authenticated: an attacker cannot change a
+    /// payload's sender to somebody else. Merging needs to know who is initiating, because
+    /// conflict resolution is decided by the initiator.
     ///
-    /// # 它是设备标识，但**不**参与 D3 的挑战-应答
+    /// # It is a device identifier, but does **not** take part in device authentication
     ///
-    /// 这里的「发送方」只是一个被认证的**声明**：它证明「持有主密钥的那一方声称自己
-    /// 是这台设备」。要真正证明设备身份（私钥在硬件里）是 [`crate::auth`] 的事，走
-    /// 的是另一条路径。两者不可互相替代：这个字段挡的是「把载荷说成别人发的」，而
-    /// 那个挡不住。
+    /// The "sender" here is only an authenticated **claim**: it proves that the party
+    /// holding the master key claims to be this device. Actually proving the device identity
+    /// (private key in hardware) is the job of [`crate::auth`], which is a different path.
+    /// Neither replaces the other: this field stops a payload from being attributed to
+    /// somebody else, which device authentication does not.
     pub sender: DeviceId,
-    /// 载荷里的记录，**仍然加密**。
+    /// The records in this payload, **still encrypted**.
     pub records: RecordSet<Record>,
-    /// 这份载荷要对方做什么。
+    /// What this payload asks the peer to do.
     ///
-    /// 私有字段：它必须与写入线格式的那个字节**永远一致**，因此只由构造函数设置并
-    /// 提供只读访问器。把它公开会让「改了字段但忘了重新 `seal`」成为可能。
+    /// Private field: it must **always** match the byte written to the wire format, so only
+    /// the constructors set it and a read-only accessor exposes it. Making it public would
+    /// allow changing the field without re-running `seal`.
     kind: PayloadKind,
 }
 
 impl Payload {
-    /// 生成一份新的载荷标识。
+    /// Generate a fresh payload identifier.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// [`Error::RandomnessUnavailable`]：OS 随机源不可用。此时**不得**回退到任何用户态
-    /// PRNG：可预测的载荷标识会让重放防护失效（攻击者可以预先算出一个「将来会被接受」
-    /// 的标识）。
+    /// [`Error::RandomnessUnavailable`]: the OS random source is unavailable. There must be
+    /// **no** fallback to a userspace PRNG: a predictable payload identifier defeats replay
+    /// protection, because an attacker could precompute an identifier that will be accepted
+    /// later.
     pub fn new_sync_id() -> Result<SyncId> {
         let mut id = [0_u8; SYNC_ID_LEN];
         crate::getrandom::fill(&mut id).map_err(|_| Error::RandomnessUnavailable)?;
         Ok(id)
     }
 
-    /// 乘这份载荷要对方做什么。
+    /// What this payload asks the peer to do.
     #[must_use]
     pub const fn kind(&self) -> PayloadKind {
         self.kind
     }
 
-    /// 造一份**请求**：请把你的全量状态发给我。
+    /// Build a **request**: send me your full state.
     ///
-    /// # 请求为什么是载荷，而不是另一种消息
+    /// A request is a payload like any other: the same transport, the same authentication, and
+    /// the same replay protection.
     ///
-    /// 它是同一套搬运、同一套认证、同一套重放防护。把它做成另一种消息类型会立刻带来
-    /// 「那种消息要不要也记重放日志」这类问题，而答案只能是「要」——那就是同一套东西。
+    /// A request carries **no** records (see [`PayloadKind::Request`]), so it is the
+    /// fixed-length header plus a nonce and the authentication tag — [`HEADER_LEN`] +
+    /// [`NONCE_LEN`] + [`TAG_LEN`] = 114 bytes plus the compressed plaintext — far smaller
+    /// than any real full state.
     ///
-    /// 请求里**没有**记录（见 [`PayloadKind::Request`]），因此它只有固定长度的头与
-    /// 认证标签，比任何真实的全量状态都小得多。这是「先发请求、再走局域网传数据」
-    /// 那条路的第一步（D9 的「建链」模式）。
+    /// **"Small" is relative; it does not mean "always fits the smallest QR code".** The
+    /// request carries the 32-byte device identifier and the 32-byte payload identifier plus
+    /// the authentication tag, so it takes up a substantial part of the capacity of any QR
+    /// code; the smallest versions cannot hold it. Whether it fits is answered by the
+    /// **channel**: [`crate::transport::TransportCapabilities::check_fits`] can tell before
+    /// sending.
     ///
-    /// **「小」是一个相对的说法，不是「一定装得下最小的二维码」。** 请求里带着 32 字节
-    /// 的设备标识与 16 字节的载荷标识，加上认证标签，它在任何二维码里都要占掉相当一部分
-    /// 容量——最小的那几版装不下它。究竟装不装得下由**通道**回答：
-    /// [`crate::transport::TransportCapabilities::check_fits`] 在发送之前就能给出答案。
+    /// # Errors
     ///
-    /// # 错误
-    ///
-    /// [`Error::RandomnessUnavailable`]：随机源不可用。
+    /// [`Error::RandomnessUnavailable`]: the random source is unavailable.
     pub fn request(sender: DeviceId) -> Result<Self> {
         Ok(Self {
             sync_id: Self::new_sync_id()?,
@@ -405,33 +399,36 @@ impl Payload {
         })
     }
 
-    /// 从本地保险库生成一份载荷。
+    /// Build a payload from the local vault.
     ///
-    /// 会把**全部**活条目与**全部**墓碑都封进去。这是 D9 的「全量提供」模式，也是
-    /// 二维码全量模式的来源；将来做增量同步时，是本函数加一个过滤参数，而不是换一套
-    /// 载荷格式。
+    /// It seals **all** live entries and **all** tombstones. Incremental sync will be a
+    /// filter parameter on this function rather than a different payload format.
     ///
-    /// # 活条目与墓碑并存时**只**发墓碑
+    /// # When an entry and its tombstone coexist, **only** the tombstone is sent
     ///
-    /// 保险库里可以同时有一条活条目和它的墓碑——那是裁决还没做完的状态
-    /// （[`crate::vault::Vault::record_tombstone`] 刻意不删活条目）。这种状态下**不能**
-    /// 把活条目也发出去：对端会把它解读成「这条还没被删」，于是每次同步都在对端触发
-    /// 同一个冲突，用户每同步一次就要看一次同样的裁决界面。
+    /// A vault can hold a live entry together with its tombstone — the state in which
+    /// adjudication has not finished ([`crate::vault::Vault::record_tombstone`] never deletes
+    /// the live entry). In that state the live entry must **not** be sent too: the peer would
+    /// read it as "this one is not deleted yet", so every sync would trigger the same
+    /// conflict on the peer and the user would face the same adjudication screen again on
+    /// every sync.
     ///
-    /// 只发墓碑的另一个理由更硬：墓碑代表一次**已经发生**的删除动作，而那条活条目是
-    /// 待裁决的本地状态。把待裁决状态广播出去，等于让每台设备都替用户做一遍尚未做出
-    /// 的决定。
+    /// A tombstone represents a deletion that has **already happened**, while that live entry
+    /// is local state awaiting adjudication. Broadcasting state awaiting adjudication would
+    /// make every device take a decision the user has not taken yet.
     ///
-    /// # 记录密钥只派生一次
+    /// # The record key is derived once
     ///
-    /// 载荷里可能有上万条，逐条重新派生 HKDF 会把两次 HMAC-SHA256 乘以条目数。派生
-    /// 一次然后传给每条记录，代价从 O(n) 次派生降到 1 次。
+    /// A payload can hold tens of thousands of records, and deriving HKDF again per record
+    /// would multiply two HMAC-SHA256 computations by the number of entries. Deriving once
+    /// and passing that key to every record reduces the cost from O(n) derivations to one.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// - [`Error::SyncTooManyRecords`]：条目与墓碑之和超过 [`MAX_RECORDS`]。
-    /// - [`Error::RandomnessUnavailable`]：随机源不可用。
-    /// - 编码失败（见 [`record::seal_entry`]）。
+    /// - [`Error::SyncTooManyRecords`]: the sum of entries and tombstones exceeds
+    ///   [`MAX_RECORDS`].
+    /// - [`Error::RandomnessUnavailable`]: the random source is unavailable.
+    /// - Sealing failure (see [`record::seal_entry`]).
     pub fn from_vault(
         master: &MasterKey,
         sender: DeviceId,
@@ -440,8 +437,6 @@ impl Payload {
         let record_key = derive_record_key(master)?;
         let mut records = RecordSet::<Record>::new();
         for (id, entry) in vault.iter() {
-            // 有墓碑的条目**不**发出去：那是「裁决未完成」的本地状态，广播它会让
-            // 每台设备都替用户做一遍尚未做出的决定。见本函数的文档。
             if vault.get_tombstone(id).is_some() {
                 continue;
             }
@@ -458,28 +453,24 @@ impl Payload {
         })
     }
 
-    /// 只读地看一眼一份载荷的头部，**不**解密。
+    /// Read a payload header without decrypting anything.
     ///
-    /// # 为什么需要它
+    /// Replay protection takes effect **before the vault is touched**, and the accounting needs
+    /// the `sync_id`, which lives in the plaintext header. `peek` answers "have I seen this
+    /// identifier" in a single call and allocates nothing large for any input, so a **garbage**
+    /// payload (tampered ciphertext, or plain random bytes) is rejected without a decompression
+    /// attempt and without its claimed identifier having been recorded.
     ///
-    /// 重放防护必须在**动保险库之前**生效，而记账需要 `sync_id`——它在明文头里。若
-    /// 非要先 `open` 再拿标识，代价是：一份**垃圾**载荷（密文被篡改、或根本是随机
-    /// 字节）会让我们先做一次完整解压尝试才发现不对；更糟的是调用方很容易顺手在
-    /// 解密失败**之前**就把标识记进日志，于是攻击者只要发垃圾并声称标识是 X，就能让
-    /// 真正的 X 永远被拒绝。
+    /// # It authenticates **nothing**
     ///
-    /// 有了 `peek`，「这个标识我见过吗」可以在**一条指令**里问完，且对任意输入都不会
-    /// 分配大块内存。
+    /// Every returned field comes from the plaintext header, so it is only a **claim**. The
+    /// one legitimate use is looking the `sync_id` up in the replay log: a hit is rejected
+    /// outright (rejecting an unauthenticated payload needs no justification), and a miss
+    /// still has to go through the full [`Payload::open`].
     ///
-    /// # 它**不**认证任何东西
+    /// # Errors
     ///
-    /// 返回的字段全部来自明文头，因此它们只是**声明**。唯一的合法用途是拿
-    /// `sync_id` 去查重放日志——查中了直接拒绝（拒绝一份未认证的载荷不需要理由），
-    /// 没查中则仍须走完整的 [`Payload::open`]。
-    ///
-    /// # 错误
-    ///
-    /// 与 [`Payload::open`] 的头部检查相同：魔数、版本、长度。
+    /// The same header checks as [`Payload::open`]: magic, version, length.
     pub fn peek(data: &[u8]) -> Result<PayloadHeader> {
         let mut reader = Reader::new(data);
         let magic = reader.take(MAGIC.len()).ok_or(Error::SyncTruncated)?;
@@ -509,31 +500,32 @@ impl Payload {
         })
     }
 
-    /// 有多少条记录（条目与墓碑之和）。
+    /// How many records there are (entries plus tombstones).
     #[must_use]
     pub fn len(&self) -> usize {
         self.records.len()
     }
 
-    /// 是否一条记录都没有。
+    /// Whether there is no record at all.
     ///
-    /// 空载荷是**合法**的：一台刚注册、还没添过条目的设备发起同步时就是这个样子。
-    /// 它必须能被正常收下（对面据此知道「你这边什么都没有」），而不是被当成错误——
-    /// 那会让「新设备加入」这条路径上多一个必须特判的分支。
+    /// An empty payload is **legal**: that is exactly what a freshly registered device with
+    /// no entries yet sends when it starts a sync. It must be accepted normally (the peer
+    /// learns from it that there is nothing on this side), not treated as an error — that
+    /// would add a branch needing a special case on the "new device joins" path.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
 
-    /// 把载荷打包成可以搬运的字节。
+    /// Pack the payload into bytes that can be carried around.
     ///
-    /// 顺序是**序列化 → 压缩 → 整体 AEAD**。
+    /// The order is **serialize → compress → whole-payload AEAD**.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// - [`Error::SyncTooManyRecords`]：记录数超过 [`MAX_RECORDS`]。
-    /// - [`Error::SyncMalformed`]：打包后的明文超过 [`MAX_PLAINTEXT_LEN`]。
-    /// - [`Error::RandomnessUnavailable`]：随机源不可用。
+    /// - [`Error::SyncTooManyRecords`]: the number of records exceeds [`MAX_RECORDS`].
+    /// - [`Error::SyncMalformed`]: the packed plaintext exceeds [`MAX_PLAINTEXT_LEN`].
+    /// - [`Error::RandomnessUnavailable`]: the random source is unavailable.
     pub fn seal(&self, master: &MasterKey) -> Result<Vec<u8>> {
         if self.records.len() > MAX_RECORDS {
             return Err(Error::SyncTooManyRecords {
@@ -542,7 +534,7 @@ impl Payload {
             });
         }
 
-        // ── 1. 序列化 ────────────────────────────────────────────────────
+        // ── 1. Serialize ────────────────────────────────────────────────────
         let mut plaintext = Vec::new();
         #[expect(
             clippy::cast_possible_truncation,
@@ -566,10 +558,10 @@ impl Payload {
             });
         }
 
-        // ── 2. 压缩 ──────────────────────────────────────────────────────
+        // ── 2. Compress ──────────────────────────────────────────────────────
         let compressed = compress::compress(&plaintext)?;
 
-        // ── 3. 整体 AEAD ─────────────────────────────────────────────────
+        // ── 3. Whole-payload AEAD ─────────────────────────────────────────────────
         let key = derive_envelope_key(master)?;
         let (nonce, ciphertext) = crypto::seal_bytes(&key, &self.aad(), &compressed)?;
 
@@ -584,32 +576,35 @@ impl Payload {
         Ok(out)
     }
 
-    /// 拆开一段搬运来的字节，得到**仍然加密**的记录。
+    /// Take apart bytes carried in from outside, yielding records that are **still
+    /// encrypted**.
     ///
-    /// # 它只做外层
+    /// # It only handles the outer layer
     ///
-    /// 返回的 [`Record`] 还没有解密——那要逐条调 [`record::open`]。分两步是刻意的：
-    /// 外层认证失败与某一条记录解不开是**不同**的故障（前者是整份载荷不可信，后者是
-    /// 载荷可信但内容坏了），而调用方对它们的处置也不同——前者只能重试，后者值得报
-    /// 一个具体的诊断。
+    /// The returned [`Record`] values are not decrypted yet; that takes a call to
+    /// [`record::open`] per record. Splitting the two steps is deliberate: an outer
+    /// authentication failure and one unopenable record are **different** faults (the whole
+    /// payload is untrustworthy versus the payload is trustworthy but its content is broken),
+    /// and callers handle them differently — the former can only be retried, the latter
+    /// deserves a specific diagnosis.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// - [`Error::SyncBadMagic`]：不是本应用的载荷。
-    /// - [`Error::SyncUnsupportedVersion`]：版本不受支持。
-    /// - [`Error::SyncTruncated`]：字节不够。
-    /// - [`Error::SyncAuthenticationFailed`]：外层认证失败。**不区分**原因。
-    /// - [`Error::SyncEmptyPayload`] / [`Error::SyncDecompressionFailed`]：压缩层。
-    /// - 其余结构错误。
+    /// - [`Error::SyncBadMagic`]: not a payload of this application.
+    /// - [`Error::SyncUnsupportedVersion`]: unsupported version.
+    /// - [`Error::SyncTruncated`]: not enough bytes.
+    /// - [`Error::SyncAuthenticationFailed`]: outer authentication failed, with **no**
+    ///   distinction of cause.
+    /// - [`Error::SyncEmptyPayload`] / [`Error::SyncDecompressionFailed`]: compression layer.
+    /// - Other structural errors.
     ///
-    /// # 这个函数必须永不 panic
+    /// # This function must never panic
     ///
-    /// 输入完全来自攻击者可控的通道（局域网上任何一台设备、或任何一段字节）。所有
-    /// 越界都由读取游标挡掉：长度先用 `checked_add` 算终点，再走 `get(range)`，因此
-    /// 溢出与越界都会返回 `None` 而不是 panic。
+    /// The input comes entirely from a channel an attacker controls (any device on the LAN,
+    /// or any byte string). All out-of-range access is stopped by the read cursor: the end
+    /// offset is computed with `checked_add` and then read through `get(range)`, so both
+    /// overflow and out-of-range access return `None` instead of panicking.
     pub fn open(master: &MasterKey, data: &[u8]) -> Result<Self> {
-        // 魔数与版本要先于任何分配检查——否则一个 3 字节的输入就能让我们走进后面的
-        // 读取逻辑。
         let header = Self::peek(data)?;
         let PayloadHeader {
             version,
@@ -619,8 +614,6 @@ impl Payload {
         } = header;
 
         let mut reader = Reader::new(data);
-        // `peek` 已经验证过前缀，这里再跳过一遍是为了拿到游标位置。丢掉返回值而不是
-        // 重新校验：两处各写一套校验迟早会漂移。
         let _ = reader.take(HEADER_LEN).ok_or(Error::SyncTruncated)?;
         let nonce: [u8; NONCE_LEN] = reader
             .take(NONCE_LEN)
@@ -628,28 +621,20 @@ impl Payload {
             .try_into()
             .map_err(|_| Error::SyncTruncated)?;
         let ciphertext = reader.rest();
-        // 密文至少要有认证标签，否则连尝试解密都不必。
         if ciphertext.len() < TAG_LEN {
             return Err(Error::SyncTruncated);
         }
 
         let aad = header_aad(version, kind, &sync_id, &sender);
         let key = derive_envelope_key(master)?;
-        // `open_bytes` 是**两个域共用**的底层助手，它报的是保险库域的错误名
-        // （`VaultDecryptionFailed`）。同步层必须把它翻成自己域的名字：一个「打开同步
-        // 载荷失败」的用户看到「保险库解密失败」会去查文件损坏、查主密钥，而真正的问题
-        // 在网络上。两个域的错误名本来就该分开——它们处置方式不同。
         let compressed = crypto::open_bytes(&key, &aad, &nonce, ciphertext)
             .map_err(|_| Error::SyncAuthenticationFailed)?;
 
-        // ── 反向：解压 → 解析 ─────────────────────────────────────────────
+        // ── Reverse: decompress → parse ─────────────────────────────────────────────
         let plaintext = compress::decompress(&compressed)?;
         let mut reader = Reader::new(&plaintext);
         let declared = reader.u32_bare().ok_or(Error::SyncTruncated)? as usize;
 
-        // 上限检查要在**循环之前**：否则一份声称有 40 亿条记录的载荷会让我们进入一个
-        // 长期循环，每次迭代都读一个已经耗尽的游标并立刻返回 `SyncTruncated`——结果
-        // 是对的，但代价由攻击者决定。
         if declared > MAX_RECORDS {
             return Err(Error::SyncTooManyRecords {
                 count: declared,
@@ -676,11 +661,6 @@ impl Payload {
                 });
             }
             let ciphertext = reader.take(len).ok_or(Error::SyncTruncated)?.to_vec();
-            // 同一个 ID 出现两次一律拒绝，而不是「取第一条」。
-            //
-            // 这与合并层的宽容不同，因为这里的问题不是「该听哪一边」而是「这份载荷
-            // 自相矛盾」。外层已经认证，因此它不是伪造的——但它是**生成方写错了**，
-            // 而我们最不希望的就是把这样的载荷静默收下一半。
             if !records.insert(Record {
                 entry_id: EntryId::from_bytes(id_bytes),
                 nonce,
@@ -693,10 +673,6 @@ impl Payload {
         }
 
         if !reader.is_empty() {
-            // 明文里多出的字节意味着载荷被重新拼装过。这与「外层认证通过」不矛盾：
-            // 一份**合法**载荷的明文被追加内容后，压缩流会变，外层就认证不过了。能走到
-            // 这里只可能是我们自己的生成逻辑写错了，因此这是内部错误而不是攻击信号
-            // ——但仍然要拒绝，不能静默忽略。
             return Err(Error::SyncMalformed {
                 reason: "载荷明文含超出声明记录数的内容",
             });
@@ -710,18 +686,20 @@ impl Payload {
         })
     }
 
-    /// 把载荷里的全部记录解开。
+    /// Open every record in the payload.
     ///
-    /// # 一条失败就整份失败
+    /// # One failure fails the whole payload
     ///
-    /// 不做「跳过解不开的、收下其余」：外层已认证，因此解不开只可能是生成方用错了
-    /// 密钥（例如两台设备的保险库其实来自不同的主密钥），而**部分成功**会让这种故障
-    /// 表现成「同步成功但少了几条」——最难定位的一类。
+    /// It does not "skip what cannot be opened and take the rest": the outer layer is
+    /// authenticated, so a record that does not open can only mean the producer used the
+    /// wrong key (for instance two devices whose vaults come from different master keys), and
+    /// **partial success** would make such a fault look like "the sync succeeded but a few
+    /// entries are missing" — the hardest kind to diagnose.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// - [`Error::SyncAuthenticationFailed`]：某条记录解不开。
-    /// - 其余结构错误（见 [`record::open`]）。
+    /// - [`Error::SyncAuthenticationFailed`]: one record does not open.
+    /// - Other structural errors (see [`record::open`]).
     pub fn open_records(&self, master: &MasterKey) -> Result<Vec<OpenedRecord>> {
         let key = derive_record_key(master)?;
         let mut opened = Vec::with_capacity(self.records.len());
@@ -731,38 +709,37 @@ impl Payload {
         Ok(opened)
     }
 
-    /// 外层 AEAD 的 AAD。
+    /// AAD of the outer AEAD.
     fn aad(&self) -> [u8; AAD_LEN] {
         header_aad(FORMAT_VERSION, self.kind, &self.sync_id, &self.sender)
     }
 }
 
-/// 一份载荷的明文头，**未经认证**。
+/// The plaintext header of a payload, **unauthenticated**.
 ///
-/// 由 [`Payload::peek`] 产出。字段全部来自明文头，因此它们只是**声明**——唯一的合法
-/// 用途是拿 `sync_id` 去查重放日志。见 [`Payload::peek`] 的说明。
+/// Produced by [`Payload::peek`]. Every field comes from the plaintext header, so it is only
+/// a **claim**; the one legitimate use is looking the `sync_id` up in the replay log. See
+/// [`Payload::peek`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PayloadHeader {
-    /// 载荷格式版本。永远等于 [`FORMAT_VERSION`]（其它版本在 `peek` 里就被拒了）。
+    /// Payload format version. Always equal to [`FORMAT_VERSION`] (other versions are
+    /// already rejected inside `peek`).
     pub version: u8,
-    /// 这份载荷要对方做什么。
+    /// What this payload asks the peer to do.
     pub kind: PayloadKind,
-    /// 载荷标识，用于查重放日志。
+    /// Payload identifier, used to consult the replay log.
     pub sync_id: SyncId,
-    /// 发送方**自称**的身份。
+    /// The identity the sender **claims**.
     ///
-    /// 与 [`Payload::sender`] 一样，它在 AAD 里，因此 [`Payload::open`] 之后它是可信
-    /// 的；但在 `peek` 这一步它还只是一个声明。
+    /// As with [`Payload::sender`], it is in the AAD and therefore trustworthy after
+    /// [`Payload::open`]; at the `peek` stage it is still only a claim.
     pub sender: DeviceId,
 }
 
-/// 检查版本号是否受支持。
+/// Check whether a version number is supported.
 ///
-/// # 为什么单独一个函数
-///
-/// [`Payload::peek`] 与 [`Payload::open`] 都要检查它，而「版本 1 的载荷必须被拒绝」
-/// 这件事是**被测试盯着**的（见 `sync::tests::a_version_1_payload_is_rejected`）。
-/// 两处各写一遍判断，迟早会漂移成「peek 接受、open 拒绝」这种最难查的组合。
+/// One implementation shared by [`Payload::peek`] and [`Payload::open`]. A version 1 payload
+/// is rejected here; `sync::tests::a_version_1_payload_is_rejected` pins that down.
 fn check_version(version: u8) -> Result<()> {
     if version != FORMAT_VERSION {
         return Err(Error::SyncUnsupportedVersion { version });
@@ -770,35 +747,37 @@ fn check_version(version: u8) -> Result<()> {
     Ok(())
 }
 
-/// 一个边界检查的读取游标。
+/// A bounds-checked read cursor.
 ///
-/// 与保险库那边的同名类型是**分开的两份**，因为两者读取的格式不同、上限不同，而共用
-/// 一个会让任一处的改动影响另一处的安全性。代价是几十行重复代码——比一个跨格式共用
-/// 的、需要同时满足两边约束的游标便宜得多。
+/// It is a **separate copy** of the type of the same name in the vault module: the two read
+/// different formats with different limits, and sharing one would let a change in either
+/// affect the security of the other. The price is a few dozen duplicated lines, far cheaper
+/// than a cursor shared across formats that would have to satisfy both sets of constraints.
 struct Reader<'a> {
-    /// 待读的字节。
+    /// Bytes still to be read.
     data: &'a [u8],
-    /// 下一个要读的位置。
+    /// Position of the next byte to read.
     ///
-    /// 恒满足 `pos <= data.len()`：只有 [`Reader::take`] 会推进它，而 `take` 在越界
-    /// 时**不**推进。
+    /// Invariant: `pos <= data.len()`. Only [`Reader::take`] advances it, and `take` does
+    /// **not** advance it when the range is out of bounds.
     pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    /// 从一段字节的开头处开始读。
+    /// Start reading at the beginning of a byte slice.
     const fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
     }
 
-    /// 取走 `len` 字节并推进游标；取不到时返回 `None` 且**不**推进。
+    /// Take `len` bytes and advance the cursor; returns `None` and does **not** advance when
+    /// the bytes are not available.
     ///
-    /// 两道保证叠在一起：
+    /// Two guarantees together:
     ///
-    /// 1. `checked_add` 挡住 `pos + len` 的整数溢出。一个声称长度为 `usize::MAX` 的
-    ///    记录字段能让朴素的加法回绕成一个小值，从而绕过边界检查——这是解析器最经典
-    ///    的一类漏洞，而这里从类型层面就不可达。
-    /// 2. `get(range)` 挡住越界。
+    /// 1. `checked_add` stops integer overflow in `pos + len`. A record field claiming a
+    ///    length of `usize::MAX` could make naive addition wrap around to a small value and
+    ///    slip past the bounds check — a classic parser vulnerability, unreachable here.
+    /// 2. `get(range)` stops out-of-range access.
     fn take(&mut self, len: usize) -> Option<&'a [u8]> {
         let end = self.pos.checked_add(len)?;
         let slice = self.data.get(self.pos..end)?;
@@ -806,68 +785,72 @@ impl<'a> Reader<'a> {
         Some(slice)
     }
 
-    /// 读一个字节，不做任何语义检查。
+    /// Read one byte without any semantic check.
     ///
-    /// 后缀 `_bare` 表示「裸读」：版本号与种类字节都可能是任意值，合法性由调用方判断。
-    /// 刻意不叫 `u8`——本模块里到处都是整数类型名，那样读起来分不清是类型还是方法。
+    /// The `_bare` suffix means "raw read": the version and kind bytes may hold any value,
+    /// and the caller decides whether they are legal. It is deliberately not called `u8`,
+    /// because integer type names are everywhere in this module and that would read
+    /// ambiguously.
     fn u8_bare(&mut self) -> Option<u8> {
         self.take(1).map(|s| s[0])
     }
 
-    /// 读一个**大端** 32 位整数。
+    /// Read a **big-endian** 32-bit integer.
     ///
-    /// 大端是网络字节序，也是本格式所有长度字段的写法：小端在十六进制转储里读起来是
-    /// 反的，而这个格式注定要被人盯着看。
+    /// Big-endian is network byte order and is how every length field of this format is
+    /// written: little-endian reads backwards in a hex dump.
     fn u32_bare(&mut self) -> Option<u32> {
         self.take(4)
             .and_then(|s| <[u8; 4]>::try_from(s).ok())
             .map(u32::from_be_bytes)
     }
 
-    /// 取走剩余的全部字节并把游标推到末尾。
+    /// Take all remaining bytes and push the cursor to the end.
     ///
-    /// 已经在末尾时返回空切片而不是 `None`：外层密文的长度是可变的，因此「零长度」是
-    /// 一个合法结果，交由后面的「至少要有认证标签」那条检查去拒绝。
+    /// At the end it returns an empty slice rather than `None`: the outer ciphertext has a
+    /// variable length, so "zero length" is a legitimate result, left for the later "at least
+    /// an authentication tag" check to reject.
     fn rest(&mut self) -> &'a [u8] {
         let rest = self.data.get(self.pos..).unwrap_or(&[]);
         self.pos = self.data.len();
         rest
     }
 
-    /// 是否已经读到末尾。
+    /// Whether the end has been reached.
     fn is_empty(&self) -> bool {
         self.pos >= self.data.len()
     }
 }
 
-/// 外层 AAD 的长度：魔数 + 版本 + 种类 + sync_id + 设备 ID。
+/// Length of the outer AAD: magic + version + kind + sync_id + device ID.
 const AAD_LEN: usize = HEADER_LEN;
 
-/// 构造外层 AEAD 的 AAD。
+/// Build the AAD of the outer AEAD.
 ///
-/// # 它认证了什么
+/// # What it authenticates
 ///
-/// 整个明文头。这是我们唯一能「绑定但不泄露」的写法：`sync_id` 与 `sender` 都必须被
-/// 认证——前者挡住「把一份载荷的标识换掉以绕过重放防护」，后者挡住「把载荷说成别人
-/// 发的」。`kind` 也必须被认证，理由见 [`PayloadKind`]。
+/// The entire plaintext header. This is how those fields are bound without being leaked:
+/// `sync_id` and `sender` both have to be authenticated — the former stops swapping a
+/// payload's identifier to bypass replay protection, the latter stops presenting a payload as
+/// somebody else's. `kind` has to be authenticated as well, see [`PayloadKind`].
 ///
-/// # 为什么是自由函数而不是 `Payload` 的方法
+/// A free function rather than a method: [`Payload::open`] builds this AAD before any
+/// `Payload` value exists, since authentication comes first and only then are the records
+/// inside known.
 ///
-/// `open` 在**构造出 `Payload` 之前**就需要这个 AAD（要先认证才能知道里面的记录是
-/// 什么）。写成方法就得先造一个字段全是占位值的 `Payload`，而那样的中间状态正是最
-/// 容易被后续改动误用的东西。
+/// # Current version only
 ///
-/// # 只有当前版本
+/// Unlike vault files, payloads are **not forward compatible**: a version mismatch is
+/// rejected. Payloads arrive over the network and are transient — they never touch disk.
+/// Being lenient towards an old file on a user's device is mandatory (it is their data),
+/// whereas accepting an old-version **network input** would only add a parsing path to
+/// maintain that never sees real traffic. See [`LEGACY_FORMAT_VERSION_1`].
 ///
-/// 与保险库文件不同，载荷**不向前兼容**：版本对不上就拒绝。理由是输入的性质——载荷
-/// 来自网络，是即时的，不落盘。对用户手里的旧文件网开一面是必须的（那是他的数据），
-/// 而接受一个旧版本的**网络输入**只是给自己增加一片要维护、又永远收不到真实流量的
-/// 解析路径。详见 [`LEGACY_FORMAT_VERSION_1`] 的说明。
+/// # No need to guard against a modified version number
 ///
-/// # 为什么不需要防「版本号被改」
-///
-/// `version` 在 AAD 里，所以把它改成任何别的值都会让认证失败；改成当前版本则等于没改。
-/// 而「不是当前版本」在更早的地方就返回 [`Error::SyncUnsupportedVersion`] 了。
+/// `version` is in the AAD, so changing it to any other value makes authentication fail, and
+/// changing it to the current version changes nothing. Anything that is not the current
+/// version has already returned [`Error::SyncUnsupportedVersion`] earlier.
 fn header_aad(
     version: u8,
     kind: PayloadKind,
@@ -889,12 +872,10 @@ fn header_aad(
     aad
 }
 
-/// 内层记录里用的记录种类，供 [`record`] 与打包方共用。
+/// Record kind used by inner records, shared by [`record`] and the sealing side.
 pub(crate) use crate::vault::RecordKind as InnerRecordKind;
 
 const _: () = {
-    // 编译期确认内外层的种类字节不重叠。两者若撞上，AAD 就可能相同，而那是域分离
-    // 失效——见 `HKDF_SALT_SYNC` 的说明。
     assert!(InnerRecordKind::SyncEntry.as_byte() != InnerRecordKind::Entry.as_byte());
     assert!(InnerRecordKind::SyncTombstone.as_byte() != InnerRecordKind::Tombstone.as_byte());
 };
@@ -905,12 +886,9 @@ mod tests {
     use crate::otp::{Algorithm, Digits, OtpSecret};
     use crate::vault::{Entry as VaultEntry, RecordKind, Timestamp, Vault, master_key_to_bytes};
 
-    /// 造一条合法条目。
-    // 「旧版本号必须小于当前版本」，否则「拒绝旧版本」的测试会退化成「拒绝当前版本」
-    // ——一个必然绿、什么也没证明的断言。编译期常量断言（不是运行期 `assert!`：后者
-    // 会被 clippy 正确地指为 `assertions_on_constants`）。
     const _: () = assert!(LEGACY_FORMAT_VERSION_1 != FORMAT_VERSION);
 
+    /// Build one valid entry.
     fn sample_entry(seed: u8) -> VaultEntry {
         VaultEntry::new(
             format!("服务 {seed}"),
@@ -928,7 +906,8 @@ mod tests {
         .expect("字段合法")
     }
 
-    /// 造一个设备标识。同步的「发送方」是 [`DeviceId`]，不是 16 字节的 `EntryId`。
+    /// Build one device identifier. The sync "sender" is a [`DeviceId`], not a 16-byte
+    /// `EntryId`.
     fn device(seed: u8) -> DeviceId {
         DeviceId::from_bytes([seed; DEVICE_ID_LEN])
     }
@@ -937,15 +916,13 @@ mod tests {
         MasterKey::generate().expect("OS 随机源可用")
     }
 
-    /// 逐条解开载荷，交出每条的 `(标识, 是否是活条目)`。
+    /// Open a payload record by record, yielding `(identifier, is_live_entry)` per record.
     ///
-    /// # 为什么需要它
-    ///
-    /// [`Payload::records`] 是按标识索引的、**不区分种类**的容器：一条记录可能是活
-    /// 条目，也可能是一条墓碑，而 `RecordSet::get` 两者都返回 `Some`。因此「这条活条目
-    /// 有没有被发出去」这个问题**只能**靠解密看种类来回答。
-    ///
-    /// 返回值带上标识，测试才能断言「发出的是哪一条」，而不只是「发了几条」。
+    /// [`Payload::records`] is indexed by identifier and **does not distinguish kinds**: a
+    /// record may be a live entry or a tombstone, and `RecordSet::get` returns `Some` for
+    /// both. Whether a given live entry was sent is answered only by decrypting and looking at
+    /// the kind, and the returned identifiers let a test assert which record was sent rather
+    /// than merely how many were.
     fn opened_kinds(payload: &Payload, master: &MasterKey) -> Vec<(EntryId, bool)> {
         payload
             .open_records(master)
@@ -958,17 +935,13 @@ mod tests {
             .collect()
     }
 
-    /// 把 `seal` 的输出拆开，交出**真实的明文段**。
+    /// Take the output of `seal` apart and yield the **actual plaintext segment**.
     ///
-    /// # 为什么测试需要它
-    ///
-    /// [`Payload::open`] 只交出 `Payload`（记录仍然是**加密**的），因此从公开 API 看
-    /// 不到线格式的字节排布。而「记录长度常量算错了」这类 bug 恰恰只在字节层面可见
-    /// ——它曾经真实存在（见 `RECORD_HEADER_LEN` 的说明），而且当时那条自以为在盯着
-    /// 线格式的测试是恒等式，抓不到它。
-    ///
-    /// 这里按**格式文档**重做一遍解析，与 `Payload::open` 的实现是两份独立代码：
-    /// 校验的是排布，而不是内部一致性。
+    /// [`Payload::open`] hands back a `Payload` with the records still **encrypted**, so the
+    /// byte layout of the wire format is invisible through the public API; faults such as "the
+    /// record length constant is miscounted" show up only at the byte level. This redoes the
+    /// parse following the **format documentation**, a second independent implementation
+    /// alongside `Payload::open`: what it checks is the layout, not internal consistency.
     fn plaintext_of(sealed: &[u8], master: &MasterKey) -> Vec<u8> {
         let mut reader = Reader::new(sealed);
         assert_eq!(reader.take(MAGIC.len()), Some(&MAGIC[..]), "魔数");
@@ -992,7 +965,8 @@ mod tests {
         compress::decompress(&compressed).expect("应当解得开")
     }
 
-    /// 按字节读明文里的记录段，返回每条的 `(entry_id, nonce, 密文长度)`。
+    /// Read the record segment of the plaintext as bytes, yielding
+    /// `(entry_id, nonce, ciphertext length)` per record.
     fn parse_record_frames(plaintext: &[u8]) -> Vec<([u8; EntryId::LEN], [u8; NONCE_LEN], usize)> {
         let mut reader = Reader::new(plaintext);
         let count = reader.u32_bare().expect("记录数") as usize;
@@ -1012,17 +986,16 @@ mod tests {
         frames
     }
 
-    /// **线格式的字节排布必须与 `encoded_len` 一致。**
+    /// **The byte layout of the wire format must agree with `encoded_len`.**
     ///
-    /// 这是唯一一条真正读字节的测试。它存在的理由是具体的：`RECORD_HEADER_LEN` 曾经
-    /// 因为早先一版设计留下一个多余的 `+ 1`，而当时那条测试把同一个常量再加一遍，
-    /// 于是「断言」与「被断言的东西」是同一个错误，绿了很久。
+    /// This is the only test that actually reads bytes. It re-parses the sealed payload
+    /// following the format documentation and reconciles the result with `encoded_len`, so
+    /// the assertion rests on a second, independent implementation.
     #[test]
     fn the_plaintext_record_framing_matches_encoded_len() {
         let master = a_master_key();
         let sender = device(7);
 
-        // 三条条目 + 一条墓碑：两种记录都要出现在同一份载荷里。
         let mut vault = Vault::new();
         for seed in 0..3_u8 {
             vault.insert(sample_entry(seed)).expect("随机源可用");
@@ -1043,8 +1016,6 @@ mod tests {
             "载荷里的记录数应当等于条目数加墓碑数"
         );
 
-        // 每一条的字节数必须与 `encoded_len` 报的一致。把 frame 还原成 `Record` 再比，
-        // 是为了走**同一个** `encoded_len`，而不是在测试里重算一遍公式。
         for (id_bytes, nonce, len) in &frames {
             let id = EntryId::from_bytes(*id_bytes);
             let record = payload.records.get(&id).expect("载荷里应当有这条记录");
@@ -1057,19 +1028,17 @@ mod tests {
             );
         }
 
-        // 明文总长度 = 记录数 + 每条固定头 + 全部密文。这条把「常量算错」的误差按
-        // 记录数放大，因此比逐条断言更容易在回归时看出来。
         let expected: usize = 4
             + frames.len() * (EntryId::LEN + NONCE_LEN + 4)
             + frames.iter().map(|f| f.2).sum::<usize>();
         assert_eq!(plaintext.len(), expected, "明文总长度与线格式不一致");
     }
 
-    /// 明文里**没有**种类字节。
+    /// The plaintext contains **no** kind byte.
     ///
-    /// 这是刻意的设计（让攻击者看不出这次带了几条删除），而它也是 `RECORD_HEADER_LEN`
-    /// 那个多余 `+ 1` 的来源——所以值得有一条测试把它钉住，免得将来有人「顺手」
-    /// 把种类写回明文以简化解密逻辑。
+    /// The kind is written into the inner AAD only, so the number of deletions in a sync is
+    /// not visible; this test pins that down so the kind is not written back into the
+    /// plaintext later on.
     #[test]
     fn the_record_kind_is_not_in_the_plaintext() {
         let master = a_master_key();
@@ -1083,8 +1052,6 @@ mod tests {
         let sealed = payload.seal(&master).expect("封装");
         let plaintext = plaintext_of(&sealed, &master);
 
-        // 明文 = 记录数(4) + 标识(16) + nonce(24) + 长度(4) + 墓碑密文。
-        // 距离记录数之后第 4 个字节就是标识，中间**没有**种类字节。
         assert_eq!(
             plaintext.len(),
             4 + EntryId::LEN + NONCE_LEN + 4 + {
@@ -1098,7 +1065,6 @@ mod tests {
             "记录数之后紧接着的应当是标识，没有种类字节"
         );
 
-        // 种类字节 0x82（SyncTombstone）不得出现在记录头的位置上。
         assert_ne!(
             RecordKind::SyncTombstone.as_byte(),
             plaintext[3],
@@ -1106,35 +1072,30 @@ mod tests {
         );
     }
 
-    /// 域分离常量必须稳定：改掉它们会让所有既有的载荷打不开。
+    /// The domain separation constants must stay stable: changing them makes every existing
+    /// payload unopenable.
     #[test]
     fn the_domain_separation_constants_are_stable() {
         assert_eq!(&HKDF_SALT_SYNC, b"Qualia2FA sync salt v1 (records)");
         assert_eq!(HKDF_SALT_SYNC.len(), 32);
         assert_eq!(MAGIC, b"Q2FASYNC");
         assert_eq!(FORMAT_VERSION, 2);
-        // 载荷格式版本与文件格式版本是**两个**独立常量。
-        //
-        // 这里**不能**断言两者不相等：它们现在恰好都是 2，而那是巧合——一个是
-        // 「同步载荷布局」，一个是「保险库文件布局」，各自演进。真正的性质是它们
-        // **各自有定义且互不引用**，而那由「两者都是独立 `pub const`」保证，测不出来。
-        // 写一个 `assert_ne!` 只会让「文件格式加一个字段」这种无关改动把这条测试弄红。
         assert!(
             crate::vault::READABLE_VERSIONS.contains(&crate::vault::FORMAT_VERSION),
             "文件格式自己声明的版本必须在自己可读的版本列表里"
         );
     }
 
-    /// **版本 1 的载荷必须被明确拒绝，而不是被当成版本 2 硬解。**
+    /// **A version 1 payload must be rejected explicitly, not force-decoded as version 2.**
     ///
-    /// # 为什么这条测试重要
+    /// Version 1 and version 2 differ by one `PayloadKind` byte in the outer layer, so a
+    /// lenient parser (say, "versions up to 2 are read as the new format") would take byte 9 of
+    /// a version 1 payload as the kind, shift the whole `sync_id` by one, and report an
+    /// **authentication failure** — a signal pointing at a wrong key rather than at the
+    /// version.
     ///
-    /// 版本 1 与版本 2 在外层**差一个 `PayloadKind` 字节**。一个「宽容」的解析器
-    /// （比如「版本号≤2 都按新格式读」）会把版本 1 的第 9 个字节当成种类、把
-    /// `sync_id` 整体错位一格，然后报一个**认证失败**——一个把诊断引向「密钥不对」
-    /// 的错误方向的现象。用户会去重新配对、重新登录，而真正的原因是版本。
-    ///
-    /// 而且版本 1 从未发布，因此这里没有兼容负担：拒绝是唯一正确的做法。
+    /// Version 1 was never released, so there is no compatibility burden: rejection is the
+    /// only correct behaviour.
     #[test]
     fn a_version_1_payload_is_rejected() {
         let master = a_master_key();
@@ -1143,11 +1104,9 @@ mod tests {
         let payload = Payload::from_vault(&master, device(1), &vault).expect("打包");
         let sealed = payload.seal(&master).expect("封装");
 
-        // 把版本号改回 1——字节层面完全模拟一份版本 1 的载荷。
         let mut legacy = sealed.clone();
         legacy[MAGIC.len()] = LEGACY_FORMAT_VERSION_1;
 
-        // `peek` 与 `open` 两条路径都必须拒绝它，且报的是**版本**而不是认证失败。
         for result in [
             Payload::peek(&legacy).map(|_| ()),
             Payload::open(&master, &legacy).map(|_| ()),
@@ -1161,7 +1120,7 @@ mod tests {
         }
     }
 
-    /// 一份**请求**载荷：种类被认证，且不携带记录。
+    /// A **request** payload: the kind is authenticated and no records are carried.
     #[test]
     fn a_request_payload_carries_no_records_and_keeps_its_kind() {
         let master = a_master_key();
@@ -1174,8 +1133,6 @@ mod tests {
 
         let sealed = payload.seal(&master).expect("封装");
 
-        // 不解密就能看出它是请求——这正是「先发请求、再走局域网传数据」那条路的
-        // 第一步：接收方要能在不动保险库的前提下知道对方想要什么。
         let header = Payload::peek(&sealed).expect("peek");
         assert_eq!(header.kind, PayloadKind::Request);
         assert_eq!(header.sender, sender);
@@ -1187,10 +1144,12 @@ mod tests {
         assert!(opened.is_empty());
     }
 
-    /// **种类被 AAD 认证**：把它从「状态」改成「请求」必须导致认证失败。
+    /// **The kind is authenticated by the AAD**: flipping it from "state" to "request" must
+    /// break authentication.
     ///
-    /// 若种类不被认证，第三方把一份全量状态改成「请求」，就能让接收方把自己整份保险库
-    /// 发回去——一次由攻击者触发的、本不该发生的传输。
+    /// If the kind were not authenticated, a third party changing a full state into a request
+    /// would make the receiver send its entire vault back — a transfer triggered by an
+    /// attacker that should never have happened.
     #[test]
     fn flipping_the_payload_kind_breaks_authentication() {
         let master = a_master_key();
@@ -1199,29 +1158,25 @@ mod tests {
         let payload = Payload::from_vault(&master, device(1), &vault).expect("打包");
         let sealed = payload.seal(&master).expect("封装");
 
-        // 种类字节紧跟在版本号之后。
         let kind_offset = MAGIC.len() + 1;
         assert_eq!(sealed[kind_offset], PayloadKind::Vault.as_byte());
 
         let mut flipped = sealed.clone();
         flipped[kind_offset] = PayloadKind::Request.as_byte();
 
-        // `peek` 只看明文，因此它会**成功**——这正是它「不认证任何东西」的体现。
         let peeked = Payload::peek(&flipped).expect("peek 只看明文，应当成功");
         assert_eq!(peeked.kind, PayloadKind::Request);
 
-        // 但 `open` 必须失败：种类在 AAD 里。
         let result = Payload::open(&master, &flipped);
         assert!(
             matches!(result, Err(Error::SyncAuthenticationFailed)),
             "篡改种类之后仍能打开，实际 {result:?}"
         );
 
-        // 未篡改的那份仍然正常工作。
         assert!(Payload::open(&master, &sealed).is_ok());
     }
 
-    /// 未知的种类字节被拒绝，且**不**被当成默认值。
+    /// An unknown kind byte is rejected and **not** treated as a default.
     #[test]
     fn an_unknown_payload_kind_is_rejected() {
         let master = a_master_key();
@@ -1241,10 +1196,10 @@ mod tests {
         }
     }
 
-    /// `peek` 对**任意**字节都不会 panic，且不做与输入等长的分配。
+    /// `peek` never panics on **arbitrary** bytes and does not allocate in proportion to the
+    /// input.
     #[test]
     fn peek_never_panics_on_arbitrary_bytes() {
-        // 固定的一组前缀，而不是随机——这条测试要的是可复现。
         let cases: [&[u8]; 6] = [
             b"",
             b"Q",
@@ -1254,21 +1209,18 @@ mod tests {
             b"Q2FASYNC\x09\xff",
         ];
         for case in cases {
-            // 只要求不 panic；成不成功都行。
             let _ = Payload::peek(case);
         }
-        // 一份完整的空载荷的头必须能读出来。
         let master = a_master_key();
         let payload = Payload::request(device(1)).expect("请求");
         let sealed = payload.seal(&master).expect("封装");
         assert!(Payload::peek(&sealed).is_ok());
     }
 
-    /// 载荷头的字节排布**逐字节**与文档一致。
+    /// The payload header layout matches the documentation **byte for byte**.
     ///
-    /// 这条测试与 `Payload::seal` 是两份独立实现：它按文档手工拼出应有的前缀，而不是
-    /// 调用任何 `seal` 逻辑。版本 1 → 2 的改动正是那种「常量与写出的字节不一致」的
-    /// 改动，而 `HEADER_LEN` 此前也确实算错过（写成 `+2` 而实际是 `+1`）。
+    /// This test builds the expected prefix by hand from the documentation instead of calling
+    /// any `seal` logic, so it is a second independent implementation.
     #[test]
     fn the_payload_header_is_laid_out_byte_for_byte() {
         let master = a_master_key();
@@ -1282,17 +1234,12 @@ mod tests {
         assert_eq!(&sealed[10..42], &payload.sync_id, "sync_id");
         assert_eq!(&sealed[42..74], sender.as_bytes(), "发送方");
 
-        // 头之后是 nonce，再之后是**压缩过**的明文，其长度无法从常量算出来（deflate
-        // 对 4 字节输入的输出与实现有关）。因此这里解出真实明文来对账，而不是硬编码
-        // 一个长度——硬编码会让这条测试在压缩实现变化时失败，而那时它报的原因是
-        // 「载荷总长度不对」，一个指向错误方向的现象。
         let plaintext = plaintext_of(&sealed, &master);
         assert_eq!(
             plaintext,
             0_u32.to_be_bytes(),
             "空请求的明文应当就是一个「零条记录」的计数"
         );
-        // 唯一的定长部分：头 + nonce + 认证标签，剩下的才是压缩段。
         assert!(
             sealed.len() >= HEADER_LEN + NONCE_LEN + TAG_LEN,
             "连「头 + nonce + 认证标签」都不够长：{} < {}",
@@ -1305,7 +1252,7 @@ mod tests {
         );
     }
 
-    /// 载荷与保险库的密钥必须真的不同。
+    /// The payload and vault keys must really differ.
     #[test]
     fn the_sync_and_vault_keys_are_different() {
         let master = a_master_key();
@@ -1318,7 +1265,7 @@ mod tests {
         assert_ne!(envelope, vault_key, "信封密钥与保险库条目密钥撞上了");
     }
 
-    /// 空保险库也能打包与拆包，且往返后仍是空的。
+    /// An empty vault can be sealed and opened, and stays empty across the round trip.
     #[test]
     fn an_empty_vault_roundtrips() {
         let master = a_master_key();
@@ -1339,7 +1286,8 @@ mod tests {
         );
     }
 
-    /// 每次打包都应当是一个**新的**载荷标识，否则重放防护无处落脚。
+    /// Every payload must get a **fresh** identifier, otherwise replay protection has
+    /// nothing to stand on.
     #[test]
     fn every_payload_gets_a_fresh_sync_id() {
         let master = a_master_key();
@@ -1356,10 +1304,12 @@ mod tests {
         assert_eq!(first.len(), second.len(), "两次打包的记录数应当相同");
     }
 
-    /// 同一份保险库打包两次的密文必须不同（nonce 每次随机）。
+    /// Sealing the same vault twice must produce different ciphertext (the nonce is random
+    /// every time).
     ///
-    /// 若相同，说明 nonce 被复用了——那是 XChaCha20-Poly1305 最严重的一类误用，
-    /// 而它在功能测试里完全看不出来（一切照常工作）。
+    /// Identical output would mean the nonce is reused — the most severe misuse of
+    /// XChaCha20-Poly1305, and one that functional tests cannot see at all (everything keeps
+    /// working).
     #[test]
     fn sealing_the_same_vault_twice_produces_different_bytes() {
         let master = a_master_key();
@@ -1374,7 +1324,6 @@ mod tests {
         let b = second.seal(&master).expect("封装");
         assert_ne!(a, b, "两次封装的字节完全相同，nonce 很可能被复用了");
 
-        // 记录密钥相同，因此内层密文也必须因 nonce 不同而不同。
         let ra = plaintext_of(&a, &master);
         let rb = plaintext_of(&b, &master);
         let fa = parse_record_frames(&ra);
@@ -1386,19 +1335,22 @@ mod tests {
         }
     }
 
-    /// 保险库里同时有活条目与它的墓碑时，**只**发墓碑。
+    /// When a live entry and its tombstone coexist in the vault, **only** the tombstone is
+    /// sent.
     ///
-    /// # 这个状态是怎么出现的
+    /// # How that state arises
     ///
-    /// **不是** [`Vault::remove`] 造成的：它按设计既删条目也留墓碑，因此不会留下
-    /// 「条目与墓碑并存」。并存只来自同步本身——[`crate::vault::Vault::record_tombstone`]
-    /// 的文档写得很明确：「若该 ID 的活条目存在，**不会**被删除，调用方需要自己决定
-    /// D2 的裁决结果」。也就是说，对端发来墓碑而本机不愿意自动采纳时，就会停在这个
-    /// 状态上等用户裁决。
+    /// It is **not** produced by [`Vault::remove`]: by design that removes the entry and
+    /// leaves a tombstone behind, so it never leaves "entry and tombstone side by side". The
+    /// state comes from sync itself: [`crate::vault::Vault::record_tombstone`] never deletes
+    /// an existing live entry with the same ID, and the caller decides the conflict
+    /// resolution outcome. A device that receives a tombstone from the peer and does not
+    /// adopt it automatically stays in this state until the user decides.
     ///
-    /// 而这个状态是**真实且常见**的：两台设备各有一条同名同 ID 的条目、其中一台删了，
-    /// 另一台在裁决界面弹出期间就是这个样子。广播那份活条目会让每次同步都在对端触发
-    /// 同一个冲突，用户每同步一次就要看一次同样的裁决界面。
+    /// The state is a real and common one: two devices each hold an entry with the same name
+    /// and ID, one of them deletes it, and the other stays like this while the adjudication
+    /// screen is up. Broadcasting the live entry would trigger the same conflict on the peer
+    /// at every sync, and the user would face the same adjudication screen every time.
     #[test]
     fn an_entry_with_a_tombstone_is_not_sent() {
         let master = a_master_key();
@@ -1408,14 +1360,12 @@ mod tests {
         let kept = vault.insert(sample_entry(1)).expect("随机源可用");
         let disputed = vault.insert(sample_entry(2)).expect("随机源可用");
 
-        // 对端说这条被删了，本机先记下来但**不**采纳——裁决未完成。
         vault.record_tombstone(crate::vault::Tombstone {
             entry_id: disputed,
             deleted_at: Timestamp::from(1_700_000_100_u64),
             deleted_by: None,
         });
 
-        // 前提：条目与墓碑并存。这才是本测试要覆盖的状态。
         assert_eq!(vault.len(), 2, "前提不成立：两条活条目都应当还在");
         assert_eq!(vault.tombstone_count(), 1, "前提不成立：应当有墓碑");
         assert!(
@@ -1427,13 +1377,6 @@ mod tests {
         assert_eq!(payload.len(), 2, "应当只有「保留的条目 + 墓碑」两条记录");
         assert!(payload.records.get(&kept).is_some(), "保留的条目应当被发出");
 
-        // # 为什么不能靠 `records.get(&disputed).is_none()` 判断
-        //
-        // `RecordSet` 是按 `entry_id` 索引的，**不区分记录种类**——因此那条墓碑的
-        // 记录用的正是 `disputed` 这个 ID。`get(&disputed)` 会返回 `Some`，而那是
-        // 墓碑，不是被发出去了的活条目。（第一版测试就是这么写的，于是它错了。）
-        //
-        // 判断「发出去的是条目还是墓碑」只能靠逐条解开看种类。
         let records = opened_kinds(&payload, &master);
         let mut entries = Vec::new();
         let mut tombstones = Vec::new();
@@ -1456,22 +1399,19 @@ mod tests {
         );
     }
 
-    /// 记录数上限在**循环之外**检查。
+    /// The record count limit is checked **outside the loop**.
     ///
-    /// 否则一个声称有 40 亿条记录的载荷能让我们先分配一个 40 亿项的容器再发现不对。
-    /// 这里只能做结构性验证：构造一份声称超限的明文，确认它被拒绝而不是被分配。
+    /// Otherwise a payload claiming four billion records could make us allocate a container
+    /// of four billion items before noticing anything is wrong. Only a structural check is
+    /// possible here: build a plaintext that claims an over-limit count and confirm it is
+    /// rejected rather than allocated for.
     #[test]
     fn an_absurd_record_count_is_rejected_before_allocating() {
         let master = a_master_key();
-        // 明文 = 一个声称有一条记录的载荷，但把记录数改成 u32::MAX。
         let mut vault = Vault::new();
         vault.insert(sample_entry(1)).expect("随机源可用");
         let payload = Payload::from_vault(&master, device(1), &vault).expect("打包");
 
-        // 手工构造：记录数写成 u32::MAX，后面附上真实的记录字节（不压缩，直接进
-        // 底层 AEAD——`decompress` 对未压缩输入会失败，因此这里改走 compress 之后
-        // 再改字节不可行）。改为直接验证常量与解析顺序：构造一段「记录数超限」的
-        // 明文，用 `compress` 压一下再封进信封。
         let mut plaintext = u32::MAX.to_be_bytes().to_vec();
         plaintext.extend_from_slice(&[0_u8; 64]);
         let compressed = compress::compress(&plaintext).expect("可压缩");
@@ -1502,7 +1442,7 @@ mod tests {
         );
     }
 
-    /// 主密钥的字节要走公开 API 拿，避免测试自己拼。
+    /// The master key bytes come from the public API instead of being assembled by the test.
     #[test]
     fn the_master_key_roundtrips_through_bytes() {
         let master = a_master_key();

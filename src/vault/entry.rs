@@ -13,72 +13,70 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! 保险库条目：明文结构与条目标识。
+//! Vault entries: the plaintext structure and the entry identifier.
 //!
-//! # 明文里有什么
+//! # What the plaintext holds
 //!
-//! 一条 2FA 条目在**解密后**由 [`Entry`] 承载：显示名、发行方、账号、种子、
-//! 算法、位数、周期/计数器、备注、以及创建与修改时间。
+//! After decryption a 2FA entry is carried by [`Entry`]: display name, issuer, account,
+//! secret, algorithm, digits, period or counter, note, and the creation and modification
+//! timestamps.
 //!
-//! # 明文里没有什么
+//! # What the plaintext does not hold
 //!
-//! **条目没有任何全局可读的元数据。** 保险库文件中，一条条目除了它的
-//! [`EntryId`] 与密文之外，不含任何结构化信息——连「这是 TOTP 还是 HOTP」
-//! 都看不出来，因为那在密文内部。这是刻意的：保险库文件可能被同步到不可信的
-//! 位置（用户自己选的网盘、二维码、另一台设备），任何明文字段都会被泄露。
+//! **An entry has no globally readable metadata.** In a vault file an entry is nothing
+//! but its [`EntryId`] and a ciphertext - not even "TOTP or HOTP" is visible, because
+//! that lives inside the ciphertext. A vault file is expected to travel through
+//! untrusted places (a cloud drive the user picked, a QR code, another device), and any
+//! plaintext field would leak there.
 //!
-//! 因此 [`EntryId`] 是**唯一**的例外，而它是 128-bit CSPRNG 随机数，不携带
-//! 任何语义——它的作用只是让两台设备能谈论「同一条条目」。
+//! [`EntryId`] is therefore the **only** exception, and it is a 128-bit CSPRNG random
+//! value carrying no semantics: its only purpose is to let two devices talk about "the
+//! same entry".
 
 use crate::{Error, Result, otp};
 
-/// 条目标识：128-bit CSPRNG 随机数。
+/// Entry identifier: a 128-bit CSPRNG random value.
 ///
-/// # 为什么是随机数而不是哈希或序号
+/// It carries no semantics: its only purpose is to let two devices talk about the same
+/// entry. The collision probability reaches the birthday bound only around 2^64 entries,
+/// and it reveals nothing about the content, so it can safely sit in the vault file in
+/// plaintext.
 ///
-/// - **不是序号**：两台设备各自新建条目时，序号必然冲突（都从 0 开始），
-///   同步取并集时会把两条无关条目当成同一条。
-/// - **不是内容的哈希**：内容相同的两条条目（用户在同一服务注册了两个账号，
-///   碰巧参数一致）会被合并，这是数据丢失。而且哈希会随内容变化，改名即变 ID，
-///   同步会认为是两条不同的条目。
-/// - **随机 128-bit**：碰撞概率在 2^64 条条目时才到生日界，实际使用规模下
-///   可忽略。且它不泄露内容信息，可以安全地明文存放在保险库文件里。
+/// # Display
 ///
-/// # 显示
-///
-/// [`Debug`] 与 [`Display`](core::fmt::Display) 都只打印十六进制形式。ID 不是
-/// 秘密（它明文存在文件里），但也不适合直接给用户看——它的用途是日志与
-/// 排错时区分条目。
+/// [`Debug`] and [`Display`](core::fmt::Display) both print the hexadecimal form only.
+/// The ID is not a secret (it sits in the file in plaintext), but it is not meant for end
+/// users either: its purpose is telling entries apart in logs and diagnostics.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntryId([u8; Self::LEN]);
 
 impl EntryId {
-    /// 标识的字节长度。
+    /// Byte length of an identifier.
     pub const LEN: usize = 16;
 
-    /// 生成一个新的随机标识。
+    /// Generates a new random identifier.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// OS 随机源不可用时返回 [`Error::RandomnessUnavailable`]。此时**不得**
-    /// 回退到任何用户态 PRNG：可预测的 ID 会让两台设备生成同一条目，
-    /// 同步时静默合并成一条。
+    /// Returns [`Error::RandomnessUnavailable`] when the OS random source is unavailable.
+    /// There is **no** fallback to a userspace PRNG: predictable IDs make two devices
+    /// generate the same entry and merge them silently during sync.
     pub fn generate() -> Result<Self> {
         let mut bytes = [0_u8; Self::LEN];
         crate::getrandom::fill(&mut bytes).map_err(|_| Error::RandomnessUnavailable)?;
         Ok(Self(bytes))
     }
 
-    /// 从字节数组构造。
+    /// Builds an identifier from a byte array.
     ///
-    /// 用于从文件解析已有 ID——**创建新条目请用 [`EntryId::generate`]**，
-    /// 否则两台设备会得到相同 ID。
+    /// Used to parse an existing ID from a file. **Creating a new entry goes through
+    /// [`EntryId::generate`]**, otherwise two devices end up with the same ID.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
         Self(bytes)
     }
 
-    /// 取出原始字节，用于写入文件与构造 AAD。
+    /// Returns the raw bytes, used to write the file and to build the AAD.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; Self::LEN] {
         &self.0
@@ -100,86 +98,84 @@ impl core::fmt::Display for EntryId {
     }
 }
 
-/// 时间戳：Unix 秒。
+/// Timestamp: Unix seconds.
 ///
-/// 由调用方传入，本库不读时钟（见 crate 文档的纯度约定）。
+/// Supplied by the caller; this library reads no clock (see the purity convention in the
+/// crate documentation).
 ///
-/// # 用途仅限用户可见的元数据
+/// # Used only for user-visible metadata
 ///
-/// 这些时间戳**不参与**同步合并的胜负判定。合并规则是「发起方版本胜出」
-/// （见设计决定 D2），不依赖时间戳比较——那样会需要时钟同步，而离线设备的
-/// 时钟不可信。
+/// These timestamps take **no** part in deciding the winner of a sync merge. The merge
+/// rule is "the originator version wins" and never compares timestamps, which would
+/// require synchronized clocks - and the clock of an offline device is not trustworthy.
 pub type Timestamp = u64;
 
-/// 一条解密后的 2FA 条目。
+/// One decrypted 2FA entry.
 ///
-/// # 为什么字段是 `pub` 而不是 getter
+/// Every field is public. This is a plain data carrier with no invariant that
+/// encapsulation would keep: validity is checked in [`Entry::new`] and during
+/// deserialization, so getters would only add noise. The one distinction is `secret`,
+/// whose type [`otp::OtpSecret`] offers neither `Clone` nor a plaintext `Debug` output,
+/// so secret handling is enforced by the type rather than by visibility.
 ///
-/// 这是一个**纯数据载体**，没有任何不变量需要靠封装维持：合法性在
-/// [`Entry::new`] 与反序列化时就已经验证过。用 getter 只会增加噪音。
+/// # Invariant: `issuer` is `None`, never `Some("")`
 ///
-/// 唯一的例外是 `secret`——它虽然不是私有字段，但它的类型
-/// [`otp::OtpSecret`] 本身不给 `Clone`、不实现 `Debug` 的明文输出，
-/// 秘密保护的约束由类型而不是可见性承担。
+/// "No issuer" has exactly one representation, [`None`]. Allowing `Some("")` would give
+/// an entry a state that does not survive a round trip: the storage format writes an
+/// empty string as a zero-length node and reads it back as `None`, so writing and reading
+/// back would yield an entry that differs from the original. That would not break
+/// anything immediately, but comparisons such as "are these two vaults equivalent" would
+/// give a wrong answer - and sync is built on exactly those comparisons. [`Entry::new`]
+/// normalizes the value, so the invalid state cannot be constructed.
 ///
-/// # 不变量：`issuer` 是 `None` 而不是 `Some("")`
+/// # Equality is hand-written, not derived
 ///
-/// 「没有发行方」只有 [`None`] 一种表示。若允许 `Some("")` 存在，条目就会有一个
-/// **往返不稳定**的状态：存储格式把空串写成零长度节点，读回来归一为 `None`，
-/// 于是「写出去再读回来」得到的是一个与原值不相等的条目。
+/// The `secret` field has type [`otp::OtpSecret`], which deliberately does not implement
+/// `PartialEq`. Deriving it on `Entry` would require that implementation and turn
+/// "compare two secrets with `==`" into a convenient operation - a non-constant-time
+/// comparison that leaks the length of a matching prefix through timing.
 ///
-/// 这种不稳定不会立刻造成故障，但会让「两份保险库是否等价」这类比较给出错误
-/// 结论——而同步正是建立在比较之上。因此 [`Entry::new`] 直接把它归一掉，让
-/// 非法状态**无法被构造出来**。
-///
-/// # 为什么没有 `PartialEq`
-///
-/// 因为 `secret` 字段的类型 [`otp::OtpSecret`] **刻意不实现 `PartialEq`**。
-/// 派生会要求它实现，从而把「用 `==` 快速比较两个种子」变成一件随手可做的
-/// 事——那是非恒定时间的比较，会通过耗时泄露前缀匹配长度。
-///
-/// 需要判断两个条目是否等价时，请逐字段比较，种子那一项用
-/// [`otp::verify_code`] 那类恒定时间原语，或比较
-/// [`otp::OtpSecret::to_base32`] 的结果（后者不是恒定时间，但只用于
-/// 测试与显示，不参与认证判定）。
+/// To decide whether two entries are equivalent, compare field by field and handle the
+/// secret with a constant-time primitive such as [`otp::verify_code`], or compare
+/// [`otp::OtpSecret::to_base32`] (not constant time, but used only for tests and display,
+/// never for an authentication decision).
 #[derive(Debug)]
 pub struct Entry {
-    /// 显示名。用户可读，可以与 `issuer`/`account` 无关。
+    /// Display name. User-readable; need not relate to `issuer` or `account`.
     pub name: String,
-    /// 发行方（`otpauth://` 的 `issuer`）。
+    /// Issuer (the `issuer` of an `otpauth://` URI).
     pub issuer: Option<String>,
-    /// 账号名。
+    /// Account name.
     pub account: String,
-    /// OTP 种子。类型层面保证不被打印、不被误克隆。
+    /// OTP secret. The type guarantees it is neither printed nor cloned by accident.
     pub secret: otp::OtpSecret,
-    /// HMAC 算法。
+    /// HMAC algorithm.
     pub algorithm: otp::Algorithm,
-    /// 验证码位数。
+    /// Number of digits in a code.
     pub digits: otp::Digits,
-    /// TOTP 的时间步长（秒）。HOTP 条目忽略此字段。
+    /// Time step of TOTP (seconds). An HOTP entry ignores this field.
     pub period: u64,
-    /// HOTP 的计数器。TOTP 条目为 `None`。
+    /// Counter of HOTP. `None` for a TOTP entry.
     pub counter: Option<u64>,
-    /// 用户备注。可为空。
+    /// Note from the user. May be empty.
     pub note: String,
-    /// 创建时间（Unix 秒）。
+    /// Creation time (Unix seconds).
     pub created_at: Timestamp,
-    /// 最后修改时间（Unix 秒）。
+    /// Last modification time (Unix seconds).
     pub updated_at: Timestamp,
 }
 
 impl PartialEq for Entry {
-    /// 逐字段比较，其中秘密那一项走恒定时间比较。
+    /// Compares field by field, with the secret compared in constant time.
     ///
-    /// # 顺序是刻意的
+    /// # The order is deliberate
     ///
-    /// 先比**廉价且几乎必然不同**的字段（名字、账号、时间戳），最后才比种子。种子那一
-    /// 项是恒定时间的（见 [`OtpSecret`](crate::otp::OtpSecret) 的 `PartialEq`），意味着
-    /// 它总是比较全部字节；放在最后，那些名字就不同的条目对在第一个字段就被排除了，
-    /// 不会付出那个代价。
-    ///
-    /// 这不是「优化」而是让恒定时间比较的代价可控：同步的合并循环要对成千上万对条目
-    /// 做这个判断，而其中绝大多数连名字都不一样。
+    /// Cheap fields that almost always differ (name, account, timestamps) come first and
+    /// the secret comes last. The secret comparison is constant time (see the `PartialEq`
+    /// of [`OtpSecret`](crate::otp::OtpSecret)), so it always reads every byte; going last
+    /// means entry pairs whose names already differ are rejected at the first field and
+    /// never pay that cost. The sync merge loop runs this check on thousands of entry
+    /// pairs, and most pairs do not even share a name.
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
             && self.issuer == other.issuer
@@ -198,85 +194,90 @@ impl PartialEq for Entry {
 impl Eq for Entry {}
 
 impl Entry {
-    /// 复制一份内容完全相同的条目。
+    /// Copies an entry with identical contents.
     ///
-    /// # 为什么需要它，而 `Clone` 又是刻意不给的
+    /// Sync needs the copy in two places: presenting the peer version and the local
+    /// version side by side to the adjudication UI (a conflict *is* two different
+    /// versions), and storing the peer version in the local vault (a received entry is
+    /// written to disk while also being recorded in the conflict record).
+    /// [`OtpSecret`](crate::otp::OtpSecret) deliberately does not implement `Clone`, so
+    /// the copy goes through this **explicit** entry point instead of a derived `Clone` on
+    /// `Entry`: a call site must spell out `duplicate()`, which makes another copy of key
+    /// material visible in review, whereas a derived `Clone` would let copies happen
+    /// silently in any number of places.
     ///
-    /// [`OtpSecret`](crate::otp::OtpSecret) 刻意不实现 `Clone`，理由是「克隆会让同一
-    /// 密钥在内存中多存一份、各自独立擦除，增加泄露面」。那个理由在**一般**情况下
-    /// 成立，但同步有两个绕不开的需要：
+    /// # Implementation
     ///
-    /// 1. **把对端的版本与本地版本同时呈现给裁决界面。** 冲突的本质就是「有两个不同
-    ///    的版本」，只给一个就没法裁决。
-    /// 2. **把对端那一版原样收进本地保险库。** 接收到的条目要落盘，而它同时也被记在
-    ///    冲突记录里。
+    /// A full encode/decode round trip rather than a field-by-field copy, so a newly added
+    /// field needs no change here: a field-by-field copy that misses one shows up as "the
+    /// new field is empty after syncing", a silent data loss that easily escapes tests. The
+    /// cost is one encode/decode, on a user-triggered sync path rather than any hot path.
+    /// The encoding and decoding functions are private items of the parent `vault` module.
     ///
-    /// 因此这里提供一个**显式**的复制入口，而不是给 `Entry` 派生 `Clone`：调用点必须
-    /// 写下 `duplicate()`，从而在代码审查中可见「这里又复制了一份密钥材料」。派生
-    /// `Clone` 会让复制在无数地方静默发生。
+    /// # Errors
     ///
-    /// # 实现
-    ///
-    /// 走一遍编解码往返，而不是逐字段复制。这样**新增字段时不需要记得改这里**——逐字段
-    /// 复制的版本漏掉一个新字段，症状是「同步之后新字段全空了」，一个很容易漏过测试的
-    /// 静默数据损失。代价是一次编解码，而复制发生在用户手动触发的同步路径上，不在任何
-    /// 热路径里。
-    ///
-    /// # 错误
-    ///
-    /// 只有当条目本身违反格式约束时才会失败（例如某个字段超过
-    /// [`Entry::MAX_FIELD_LEN`]）。能构造出这样一个条目就已经是 bug 了。
+    /// Fails only when the entry itself violates the format constraints (for example a
+    /// field longer than [`Entry::MAX_FIELD_LEN`]). Constructing such an entry is already a
+    /// bug.
     pub fn duplicate(&self) -> Result<Self> {
-        // `super` 是 `vault` 模块，编解码函数是那里的私有项。
         let encoded = super::encode_entry(self)?;
         super::decode_entry(&encoded)
     }
 
-    /// 索引上限：单个可变长字段的最大字节数。
+    /// Size limit: maximum byte length of a single variable-length field.
     ///
-    /// # 为什么要有上限
+    /// These fields become `String`s after decryption, and a ciphertext length has no
+    /// natural bound - a constructed vault file can claim a 4 GiB name, which would eat all
+    /// memory at decryption time. Noticing an over-long field **after** decrypting is too
+    /// late, so the limit has to apply at allocation.
     ///
-    /// 这些字段在解密后成为 `String`，而密文长度不受任何天然约束——一个
-    /// 构造出来的保险库文件可以声称某条目的名称有 4 GiB，解密时直接吃光内存。
-    /// 解密**之后**才发现超长已经太晚，因此上限必须在分配时生效。
-    ///
-    /// 64 KiB 远大于任何真实字段（最长的账号名或备注也很少超过几百字节），
-    /// 同时把「几百条条目」的最坏内存占用限制在可接受范围。
+    /// 64 KiB far exceeds any real field (even a long account name or note rarely passes a
+    /// few hundred bytes) and bounds the worst-case memory of a few hundred entries to
+    /// something acceptable.
     pub const MAX_FIELD_LEN: usize = 64 * 1024;
 
-    /// 条目的最大字段数，用于在解析时限制未知节的数量。
+    /// Maximum number of fields in an entry, used to bound the number of unknown nodes
+    /// during parsing.
     ///
-    /// 解析器遇到未知节点会跳过而不是报错（向前兼容），但没有上限的话，
-    /// 一个全是未知节点的文件可以让跳过的循环跑很久。
+    /// The parser skips unknown nodes instead of failing (forward compatibility), and
+    /// without a limit a file made entirely of unknown nodes would keep the skip loop
+    /// running for a long time.
     pub const MAX_FIELDS: usize = 64;
 
-    /// 构造一条条目。
+    /// Constructs an entry.
     ///
-    /// # 错误
+    /// The empty-secret check is redundant with the guarantee of `OtpSecret` itself
+    /// (`from_bytes` rejects empty input), but it stays so that the invariants of `Entry`
+    /// do not depend on the behaviour of another type.
     ///
-    /// - 种子为空 → [`Error::SecretEmpty`]（空种子无意义，且会让所有验证码相同）
-    /// - 任一字段超过 [`Entry::MAX_FIELD_LEN`] → [`Error::FieldTooLong`]
-    /// - `period` 为 0 → [`Error::InvalidPeriod`]（会导致除零）
+    /// # Errors
     ///
-    /// **不检查**种子长度是否达到推荐值：短种子在真实世界存在，属于告警而非
-    /// 拒绝，见 [`otp::recommended_min_secret_len`]。
+    /// - Empty secret -> [`Error::SecretEmpty`] (an empty secret is meaningless and would
+    ///   make every code identical)
+    /// - Any field longer than [`Entry::MAX_FIELD_LEN`] -> [`Error::FieldTooLong`]
+    /// - `period` of 0 -> [`Error::InvalidPeriod`] (would divide by zero)
     ///
-    /// # 条目的类型由 `counter` 决定
+    /// A secret shorter than the recommended length is **not** checked: short secrets exist
+    /// in the real world and that is a warning rather than a refusal, see
+    /// [`otp::recommended_min_secret_len`].
     ///
-    /// `counter` 为 `Some` 即 HOTP，为 `None` 即 TOTP（见 [`Entry::uri_type`]）。
-    /// 这里**不**额外要求「HOTP 必须给出 `counter`」——`None` 已经被解释为
-    /// TOTP，不存在「HOTP 却没有计数器」这个状态。
+    /// # The entry type follows `counter`
     ///
-    /// # 为什么参数这么多
+    /// `Some` means HOTP and `None` means TOTP (see [`Entry::uri_type`]). There is no
+    /// separate requirement that an HOTP entry supply a counter: `None` already reads as
+    /// TOTP, so "HOTP without a counter" is not a state.
     ///
-    /// 11 个参数确实多，但它们全是条目的必填字段，没有一个可以省略或推导出来。
-    /// 用构造器（builder）模式会让「忘记设置某个字段」从编译错误变成运行时错误，
-    /// 而这里恰恰是密码学数据——一个静默默认值（`period` 默认 0、种子默认空）
-    /// 造成的故障极难定位。参数表让「所有字段都必须给出」由类型系统强制。
+    /// # Eleven parameters
     ///
-    /// 调用方通常也不需要手工填这一长串：从二维码接入的路径走
-    /// [`entry_from_parsed_uri`]，从文件恢复的路径走
-    /// [`crate::vault::VaultFile::parse`]。
+    /// All eleven are mandatory fields of the entry and none can be omitted or derived. A
+    /// builder would turn "forgot to set a field" from a compile error into a runtime one,
+    /// on cryptographic data where a silent default (`period` 0, an empty secret) is very
+    /// hard to diagnose. The parameter list makes the type system enforce that every field
+    /// is supplied.
+    ///
+    /// Callers rarely fill this list by hand: the QR path goes through
+    /// [`entry_from_parsed_uri`] and the file path through
+    /// [`crate::vault::VaultFile::parse`].
     #[expect(
         clippy::too_many_arguments,
         reason = "全部参数都是必填字段；改用 builder 会把编译期保证换成运行时默认值"
@@ -294,8 +295,6 @@ impl Entry {
         created_at: Timestamp,
         updated_at: Timestamp,
     ) -> Result<Self> {
-        // `OtpSecret` 自身保证非空（`from_bytes` 拒绝空输入），这里的检查是
-        // 冗余的，但保留它意味着 `Entry` 的不变量不依赖另一个类型的历史行为。
         if secret.len() == 0 {
             return Err(Error::SecretEmpty);
         }
@@ -320,8 +319,6 @@ impl Entry {
         }
         Ok(Self {
             name,
-            // 空发行方归一为 `None`。这不是「顺手清理」，而是维持一个**往返
-            // 稳定**的状态空间：见本类型文档里关于 `issuer` 不变量的说明。
             issuer: issuer.filter(|text| !text.is_empty()),
             account,
             secret,
@@ -335,10 +332,11 @@ impl Entry {
         })
     }
 
-    /// 该条目是 HOTP 还是 TOTP。
+    /// Whether the entry is HOTP or TOTP.
     ///
-    /// 判据是 `counter` 是否存在，因为那是两者的**结构性**差异：TOTP 由时间
-    /// 派生计数器，HOTP 的计数器必须由用户或同步状态提供。
+    /// The presence of `counter` decides it, that being the **structural** difference
+    /// between the two: TOTP derives its counter from time, while an HOTP counter must come
+    /// from the user or from sync state.
     #[must_use]
     pub const fn uri_type(&self) -> crate::uri::UriType {
         if self.counter.is_some() {
@@ -349,18 +347,18 @@ impl Entry {
     }
 }
 
-/// 从 `otpauth://` 解析结果构造条目。
+/// Builds an entry from a parsed `otpauth://` result.
 ///
-/// 这是把二维码扫进来的配置与本库的存储模型接起来的那一步。`now` 是当前
-/// Unix 秒，由调用方传入（本库不读时钟），同时用作创建与修改时间。
+/// This is the step joining a scanned QR configuration to the storage model of this
+/// library. `now` is the current Unix second supplied by the caller (this library reads no
+/// clock) and is used as both the creation and the modification time.
 ///
-/// # 错误
+/// # Errors
 ///
-/// 与 [`Entry::new`] 相同的校验，因此正常解析出的 URI 不会失败——`uri::parse`
-/// 已经保证了种子非空与 `period` 非零。二者都保留校验是为了让 [`Entry`]
-/// 的不变量不依赖于调用顺序。
+/// The same checks as [`Entry::new`], so a URI that parsed normally does not fail here:
+/// `uri::parse` already guarantees a non-empty secret and a non-zero `period`. Both checks
+/// are kept so that the invariants of [`Entry`] do not depend on the order of calls.
 pub fn entry_from_parsed_uri(parsed: &crate::uri::OtpAuth, now: Timestamp) -> Result<Entry> {
-    // `OtpSecret` 不可克隆（那会复制明文），因此这里重新从 Base32 解码一份。
     let secret = otp::OtpSecret::from_base32(&parsed.secret.to_base32())?;
     let name = match &parsed.issuer {
         Some(issuer) => format!("{issuer}:{}", parsed.account),
@@ -414,13 +412,11 @@ mod tests {
         assert_eq!(text.len(), 32, "十六进制应为 32 字符：{text}");
         assert!(text.chars().all(|c| c.is_ascii_hexdigit()));
 
-        // 同一个 ID 的两种打印形式必须一致，避免日志里出现两种表示。
         assert_eq!(format!("{id:?}"), format!("EntryId({text})"));
     }
 
     #[test]
     fn entry_id_generation_does_not_repeat() {
-        // 不是严格的随机性检验，只挡住「生成器退化为常量」这类错误。
         let ids: Vec<_> = (0..64)
             .map(|_| EntryId::generate().expect("OS 随机源可用"))
             .collect();
@@ -473,16 +469,8 @@ mod tests {
         }
     }
 
-    /// **不变量测试**：空发行方必须在构造时就被归一为 `None`。
-    ///
-    /// # 这条测试的来历
-    ///
-    /// 由属性测试 `roundtrip_preserves_every_entry` 发现：策略生成了一条
-    /// `issuer = Some("")` 的条目，存储格式把空串写成零长度节点，读回来归一为
-    /// `None`，于是往返前后不相等——`Entry` 存在一个**往返不稳定**的状态。
-    ///
-    /// 修法是在唯一能构造 `Entry` 的入口把它归一掉，而不是在序列化时特判。
-    /// 前者让非法状态无法存在，后者只是掩盖了它。
+    /// **Invariant test**: an empty issuer is normalized to `None` by the constructor, while
+    /// a whitespace-only issuer is preserved as user-visible content.
     #[test]
     fn empty_issuer_is_normalized_to_none() {
         let entry = Entry::new(
@@ -501,7 +489,6 @@ mod tests {
         .expect("其余字段合法");
         assert_eq!(entry.issuer, None, "空发行方应归一为 None");
 
-        // 空白字符串**不**归一：它是用户输入的、可见的内容，不是「没有值」。
         let blank = Entry::new(
             "x".into(),
             Some("   ".into()),
@@ -542,7 +529,7 @@ mod tests {
         assert_eq!(hotp.counter, Some(7));
     }
 
-    /// `Debug` 是条目最可能被误打进日志的路径，必须不含种子。
+    /// `Debug` must not contain the secret.
     #[test]
     fn debug_does_not_leak_secret() {
         let entry = sample_entry();
@@ -550,7 +537,6 @@ mod tests {
         assert!(debug.contains("GitHub"), "非秘密字段应正常：{debug}");
         assert!(debug.contains("alice"), "非秘密字段应正常：{debug}");
 
-        // 种子的 Base32 与原始字节两种形态都不得出现。
         let base32 = entry.secret.to_base32();
         assert!(
             !debug.contains(&base32),
@@ -573,7 +559,6 @@ mod tests {
         assert_eq!(entry.created_at, 1_700_000_000);
         assert_eq!(entry.created_at, entry.updated_at);
 
-        // 转换必须真的搬走了种子，而不只是留下一个空壳。
         assert_eq!(
             entry.secret.to_base32(),
             parsed.secret.to_base32(),

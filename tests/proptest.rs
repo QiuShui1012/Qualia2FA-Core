@@ -13,22 +13,34 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! 基于属性的测试。
+//! Property-based tests for the secret wrappers, Base32, OTP and `otpauth://`.
 //!
-//! 与 `fuzz/` 下的 libFuzzer 目标分工：
+//! The failure mode of a secret type is not a wrong result but a **leak**: once `Debug`
+//! carries the plaintext out, it can end up in logs, crash dumps or telemetry. Such a bug
+//! is invisible to tests built on hand-picked inputs, so it is asserted over arbitrary
+//! ones.
 //!
-//! - **proptest（本文件）**：验证「对所有输入都应成立的**性质**」，用收缩
-//!   （shrinking）给出最小反例。跑在 `cargo test` 里，CI 必然执行。
-//! - **fuzz**：极大量随机输入 + 变异，找 panic、越界、挂起。需要显式触发。
+//! Coverage and properties:
 //!
-//! # 为什么这一层测的不是「显然成立」的东西
+//! - **Secret wrappers** — arbitrary byte strings of 0 to 2048 bytes and arbitrary UTF-8
+//!   text. Construction and `expose_secret` are transparent, `Clone` is exact, and
+//!   `Debug` — standalone or nested in a `#[derive(Debug)]` struct — never contains the
+//!   plaintext in hexadecimal or decimal form.
+//! - **Base32 and OTP** — non-empty byte strings and arbitrary text. Encoding and
+//!   decoding round-trip byte for byte for every legal tail remainder and in both the
+//!   padded and the unpadded form, decoding never panics, and every code keeps its exact
+//!   width and alphabet.
+//! - **`otpauth://`** — arbitrary label text and self-consistent TOTP/HOTP
+//!   configurations. Parse and serialize round-trip semantically, serialization is
+//!   idempotent, and parsing never panics on arbitrary text.
 //!
-//! 秘密类型的失败模式不是「算错」而是**泄露**：`Debug` 一旦把明文带出来，就可能
-//! 落进日志、崩溃转储或遥测。这类 bug 不会被固定样例的单元测试发现，
-//! 必须用「任意输入」来保证。
+//! A failure means an arbitrary input reached a state the property excludes: a leaked
+//! secret, data that changed or was lost, or a panic.
 //!
-//! 另外，这些性质同时是**对上游 `secrecy` 的回归防线**：将来升级 `secrecy` 时，
-//! 若其脱敏行为发生变化，这里会直接失败。
+//! Note: `prop_assert!` stringifies its whole expression into a format string, so a
+//! `matches!(..)` pattern or an inline named capture (`{name}`) must be bound to a local
+//! before it is asserted; `prop_assert_eq!` consumes its arguments, so a value needed
+//! afterwards has to be computed up front.
 
 use proptest::prelude::*;
 use qualia2fa_core::base32;
@@ -36,42 +48,40 @@ use qualia2fa_core::otp::{self, Algorithm, Digits, OtpSecret};
 use qualia2fa_core::uri::{self, OtpAuth, UriType};
 use qualia2fa_core::{ExposeSecret, SecretBytes, SecretString};
 
-/// 生成任意字节序列。
+/// Generates an arbitrary byte sequence.
 ///
-/// 上限取 2048 字节：既覆盖真实种子/密钥量级（20–64 字节），又给到手写
-/// Base32 串、二维码载荷这类较长的输入，同时避免超长输入拖慢测试。
+/// The upper bound is 2048 bytes: it covers the size of real seeds and keys (20–64 bytes)
+/// as well as longer inputs such as hand-written Base32 strings and QR payloads, while
+/// keeping very long inputs from slowing the tests down.
 fn arb_bytes() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(any::<u8>(), 0..=2048)
 }
 
-/// 生成**非空**字节串，用于「编码 → 解码」这类往返性质。
+/// Generates a **non-empty** byte string, for round-trip properties such as
+/// "encode then decode".
 ///
-/// # 为什么不能复用 `arb_bytes`
+/// Empty input is not legal Base32: `base32::decode("")` returns
+/// [`Error::SecretTooShort`] (see `rejects_empty_and_padding_only` in `src/base32.rs` —
+/// an empty seed would make every code identical, so it must be rejected). The round-trip
+/// property therefore does not hold for the empty string, and this strategy keeps it out
+/// of reach; [`arb_bytes`], which allows the empty string, must not be used here.
 ///
-/// `arb_bytes` 允许空串，而**空输入不是合法的 Base32**：`base32::decode("")`
-/// 会返回 [`Error::SecretTooShort`]（见 `src/base32.rs` 的
-/// `rejects_empty_and_padding_only`，那是刻意的行为——空种子会让所有验证码
-/// 相同，必须拒绝）。
-///
-/// 于是「编码再解码必须还原」这条性质对空输入**本来就不成立**，而 `arb_bytes`
-/// 迟早会生成它。这是个潜伏的测试缺陷：它一直在随机地等着被触发，一旦触发，
-/// proptest 会把 `data = []` 写进 `proptest-regressions` 文件，此后每次运行都
-/// 稳定失败。
-///
-/// 「空输入被拒绝」这件事由上面的单元测试覆盖，往返性质只需要管非空输入。
+/// Rejection of empty input is covered by the unit tests in `src/base32.rs`; the
+/// round-trip properties only concern non-empty input.
 fn arb_nonempty_bytes() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(any::<u8>(), 1..=2048)
 }
 
 proptest! {
-    /// 性质：从 `Vec<u8>` 构造后取用，必须原样返回，不截断、不填充、不改写。
+    /// Property: constructing from a `Vec<u8>` and exposing the result gives the input
+    /// back unchanged — no truncation, no padding, no rewriting.
     #[test]
     fn expose_is_transparent(data in arb_bytes()) {
         let secret: SecretBytes = data.clone().into();
         prop_assert_eq!(secret.expose_secret(), data.as_slice());
     }
 
-    /// 性质：`Clone` 必须逐字节一致。
+    /// Property: `Clone` is byte-for-byte identical.
     #[test]
     fn clone_is_exact(data in arb_bytes()) {
         let secret: SecretBytes = data.clone().into();
@@ -79,29 +89,30 @@ proptest! {
         prop_assert_eq!(copy.expose_secret(), secret.expose_secret());
     }
 
-    /// 性质：`SecretString` 的构造与取用同样透明。
+    /// Property: `SecretString` construction and exposure are equally transparent.
     ///
-    /// 用 Rust 的 `String`（保证 UTF-8）作为输入，覆盖文本秘密路径。
+    /// The input is a Rust `String` (guaranteed UTF-8), which is the text-secret path.
     #[test]
     fn secret_string_is_transparent(text in ".*") {
         let secret = SecretString::from(text.clone());
         prop_assert_eq!(secret.expose_secret(), text.as_str());
     }
 
-    /// **核心性质**：`Debug` 输出绝不含明文。
+    /// **Core property**: the `Debug` output never contains the plaintext.
     ///
-    /// 检查明文的十六进制与十进制两种表示。上游 `secrecy` 的 `Debug` 连长度都
-    /// 不打印，因此这里**不**断言长度可读——只断言不泄露。
+    /// Both the hexadecimal and the decimal representation of the plaintext are checked.
+    /// Upstream `secrecy` does not even print the length, so a readable length is **not**
+    /// asserted here — only the absence of a leak.
     ///
-    /// 仅当长度 ≥ 4 时才做子串检查：更短的十进制串（如 2 字节的 "12"）会与
-    /// `Debug` 里的类型名、数字等产生偶然碰撞，导致误报。
+    /// The substring check runs only for lengths ≥ 4: a shorter decimal string (such as
+    /// the "12" of a 2-byte input) collides by chance with type names and numbers printed
+    /// by `Debug` and would cause a false positive.
     #[test]
     fn debug_never_contains_plaintext(data in arb_bytes()) {
         let secret: SecretBytes = data.clone().into();
         let debug = format!("{secret:?}");
         let lower = debug.to_lowercase();
 
-        // 必须标注脱敏。
         prop_assert!(
             lower.contains("redacted"),
             "Debug 未标注脱敏（长度 {}）：{}",
@@ -122,20 +133,18 @@ proptest! {
         }
     }
 
-    /// 性质：嵌套在 `#[derive(Debug)]` 结构里的秘密，同样不得泄露。
+    /// Property: a secret nested inside a `#[derive(Debug)]` struct must not leak either.
     #[test]
     fn debug_never_leaks_when_nested(data in arb_bytes()) {
-        // 字段只用于构造 `Debug` 输出，不参与读取；`expect` 比 `allow` 严格：
-        // 一旦这些字段真被读到，它会反过来报错提醒删除本属性。
         #[expect(
             dead_code,
             reason = "字段仅用于构造 Debug 输出；这是本测试的全部意图"
         )]
         #[derive(Debug)]
         struct Holder {
-            /// 非秘密字段，用于确认 Debug 确实在输出内容。
+            /// Non-secret field, used to confirm that `Debug` really prints content.
             tag: u8,
-            /// 秘密字段。
+            /// Secret field.
             secret: SecretBytes,
         }
 
@@ -153,33 +162,34 @@ proptest! {
     }
 }
 
-// ─────────────────────────── Base32 与 OTP 的性质 ───────────────────────────
+// ─────────────────────────── Base32 and OTP properties ───────────────────────────
 
 proptest! {
-    /// **核心性质**：Base32 编码再解码必须逐字节还原。
+    /// **Core property**: Base32 encoding followed by decoding restores every byte.
     ///
-    /// 这条覆盖全部 5 种合法尾部余数（0/2/4/5/7 位）。随机字节长度会均匀
-    /// 命中它们，因此不需要为每种余数单独写测试。
+    /// This covers all five legal tail remainders (0/2/4/5/7 bits); random byte lengths
+    /// hit them evenly, so no per-remainder test is needed.
     ///
-    /// 输入限定非空——空输入不是合法 Base32，见 [`arb_nonempty_bytes`]。
+    /// Input is restricted to non-empty strings — empty input is not legal Base32, see
+    /// [`arb_nonempty_bytes`].
     #[test]
     fn base32_encode_decode_roundtrips(data in arb_nonempty_bytes()) {
         let encoded = base32::encode(&data);
-        // 编码结果只能是字母表内字符与填充符。
         prop_assert!(
             encoded.bytes().all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b) || b == b'='),
             "编码含字母表外字符：{}",
             encoded
         );
-        // 我们自己的编码必须是规范形式，因此严格模式也必须接受。
         let decoded = base32::decode_strict(&encoded)
             .map_err(|e| TestCaseError::fail(format!("严格解码自己的编码失败：{e}（原文 {}）", encoded)))?;
         prop_assert_eq!(decoded.expose_secret(), data.as_slice());
     }
 
-    /// 性质：无填充形式的编码同样可解码（真实世界绝大多数种子无填充）。
+    /// Property: the unpadded form decodes to the same secret — nearly every real-world
+    /// seed is distributed without padding.
     ///
-    /// 输入同样限定非空：空串去掉填充还是空串，仍然非法。
+    /// Input is restricted to non-empty strings for the same reason: stripping the padding
+    /// from the empty string still leaves an empty string, which stays illegal.
     #[test]
     fn base32_unpadded_encoding_also_decodes(data in arb_nonempty_bytes()) {
         let padded = base32::encode(&data);
@@ -189,21 +199,22 @@ proptest! {
         prop_assert_eq!(decoded.expose_secret(), data.as_slice());
     }
 
-    /// 性质：任意字符串都不得让解码器 panic——只能返回 `Ok` 或 `Err`。
+    /// Property: no string makes the decoder panic — it returns `Ok` or `Err`, nothing
+    /// else.
     ///
-    /// 这条是「库内禁 panic」契约在 Base32 上的体现。解码器接受的输入直接来自
-    /// 二维码与用户手输，必须有界且不崩。
+    /// This is the no-panic contract applied to Base32. Decoder input comes straight from
+    /// QR codes and manual typing, so it must stay bounded and never crash.
     #[test]
     fn base32_never_panics_on_arbitrary_text(text in "\\PC*") {
-        // 只要求调用返回，不关心成功与否。
         let _ = base32::decode(&text);
         let _ = base32::decode_strict(&text);
     }
 
-    /// 性质：OTP 码必须**恒为**定宽十进制字符串。
+    /// Property: an OTP code is **always** a fixed-width decimal string whose numeric value
+    /// lies in `[0, 10^digits)`.
     ///
-    /// 这是最容易出错的地方：把结果当整数处理就会丢掉前导零，
-    /// 而当结果恰好是 0 时会输出空串或 "0"。
+    /// Leading zeros are part of the code: a value that happens to be 0 still has to be
+    /// rendered at the full width, not as an empty string or "0".
     #[test]
     fn otp_code_is_always_exact_width_digits(
         data in prop::collection::vec(any::<u8>(), 1..=64),
@@ -224,12 +235,11 @@ proptest! {
             "含非数字字符：{}",
             code
         );
-        // 数值必须落在 [0, 10^digits)。
         let numeric: u64 = code.parse().expect("应可解析为数字");
         prop_assert!(numeric < 10_u64.pow(digits.count()));
     }
 
-    /// 性质：`format_code` 与 `hotp` 必须一致（格式化不改变数值）。
+    /// Property: `format_code` and `hotp` agree — formatting does not change the value.
     #[test]
     fn format_code_agrees_with_numeric_value(
         data in prop::collection::vec(any::<u8>(), 1..=64),
@@ -239,16 +249,14 @@ proptest! {
         let secret = OtpSecret::from_bytes(data).expect("非空");
         let numeric = otp::hotp(&secret, counter, Algorithm::Sha1, digits);
         let formatted = otp::format_code(numeric, digits);
-        // 先解析再断言：`prop_assert_eq!` 会消费其参数。且 proptest 的宏不支持
-        // 内联命名格式化参数（`{name}` 捕获）——所有格式化参数必须预先算好，
-        // 并按位置显式传入。这两点都在此前踩过。
         let reparsed: u64 = formatted.parse().expect("应可解析");
         let expected = otp::hotp_code(&secret, counter, Algorithm::Sha1, digits);
         prop_assert_eq!(formatted, expected);
         prop_assert_eq!(reparsed, u64::from(numeric));
     }
 
-    /// 性质：TOTP 只依赖 `unix_time / period`，同一时间步内的不同时刻必须同码。
+    /// Property: TOTP depends only on `unix_time / period`, so two instants inside the same
+    /// time step produce the same code.
     #[test]
     fn totp_is_constant_within_a_time_step(
         data in prop::collection::vec(any::<u8>(), 1..=64),
@@ -258,7 +266,6 @@ proptest! {
     ) {
         let secret = OtpSecret::from_bytes(data).expect("非空");
         let base = time - (time % period);
-        // 落在同一个时间步内的另一个时刻。
         let same_step = base + (offset % period);
         prop_assert_eq!(base / period, same_step / period, "构造应落在同一时间步");
 
@@ -269,7 +276,8 @@ proptest! {
         prop_assert_eq!(a, b);
     }
 
-    /// 性质：`verify_code` 自反，且对不同长度的输入恒为 `false`。
+    /// Property: `verify_code` is reflexive and always `false` for inputs of a different
+    /// length. Code length is not secret, so a length mismatch may return immediately.
     #[test]
     fn verify_code_is_reflexive(
         data in prop::collection::vec(any::<u8>(), 1..=64),
@@ -278,15 +286,14 @@ proptest! {
         let secret = OtpSecret::from_bytes(data).expect("非空");
         let code = otp::hotp_code(&secret, counter, Algorithm::Sha1, Digits::Six);
         prop_assert!(otp::verify_code(&code, &code), "自反性失败：{}", code);
-        // 长度不同时必须为 false（长度不是秘密，可立即返回）。
-        // 变体必须先在宏外算好：宏内部会把 `{code}` 当成内联命名捕获参数。
         let too_long = format!("{code}0");
         let one_shorter = code[1..].to_owned();
         prop_assert!(!otp::verify_code(&code, &too_long));
         prop_assert!(!otp::verify_code(&code, &one_shorter));
     }
 
-    /// 性质：Steam 码恒为 5 个字符，且全部来自 Steam 字母表。
+    /// Property: a Steam code is always 5 characters long and drawn entirely from the Steam
+    /// alphabet.
     #[test]
     fn steam_code_shape_is_constant(
         data in prop::collection::vec(any::<u8>(), 1..=64),
@@ -297,35 +304,34 @@ proptest! {
             .expect("period 非零");
         prop_assert_eq!(code.chars().count(), otp::STEAM_DIGITS);
         const ALPHABET: &str = "23456789BCDFGHJKMNPQRTVWXY";
-        // 先把结果算成 `bool`：proptest 的宏不支持内联命名格式化参数。
         let all_in_alphabet = code.chars().all(|c| ALPHABET.contains(c));
         prop_assert!(all_in_alphabet, "含字母表外字符：{}", code);
     }
 }
 
-// ────────────────────────── `otpauth://` 解析的性质 ──────────────────────────
+// ────────────────────────── `otpauth://` parsing properties ──────────────────────────
 
-/// 生成可安全放进 `otpauth://` 各字段的文本。
+/// Generates text that can be placed safely into every `otpauth://` field.
 ///
-/// # 为什么必须限制字符集
+/// The character set is restricted because some characters do not round-trip through the
+/// format:
 ///
-/// 这不是为了让测试好写，而是因为**有些字符在格式里是不可往返的**：
+/// - **colon `:`** — the label uses the first `:` to separate issuer from account, so a `:`
+///   inside the account name cannot be told apart from the separator. This is an ambiguity
+///   of the format itself, and both ends reject it explicitly
+///   (`Error::UriAccountContainsColon`). The legal value domain excludes the colon, so the
+///   strategy must not generate one; doing so would test an unreachable state.
+/// - **whitespace** — query decoding treats `+` as a space, and leading or trailing
+///   whitespace is trimmed by most implementations.
+/// - **control characters** — the format defines no meaning for them.
 ///
-/// - **冒号 `:`**：label 用第一个 `:` 分隔 issuer 与 account，因此账号名里的 `:`
-///   无法与分隔符区分。这是**格式本身的歧义**，不是实现缺陷——解析与序列化
-///   两端都已显式拒绝（`Error::UriAccountContainsColon`）。既然合法值域里不含
-///   冒号，策略就不该生成它，否则测的是不可达状态。
-/// - **空白**：query 解码把 `+` 视为空格，前导/尾随空白在多数实现里会被裁剪。
-/// - **控制字符**：本格式不定义其语义。
-///
-/// 因此这里用「字母数字 + 少量格式里有明确含义的 ASCII + 任意非 ASCII」，
-/// 让性质测试聚焦在**编解码正确性**上，而不是去断言规范未定义的边角行为。
+/// The generated text is therefore drawn from ASCII characters that have a defined meaning
+/// in the format plus arbitrary non-ASCII: the properties then focus on **encode/decode
+/// correctness** instead of corners the specification leaves undefined.
 fn arb_label_text() -> impl Strategy<Value = String> {
     prop::collection::vec(
         prop_oneof![
-            // 非 ASCII（含中文、emoji 等多字节字符），覆盖百分号编解码路径。
             0x80_u32..0x2FFFF,
-            // 格式里有明确含义、且应能往返的 ASCII。
             prop::sample::select(vec![
                 'a', 'Z', '0', '9', ' ', '+', '-', '_', '.', '%', '&', '=', '?', '#', '@', '/',
             ])
@@ -336,7 +342,12 @@ fn arb_label_text() -> impl Strategy<Value = String> {
     .prop_map(|codes| codes.into_iter().filter_map(char::from_u32).collect())
 }
 
-/// 生成 TOTP 或 HOTP 的完整配置，保证字段组合自洽。
+/// Generates a complete TOTP or HOTP configuration whose fields are mutually consistent.
+///
+/// `OtpAuth` invariants: `period` has a meaning only for TOTP and HOTP always carries
+/// [`uri::DEFAULT_PERIOD`], while `counter` is present only for HOTP. Only values that
+/// satisfy the invariants are generated, otherwise the properties would test unreachable
+/// states.
 fn arb_otp_auth() -> impl Strategy<Value = OtpAuth> {
     (
         prop::collection::vec(any::<u8>(), 1..=64),
@@ -365,9 +376,6 @@ fn arb_otp_auth() -> impl Strategy<Value = OtpAuth> {
                     account,
                     algorithm,
                     digits,
-                    // `OtpAuth` 的不变量：`period` 只在 TOTP 下有含义，HOTP 恒为
-                    // `DEFAULT_PERIOD`。策略必须生成满足不变量的值，否则测的是
-                    // 不可达状态——这个坑已经踩过一次（最小反例：HOTP + period=1）。
                     period: if is_hotp { uri::DEFAULT_PERIOD } else { period },
                     counter: is_hotp.then_some(counter),
                 }
@@ -376,14 +384,13 @@ fn arb_otp_auth() -> impl Strategy<Value = OtpAuth> {
 }
 
 proptest! {
-    /// **核心性质**：`parse(serialize(auth)?)` 必须还原出等价的配置。
+    /// **Core property**: `parse(serialize(auth)?)` restores an equivalent configuration.
     ///
-    /// 序列化会做规范化（省略默认值、种子转为无填充 Base32），所以断言的是
-    /// **语义等价**而不是逐字节相同。这条性质覆盖了百分号编解码、默认值省略、
-    /// 以及 issuer 在两个位置（label 前缀与 query 参数）的一致性校验。
-    ///
-    /// 这条性质曾经抓到两个真实缺陷：scheme 前缀剥离在非字符边界上 panic，
-    /// 以及 HOTP 的 `period` 往返丢失。
+    /// Serialization normalizes (defaults are omitted, the secret becomes unpadded Base32),
+    /// so what is asserted is **semantic equivalence**, not byte equality. The property
+    /// covers percent encoding and decoding, omission of default values, and the consistency
+    /// check on the issuer in both of its positions (label prefix and query parameter). The
+    /// secret itself must come back byte for byte.
     #[test]
     fn otpauth_uri_roundtrips(auth in arb_otp_auth()) {
         let text = uri::serialize(&auth)
@@ -398,7 +405,6 @@ proptest! {
         prop_assert_eq!(parsed.digits, auth.digits, "位数不同");
         prop_assert_eq!(parsed.period, auth.period, "周期不同");
         prop_assert_eq!(parsed.counter, auth.counter, "计数器不同");
-        // 种子必须逐字节还原——这是最重要的一条。
         prop_assert_eq!(
             parsed.secret.to_base32(),
             auth.secret.to_base32(),
@@ -406,7 +412,7 @@ proptest! {
         );
     }
 
-    /// 性质：序列化两次必须得到相同结果（规范化是幂等的）。
+    /// Property: serializing twice yields the same text — normalization is idempotent.
     #[test]
     fn otpauth_serialization_is_idempotent(auth in arb_otp_auth()) {
         let once = uri::serialize(&auth).expect("应可序列化");
@@ -415,19 +421,20 @@ proptest! {
         prop_assert_eq!(once, twice);
     }
 
-    /// 性质：任意字符串都不得让 URI 解析器 panic。
+    /// Property: no string makes the URI parser panic.
     ///
-    /// 这是**最主要的攻击者可控输入面**（二维码内容、剪贴板、手输链接），
-    /// 因此「有界且不崩」是硬契约。
+    /// This is the main attacker-controlled input surface (QR content, clipboard, typed
+    /// links), so staying bounded without crashing is a hard contract.
     #[test]
     fn uri_parser_never_panics(text in "\\PC*") {
         let _ = uri::parse(&text);
     }
 
-    /// 性质：在合法 URI 前缀后拼接任意文本，同样不得 panic。
+    /// Property: arbitrary text appended to a legal URI prefix must not panic either.
     ///
-    /// 纯随机字符串几乎永远不会命中 `otpauth://` 前缀，从而走不到深层解析逻辑。
-    /// 这条把随机性注入到真正的解析路径里。
+    /// A purely random string almost never hits the `otpauth://` prefix and therefore never
+    /// reaches the deeper parsing logic; this injects randomness into the path that actually
+    /// parses.
     #[test]
     fn uri_parser_never_panics_with_valid_prefix(suffix in "\\PC*") {
         for prefix in [
@@ -440,10 +447,11 @@ proptest! {
         }
     }
 
-    /// 性质：Base32 解码结果作为种子时，长度必须与原字节数一致。
+    /// Property: when a Base32 decoding result is used as a secret, its length matches the
+    /// original byte count.
     ///
-    /// 这条把 Base32 与 OTP 两个模块接起来：若 Base32 在多字节边界上少算/多算
-    /// 一个字节，这里会立刻失败。
+    /// This joins the Base32 and OTP modules: an implementation that loses or gains a byte at
+    /// a multi-byte boundary fails here immediately.
     #[test]
     fn secret_length_survives_base32_roundtrip(data in prop::collection::vec(any::<u8>(), 1..=64)) {
         let encoded = base32::encode(&data);
@@ -454,39 +462,31 @@ proptest! {
     }
 }
 
-/// **回归**：账号名里的 `:` 造成往返歧义。
+/// A `:` inside an account name makes the round trip ambiguous.
 ///
-/// # 原缺陷
-///
-/// 最初 `split_label` 允许账号名含 `:`（当时按「账号名可能是
-/// `john@example.com:8080` 这种带端口的形式」考虑）。但 label 用第一个 `:`
-/// 分隔 issuer 与 account，账号名里的 `:` 因此**无法与分隔符区分**：
+/// The label uses the first `:` to separate issuer from account, so a `:` inside the account
+/// name **cannot be told apart from the separator**:
 ///
 /// ```text
-/// 输入:       otpauth://totp/:a::a?secret=AA
-/// 首次解析:   account = "a::a",  issuer = None
-/// 序列化后:   otpauth://totp/a%3A%3Aa?secret=AA
-/// 再次解析:   account = ":a",    issuer = Some("a")   ← 静默改变了归属
+/// input:        otpauth://totp/:a::a?secret=AA
+/// first parse:  account = "a::a",  issuer = None
+/// serialized:   otpauth://totp/a%3A%3Aa?secret=AA
+/// second parse: account = ":a",    issuer = Some("a")   ← ownership changed silently
 /// ```
 ///
-/// 后果是用户可能把一个条目的验证码错配到另一个服务上——对 2FA 来说这是
-/// 安全事故，不是显示问题。百分号编码救不了它：`%3A` 与字面 `:` 在解码后
-/// 无从区分。
+/// The consequence is that a user's code for one entry can be attributed to a different
+/// service — for 2FA that is a security incident, not a display problem. Percent-encoding
+/// does not help: after decoding, `%3A` and a literal `:` are indistinguishable.
 ///
-/// # 修法
-///
-/// 把这个不变量强制在**两端**：`split_label` 拒绝含 `:` 的账号名，
-/// `serialize` 也拒绝（改为返回 `Result`）。这样合法值域里不存在歧义状态。
-///
-/// 该缺陷由穷举诊断程序发现（`fuzz` 里的往返断言是同一性质的更强形式）。
+/// The invariant is therefore enforced at **both** ends: `split_label` rejects account names
+/// containing `:`, and `serialize` rejects them too (it returns `Result`). The legal value
+/// domain then contains no ambiguous state.
 #[test]
 fn regression_account_with_colon_is_rejected_on_both_ends() {
-    // 解析端：这些 URI 都必须被拒绝，而不是解析出一个会变形的账号名。
     for bad in [
         "otpauth://totp/:a::a?secret=JBSWY3DPEHPK3PXP",
         "otpauth://totp/ACME:john:8080?secret=JBSWY3DPEHPK3PXP",
         "otpauth://totp/:a:?secret=JBSWY3DPEHPK3PXP",
-        // 百分号编码的冒号同样必须被拒绝——解码后与字面冒号无从区分。
         "otpauth://totp/ACME:john%3A8080?secret=JBSWY3DPEHPK3PXP",
     ] {
         assert!(
@@ -498,7 +498,6 @@ fn regression_account_with_colon_is_rejected_on_both_ends() {
         );
     }
 
-    // 序列化端：同样拒绝，避免产出一个「解析回来不同」的 URI。
     let auth = OtpAuth {
         uri_type: UriType::Totp,
         secret: OtpSecret::from_bytes(vec![1, 2, 3, 4]).expect("非空"),
@@ -514,7 +513,6 @@ fn regression_account_with_colon_is_rejected_on_both_ends() {
         "serialize 应拒绝含冒号的账号名"
     );
 
-    // 不含冒号的账号名不受影响（确认拒绝范围没有过度扩大）。
     let ok = OtpAuth {
         account: "john@example.com".to_owned(),
         ..auth
@@ -525,34 +523,23 @@ fn regression_account_with_colon_is_rejected_on_both_ends() {
     assert_eq!(parsed.issuer.as_deref(), Some("ACME"));
 }
 
-// ─────────────────────────────── 回归测试 ───────────────────────────────
-//
-// 下面两条来自 proptest 找到的真实缺陷，固化为具名测试，使失败信息直接说明
-// 问题所在（而不是只留下一个最小化的随机输入）。
+// ─────────────────────────────── Regression tests ───────────────────────────────
 
-/// **回归**：scheme 前缀剥离曾在非字符边界上 panic。
+/// Stripping the `otpauth://` scheme prefix must never panic on a non-character boundary.
 ///
-/// # 原缺陷
+/// The prefix occupies the first 10 bytes, and a `str` index must fall on a character
+/// boundary: when the tenth byte of the input lands inside a multi-byte character, the cut is
+/// not a valid string position.
 ///
-/// `strip_prefix_ignore_ascii_case` 最初写成 `input.split_at(prefix.len())`。
-/// `str::split_at` 要求索引落在**字符边界**上，否则 panic。`"otpauth://"` 是
-/// 10 字节，当输入的前 10 字节切在一个多字节字符中间时就崩。
+/// This matters because the input is attacker-controlled (QR code, clipboard, typed text): a
+/// remote attacker who gets the user to scan a QR code could otherwise crash the application.
 ///
-/// # 为什么这条重要
-///
-/// 这是**攻击者可控输入导致的拒绝服务**：输入来自二维码、剪贴板、用户手输。
-/// 一个远程攻击者只要能让你扫一个二维码，就能让应用崩溃。
-///
-/// # 最小反例
-///
-/// proptest 收缩出的账号名是 `"\u{80}"`，其百分号编码是 `%C2%80`——共 6 字节，
-/// 而它紧跟在 `otpauth://hotp/` 之后，使第 10 字节落在 `C2` 上。
-///
-/// 下面覆盖多种「前缀长度切进多字节序列」的输入，包括中文（3 字节/字符）、
-/// emoji（4 字节/字符）与 U+0080（2 字节/字符）。
+/// The percent-encoded form of U+0080 is `%C2%80` — six bytes, which after
+/// `otpauth://hotp/` place byte 10 on `C2`. The cases below cover several prefix lengths
+/// cutting into multi-byte sequences, including Chinese (3 bytes per character), emoji
+/// (4 bytes per character) and U+0080 (2 bytes per character).
 #[test]
 fn regression_scheme_stripping_never_panics_on_multibyte_boundary() {
-    // 直接测底层函数：各种长度都会让 `prefix.len()` 落在字符中间。
     for text in [
         "otpauth:\u{4e2d}",
         "otpauth\u{1f600}",
@@ -563,32 +550,22 @@ fn regression_scheme_stripping_never_panics_on_multibyte_boundary() {
         "",
         "otp",
     ] {
-        // 不关心返回什么，只要求不 panic。
         let _ = uri::parse(text);
         let _ = uri::parse(&format!("otpauth://totp/{text}?secret=AA"));
     }
 
-    // 前缀确实是 `otpauth://` 时，余下部分应被正确剥离。
     let parsed = uri::parse("OTPAUTH://totp/a?secret=AA").expect("大小写不敏感的 scheme 应被接受");
     assert_eq!(parsed.account, "a");
 }
 
-/// **回归**：HOTP 的 `period` 曾导致序列化/解析往返丢数据。
+/// HOTP always carries [`uri::DEFAULT_PERIOD`].
 ///
-/// # 原缺陷
-///
-/// `serialize` 只在 TOTP 时写出 `period`，而 `parse` 无条件读取它并赋给
-/// `OtpAuth::period`。于是 `HOTP + period=1` 这样的条目序列化后再解析，
-/// `period` 会从 1 变成默认的 30——往返不保持等价。
-///
-/// # 修法
-///
-/// 不是「把 period 也写出来」，而是**把它固定为不变量**：HOTP 按计数器推进，
-/// `period` 对它没有意义，因此解析时一律归一为 [`uri::DEFAULT_PERIOD`]。
-/// 这样 `OtpAuth` 的状态空间里就不存在「HOTP 带非默认 period」这种值。
+/// `serialize` writes no `period` for HOTP, and `parse` normalizes any `period` read from a
+/// HOTP URI to [`uri::DEFAULT_PERIOD`]: HOTP advances by counter, so `period` has no meaning
+/// for it. `OtpAuth` therefore has no state in which HOTP carries a non-default `period`, and
+/// a serialize/parse round trip cannot produce one.
 #[test]
 fn regression_hotp_period_is_normalized_to_default() {
-    // URI 里显式写了 period=1，但因为是 HOTP，必须被归一。
     let parsed = uri::parse("otpauth://hotp/acct?secret=JBSWY3DPEHPK3PXP&counter=0&period=1")
         .expect("应可解析");
     assert_eq!(parsed.uri_type, UriType::Hotp);
@@ -598,7 +575,6 @@ fn regression_hotp_period_is_normalized_to_default() {
         "HOTP 的 period 应被归一为默认值"
     );
 
-    // 序列化后不含 period，再次解析仍等价——往返稳定。
     let text = uri::serialize(&parsed).expect("应可序列化");
     assert!(
         !text.contains("period="),
@@ -607,7 +583,6 @@ fn regression_hotp_period_is_normalized_to_default() {
     let reparsed = uri::parse(&text).expect("应可解析");
     assert_eq!(reparsed.period, uri::DEFAULT_PERIOD);
 
-    // TOTP 不受影响：非默认 period 必须被保留。
     let totp =
         uri::parse("otpauth://totp/acct?secret=JBSWY3DPEHPK3PXP&period=60").expect("应可解析");
     assert_eq!(totp.period, 60, "TOTP 的非默认 period 应被保留");

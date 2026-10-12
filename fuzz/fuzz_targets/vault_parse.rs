@@ -13,41 +13,54 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! fuzz 目标：保险库文件解析。
+//! Fuzz target: vault file parsing.
 //!
-//! # 为什么需要它
+//! # Input surface
 //!
-//! 保险库文件是**攻击者可以完整构造**的输入：它会经过用户自己选的网盘、二维码、
-//! 另一台设备，这些通道都不受本应用控制。解析器要处理的是一份完全由对手决定的
-//! 字节流，里面每个长度字段都可以是任意值。
+//! A vault file is input an **attacker can construct in full**: it travels through a
+//! cloud drive of the user's choosing, a QR code or another device, and none of
+//! those channels is under this application's control. The parser handles a byte
+//! stream entirely decided by the adversary, in which every length field may hold
+//! any value.
 //!
-//! 因此本目标盯的是两类缺陷：
+//! # Properties covered
 //!
-//! 1. **越界与 panic**——「声称有 4 GiB 密文」「长度前缀之后什么都没有」
-//!    「标签后面缺长度字段」这类输入不得让进程崩溃。这是拒绝服务防线：
-//!    一个能被恶意文件搞崩的认证器等于不能用。
-//! 2. **无界分配**——长度字段在被用于分配之前必须先与上限比较。否则一个
-//!    100 字节的文件就能让应用申请 4 GiB 内存。
+//! 1. **Out-of-bounds and panics** — inputs such as "claims 4 GiB of ciphertext",
+//!    "nothing after the length prefix" or "the length field is missing after the
+//!    tag" must not crash the process. This is the denial-of-service defense: an
+//!    authenticator that a malicious file can crash is unusable.
+//! 2. **Unbounded allocation** — a length field must be compared against the limit
+//!    before it is used for an allocation. Otherwise a 100-byte file makes the
+//!    application request 4 GiB of memory.
 //!
-//! # AEAD 把大部分输入挡在解析之前，所以要专门绕过去
+//! # AEAD stops most inputs before parsing, so it has to be bypassed on purpose
 //!
-//! 这份文件的每条记录都被 XChaCha20-Poly1305 保护，因此**随手构造的字节流几乎
-//! 一定在认证那一步就被拒绝**，根本走不到条目明文的解析逻辑（那才是最容易写错
-//! 的地方）。为了让 fuzz 真正覆盖到它，本目标构造一份**用已知密钥加密的合法骨架
-//! 文件**，让 fuzz 输入落在密文之内或其周围：
+//! Every record of this file is protected by XChaCha20-Poly1305, so a casually
+//! constructed byte stream is almost certain to be rejected at the authentication
+//! step and never reaches the entry-plaintext parsing logic (the place most easily
+//! written wrong). To make fuzz really cover it, this target builds a **valid
+//! skeleton file encrypted with a known key**, with the fuzz input landing inside or
+//! around the ciphertext:
 //!
-//! - 模式 1：整段输入当作文件解析。覆盖文件头与记录框架。
-//! - 模式 2：把输入**当作记录密文**插进合法骨架。这样输入会在通过（或未通过）
-//!   认证后进入 `decode_entry` 的解析循环。
+//! - Mode 1: parse the whole input as a file. Covers the file header and the record
+//!   framing.
+//! - Mode 2: insert the input as the **record ciphertext** into a valid skeleton.
+//!   The input then enters the parsing loop of `decode_entry`, after passing (or
+//!   failing) authentication.
 //!
-//! 模式 2 是本目标存在的主要理由——`decode_entry` 里的「跳过未知节点」是向前
-//! 兼容的全部实现，也是最容易写成越界的地方。
+//! Mode 2 is the main reason the target exists — "skip unknown nodes" in
+//! `decode_entry` is the whole implementation of forward compatibility, and the
+//! place most easily written with an out-of-bounds error.
 //!
-//! # 关键：骨架必须用**能重新构造出来的密钥**
+//! # Key point: the skeleton must use a key that can be reconstructed
 //!
-//! `MasterKey::generate()` 每次都不一样，用它加密的话 fuzz 目标自己都解不开自己
-//! 造的文件，模式 2 就白费了。因此这里用输入派生的固定长度密钥，让「加密」与
-//! 「解析」两端用同一把钥匙。
+//! `MasterKey::generate()` differs every time; encrypting with it would leave the
+//! fuzz target unable to open the file it built itself, wasting mode 2. An
+//! input-derived key of fixed length is used instead, so that "encrypt" and "parse"
+//! use the same key.
+//!
+//! Preconditions: no feature flags. Mode 2 builds a valid skeleton with a known key
+//! on purpose, in order to reach the plaintext parsing behind AEAD.
 
 #![no_main]
 
@@ -55,10 +68,11 @@ use libfuzzer_sys::fuzz_target;
 use qualia2fa_core::otp;
 use qualia2fa_core::vault::{self, Entry, EntryId, MasterKey, VaultFile};
 
-/// 从输入派生一把确定的 32 字节密钥。
+/// Derives a deterministic 32-byte key from the input.
 ///
-/// 取前 32 字节，不足则补零。**这不是密钥派生函数**，只是让 fuzz 目标自己造的
-/// 文件自己能解开；它不参与任何真实的安全决策。
+/// Takes the first 32 bytes and zero-pads a short input. **This is not a key
+/// derivation function** — it only lets the fuzz target open the file it built
+/// itself, and it takes part in no real security decision.
 fn master_from(data: &[u8]) -> MasterKey {
     let mut key = [0_u8; vault::MASTER_KEY_LEN];
     let take = data.len().min(vault::MASTER_KEY_LEN);
@@ -69,28 +83,23 @@ fn master_from(data: &[u8]) -> MasterKey {
 fuzz_target!(|data: &[u8]| {
     let master = master_from(data);
 
-    // 模式 1：整段输入当作文件。
-    // `MasterKey` 刻意不实现 `Clone`，因此复制要显式经字节绕一圈（见 `clone_key`）。
+    // ── Mode 1: parse the whole input as a file ─────────────────────────────
     check_file(clone_key(&master), data);
 
-    // 模式 2：把输入当作**记录密文**塞进合法骨架。
+    // ── Mode 2: the input as the record ciphertext of a valid skeleton ──────
     check_embedded_record(&master, data);
 });
 
-/// 解析一段字节，并在成功时验证往返。
+/// Parses a byte string and, on success, verifies the round-trip.
 fn check_file(master: MasterKey, data: &[u8]) {
     let Ok(file) = VaultFile::parse(master, data) else {
         return;
     };
 
-    // 解析成功说明整份文件的认证都通过了。此时必须能重新序列化——
-    // 若不能，说明「能解开的文件却写不回去」，是数据丢失的隐患。
     let Ok(again) = file.serialize() else {
         return;
     };
 
-    // 重新序列化后再解析一次，内容必须稳定（序列化是幂等的语义上）。
-    // 这里再次用同一把密钥；`file` 内部持有它的副本。
     let master2 = master_key_of(&file);
     let Ok(reparsed) = VaultFile::parse(master2, &again) else {
         panic!("自己序列化出的文件自己解不开");
@@ -107,19 +116,26 @@ fn check_file(master: MasterKey, data: &[u8]) {
     );
 }
 
-/// 取出文件持有的主密钥副本（用于再次解析）。
+/// Takes out the copy of the master key held by the file (used to parse it again).
 fn master_key_of(file: &VaultFile) -> MasterKey {
     let bytes = vault::master_key_to_bytes(file.master_key());
     MasterKey::from_bytes(bytes).expect("长度正确")
 }
 
-/// 把输入当作记录密文，插进一份骨架文件里解析。
+/// Inserts the input as the record ciphertext into a skeleton file and parses that.
 ///
-/// 骨架用一个已知的条目加密而成，因此它的**非密文部分全部合法**：魔数、版本、
-/// 记录种类、`entry_id`、nonce、长度都对。输入的字节被放进密文位置，于是
-/// fuzz 的探索力量集中在「密文解密后的明文怎么解析」这条路径上。
+/// The skeleton is encrypted from a known entry, so its **non-ciphertext parts are
+/// all valid**: magic, version, record kind, `entry_id`, nonce and length are
+/// correct. The input bytes are placed in the ciphertext position, so the
+/// exploration power of fuzz concentrates on the path "how is the plaintext parsed
+/// once the ciphertext is decrypted".
+///
+/// The skeleton layout is fixed: a 14-byte file header, a 1-byte kind, a 16-byte
+/// `entry_id`, a 24-byte nonce and a 4-byte length, followed by the ciphertext,
+/// which is replaced as a whole by the fuzz input. The length field is rewritten to
+/// the actual length of the input, otherwise the parser stops at the length check
+/// and never reaches the logic after ciphertext decryption.
 fn check_embedded_record(master: &MasterKey, data: &[u8]) {
-    // 先造一份合法骨架，拿到它内部的一条条目。
     let mut file = VaultFile::with_master_key(clone_key(master));
     let Ok(_) = file.vault_mut().insert(sample_entry()) else {
         return;
@@ -128,8 +144,6 @@ fn check_embedded_record(master: &MasterKey, data: &[u8]) {
         return;
     };
 
-    // 骨架的布局是固定的：14 字节文件头 + 1 字节种类 + 16 字节 ID + 24 字节 nonce
-    // + 4 字节长度，其后是密文。把密文整段替换成 fuzz 输入。
     const CIPHERTEXT_OFFSET: usize = 14 + 1 + EntryId::LEN + vault::NONCE_LEN + 4;
     if skeleton.len() < CIPHERTEXT_OFFSET {
         return;
@@ -137,24 +151,23 @@ fn check_embedded_record(master: &MasterKey, data: &[u8]) {
 
     let mut mutated = skeleton[..CIPHERTEXT_OFFSET].to_vec();
     mutated.extend_from_slice(data);
-    // 把长度字段改成输入的实际长度，否则解析器会在长度检查那一步就退出，
-    // 到不了密文解密之后的解析逻辑。
     let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
     mutated[CIPHERTEXT_OFFSET - 4..CIPHERTEXT_OFFSET].copy_from_slice(&len.to_be_bytes());
 
     check_file(clone_key(master), &mutated);
 }
 
-/// 复制一把主密钥。
+/// Copies a master key.
 ///
-/// `MasterKey` 刻意不实现 `Clone`（那会让「秘密被静默复制」变成随手可做），
-/// 因此这里显式地经字节绕一圈——在 fuzz 目标里这么做是刻意的：它让「这里确实
-/// 复制了一份密钥」在代码中可见。
+/// `MasterKey` deliberately does not implement `Clone` (that would make silently
+/// copying a secret something anyone can do), so the copy goes explicitly through
+/// bytes here — doing it this way in a fuzz target is deliberate: it keeps the fact
+/// that a key really is copied visible in the code.
 fn clone_key(master: &MasterKey) -> MasterKey {
     MasterKey::from_bytes(vault::master_key_to_bytes(master)).expect("长度正确")
 }
 
-/// 一条用于构造骨架的合法条目。
+/// A valid entry used to build the skeleton.
 fn sample_entry() -> Entry {
     Entry::new(
         "fuzz".into(),

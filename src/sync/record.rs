@@ -13,83 +13,82 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! 单条记录的加解密：把保险库里的条目与墓碑变成载荷里的记录，以及反过来。
+//! Encryption and decryption of a single record: turning vault entries and tombstones into records
+//! inside a payload, and back.
 //!
-//! # 与保险库文件的编码**共用同一套**
+//! # It **shares one encoding** with the vault file
 //!
-//! 条目与墓碑的明文编码完全复用 [`crate::vault`] 里那份（[`crate::vault::Entry`] 与
-//! [`crate::vault::Tombstone`] 的编解码）。这不是偷懒，而是刻意的：
+//! The plaintext encoding of entries and tombstones is reused wholesale from [`crate::vault`] (the
+//! codecs of [`crate::vault::Entry`] and [`crate::vault::Tombstone`]). This is deliberate:
 //!
-//! - **两份手写编码会漂移。** 新增一个字段时改了文件格式却忘了同步格式，症状是「同步
-//!   之后新字段全空了」——一个不会让任何测试失败的静默数据损失。
-//! - **同步本来就是「把同样的数据搬到另一台设备」**，两边语义完全相同，没有理由用
-//!   两套表示。
+//! - **Two hand-written encodings drift.** Adding a field to the file format while forgetting the
+//!   sync format shows up as "the new field is empty after syncing" — silent data loss that fails
+//!   no test.
+//! - **Syncing is moving the same data to another device**, with identical semantics on both
+//!   sides, so there is no reason for two representations.
 //!
-//! **域分离靠密钥，不靠编码**：同步记录用一把与保险库不同的子密钥
-//! （[`crate::sync::derive_record_key`]），因此即使两边的 AAD 逐字节相同，密文也互不
-//! 可解。见 [`crate::sync::HKDF_SALT_SYNC`] 的说明。
+//! **Domain separation comes from keys, not from encoding**: sync records use a subkey different
+//! from the vault's ([`crate::sync::derive_record_key`]), so even if the two AADs were identical
+//! byte for byte, the ciphertexts remain mutually undecryptable. See
+//! [`crate::sync::HKDF_SALT_SYNC`].
 //!
-//! # 种类在密文里，因此解密要试两次
+//! # The kind is inside the ciphertext, so decryption tries twice
 //!
-//! 记录的**种类**（活条目还是墓碑）是 AAD 的一部分，而 AAD 必须先于解密确定——于是
-//! 「种类藏在密文里」这个目标带来一个鸡生蛋问题。
+//! A record's **kind** (live entry or tombstone) is part of the AAD, and the AAD must be known
+//! before decryption — so keeping the kind out of the plaintext creates a chicken-and-egg problem.
+//! Putting the kind into the plaintext under a key that does not depend on it would instead make
+//! "move an entry's ciphertext into a tombstone's slot" invisible to the AEAD, wasting the
+//! per-record authentication.
 //!
-//! 三条路：
+//! The resolution is to try both kinds: `SyncEntry` first, then `SyncTombstone`, and take the one
+//! that authenticates. This introduces **no ambiguity** — the two kinds have different AADs, so one
+//! ciphertext cannot pass both authentications (probability on the order of 2^-128). The cost is
+//! one extra Poly1305 computation on a failed attempt, and failure only happens in two situations:
+//! a wrong key (the very first record of the payload fails) or a tampered payload (the whole sync
+//! is void). On the normal path each kind is tried once.
 //!
-//! 1. 把种类明文写在记录头里。简单，但泄露「这次同步带了几条删除」。
-//! 2. 用一把与种类无关的密钥，把种类放进明文**内部**，解密后再读。但这会让「把条目
-//!    的密文搬到墓碑的位置」变成 AEAD 无法发现的事——内层逐条认证就白做了。
-//! 3. **两种都试。** 顺序试 `SyncEntry` 与 `SyncTombstone`，取认证通过的那个。
-//!
-//! 这里选 3。理由是**它不引入任何歧义**：两个种类的 AAD 不同，同一段密文不可能同时
-//! 通过两次认证（概率是 2⁻¹²⁸ 量级）。代价是认证失败时多算一次 Poly1305——而失败的
-//! 情形本来就只有两种：密钥不对（整个载荷的第一条就会失败）或载荷被篡改（整个同步
-//! 作废）。正常路径上每个种类只试一次。
-//!
-//! 换来的是：攻击者拿不到「这次带了几条删除」。这个信息本身价值有限，但**免费**——
-//! 而它是一件只有一次机会去做对的事：一旦明文里写上了种类字节，将来想收回来就必须
-//! 换载荷格式版本。
+//! What it buys is that an attacker cannot see how many deletions this sync carries. That
+//! information has limited value in itself, but it is **free** here — and it can only be got right
+//! once: once a kind byte is written into the plaintext, taking it back requires a new payload
+//! format version.
 
 use crate::sync::{FORMAT_VERSION, InnerRecordKind, Record};
 use crate::vault::crypto;
 use crate::vault::{Entry as VaultEntry, EntryId, Tombstone};
 use crate::{Error, Result};
 
-/// 条目明文头的长度：魔数 4 + 标识 16 + 长度 2。
+/// Length of the entry plaintext header: magic 4 + id 16 + length 2.
 const ENTRY_HEADER_LEN: usize = 4 + EntryId::LEN + 2;
 
-/// 条目明文头的魔数。
+/// Magic number of the entry plaintext header.
 ///
-/// # 为什么密文里还要再放一个魔数
-///
-/// AAD 已经把「种类 + 条目 ID + 版本」绑进去了，因此**按正常路径**拿到一段明文就一定
-/// 对得上。这个魔数是防**编码层被误用**：如果有人把条目的编码喂给墓碑的解码器（或者
-/// 将来加了一种新记录、解码时选错了分支），第一个检查就能抓住，而不是让解析器在一个
-/// 语义完全不同的字节流里挣扎，最后报一个指向错误方向的「字段标签不认识」。
+/// It fails the first check when the **encoding layer is misused** (an entry encoding fed to the
+/// tombstone decoder, or a future record type dispatched to the wrong branch), instead of leaving
+/// the parser to report a "field tag not recognized" error for a byte stream with completely
+/// different semantics. On the normal path the AAD already binds kind + entry ID + version, so any
+/// plaintext that arrives does match.
 const ENTRY_MAGIC: &[u8; 4] = b"Q2FE";
 
-/// 一条解开并解析完成的记录。
+/// A record that has been decrypted and parsed.
 ///
-/// # 为什么它不等于 [`crate::sync::Record`]
-///
-/// 两者刻意分开：`Record` 是**线格式**（只有字节和标识），`OpenedRecord` 是**语义**
-/// （已经是一个能做合并的条目或墓碑）。同一条记录在解密前不知道自己是哪一种——种类在
-/// 密文里，这正是「攻击者连这次同步带了几条删除都看不出来」的实现方式。
+/// Kept separate from the wire type: [`crate::sync::Record`] is bytes plus an identifier, while
+/// `OpenedRecord` is the semantics — an entry or a tombstone that can be merged.
 #[derive(Debug, PartialEq, Eq)]
 pub enum OpenedRecord {
-    /// 一条活条目。
+    /// A live entry.
     Entry {
-        /// 条目的标识。同时是载荷里那条记录的标识（已核对一致）。
+        /// Identifier of the entry. It is also the identifier of this record in the payload
+        /// (checked to be equal).
         id: EntryId,
-        /// 条目内容。
+        /// The entry content.
         entry: Box<VaultEntry>,
     },
-    /// 一条墓碑。
+    /// A tombstone.
     Tombstone(Box<Tombstone>),
 }
 
 impl OpenedRecord {
-    /// 这条记录讲的是哪一个条目。
+    /// Which entry this record is about.
     #[must_use]
     pub fn entry_id(&self) -> EntryId {
         match self {
@@ -98,7 +97,7 @@ impl OpenedRecord {
         }
     }
 
-    /// 转成可以交给 [`crate::sync::merge_into`] 的形式。
+    /// Converts this into a form that can be handed to [`crate::sync::merge_into`].
     #[must_use]
     pub fn into_merged(self) -> crate::sync::MergedRecord {
         match self {
@@ -108,16 +107,18 @@ impl OpenedRecord {
     }
 }
 
-/// 把一条条目加密成载荷里的记录。
+/// Encrypts an entry into a record of the payload.
 ///
-/// `id` 是这条条目在集合里的标识。条目本身不带标识（见 [`crate::vault::Entry`]），
-/// 因此这个函数把它写进明文头，解密时再核对一次——见 [`open`] 的第 2 条。
+/// `id` is the identifier of this entry in the set. The entry itself carries no identifier (see
+/// [`crate::vault::Entry`]), so this function writes it into the plaintext header and it is checked
+/// again on decryption — see item 2 of [`open`].
 ///
-/// # 错误
+/// # Errors
 ///
-/// - [`Error::SyncMalformed`]：条目的编码超过 65535 字节。真实条目远小于此（最长字段
-///   上限是 64 KiB），因此这只在编码逻辑出错时发生。
-/// - [`Error::RandomnessUnavailable`]：随机源不可用。
+/// - [`Error::SyncMalformed`]: the entry encoding exceeds 65535 bytes. Real entries are far smaller
+///   (the longest field is capped at 64 KiB), so this only happens when the encoding logic is
+///   wrong.
+/// - [`Error::RandomnessUnavailable`]: the random source is unavailable.
 pub fn seal_entry(key: &[u8; 32], id: &EntryId, entry: &VaultEntry) -> Result<Record> {
     let body = crate::vault::encode_entry(entry)?;
     let mut plaintext = Vec::with_capacity(ENTRY_HEADER_LEN + body.len());
@@ -132,11 +133,11 @@ pub fn seal_entry(key: &[u8; 32], id: &EntryId, entry: &VaultEntry) -> Result<Re
     seal_plaintext(key, InnerRecordKind::SyncEntry, id, &plaintext)
 }
 
-/// 把一条墓碑加密成载荷里的记录。
+/// Encrypts a tombstone into a record of the payload.
 ///
-/// # 错误
+/// # Errors
 ///
-/// [`Error::RandomnessUnavailable`]：随机源不可用。
+/// [`Error::RandomnessUnavailable`]: the random source is unavailable.
 pub fn seal_tombstone(key: &[u8; 32], tombstone: &Tombstone) -> Result<Record> {
     let plaintext = crate::vault::encode_tombstone(tombstone);
     seal_plaintext(
@@ -147,9 +148,10 @@ pub fn seal_tombstone(key: &[u8; 32], tombstone: &Tombstone) -> Result<Record> {
     )
 }
 
-/// 用一把已派生好的子密钥把一段明文封成记录。
+/// Seals a plaintext into a record with an already-derived subkey.
 ///
-/// 是 [seal_entry] 与 [seal_tombstone] 的公共尾部：两者只差明文编码与种类字节。
+/// The common tail of [seal_entry] and [seal_tombstone]: the two differ only in the plaintext
+/// encoding and the kind byte.
 fn seal_plaintext(
     key: &[u8; 32],
     kind: InnerRecordKind,
@@ -164,58 +166,59 @@ fn seal_plaintext(
     })
 }
 
-/// 解开并解析一条记录。
+/// Decrypts and parses a record.
 ///
-/// # 它核对什么
+/// # What it checks
 ///
-/// 1. **AAD**：种类、条目 ID、载荷格式版本。因此「把条目 A 的密文搬到条目 B 的位置」
-///    会因为 AAD 里的 ID 对不上而认证失败，而不是被静默接受成 B 的内容。
-/// 2. **明文头里的标识与 `record.entry_id` 一致**。这一条**不是**冗余：AAD 用的是
-///    `record.entry_id`，而调用方可能从别处拿到一个不同的标识去查合并结果。让明文里
-///    也带一份并核对，就堵住了「记录说自己是 A、内容其实来自 B」的那条缝。
-/// 3. **条目明文头里的魔数与长度**：明文头以 `Q2FE` 起头，跟着标识与一个 u16 长度。
-///    那 4 个字节不是冗余的——AAD 已经把种类与标识绑进去了，但**编码层被误用**
-///    （把条目的编码喂给墓碑的解码器）时，第一道检查就能抓住，而不是让解析器在一个
-///    语义完全不同的字节流里挣扎，最后报一个指向错误方向的「字段标签不认识」。
+/// 1. **The AAD**: kind, entry ID, payload format version. Moving entry A's ciphertext into entry
+///    B's slot therefore fails authentication because the ID in the AAD does not match, instead of
+///    being silently accepted as B's content.
+/// 2. **The identifier in the plaintext header equals `record.entry_id`**. This is **not**
+///    redundant: the AAD uses `record.entry_id`, and a caller may hold a different identifier
+///    obtained elsewhere when looking up the merge result. Carrying a copy inside the plaintext and
+///    checking it closes the gap where "the record claims to be A while the content came from B".
+/// 3. **The magic number and length in the entry plaintext header**: the header starts with `Q2FE`,
+///    followed by the identifier and a u16 length. Those 4 bytes are not redundant — the AAD
+///    already binds kind and identifier, but when the **encoding layer is misused** (an entry
+///    encoding fed to the tombstone decoder), the first check catches it instead of leaving the
+///    parser to struggle through a byte stream with completely different semantics and finally
+///    report a "field tag not recognized" error pointing in the wrong direction.
 ///
-/// # 为什么两种种类都要试
+/// Both kinds are tried — `SyncEntry` first, then `SyncTombstone` — and the one that authenticates
+/// is taken; see the module documentation.
 ///
-/// 见模块文档。顺序是 `SyncEntry` 在前，因为条目在真实数据集里占绝大多数——省下的
-/// 是失败路径的半次 Poly1305，而失败是罕见情况。
+/// # Errors
 ///
-/// # 错误
-///
-/// - [`Error::SyncAuthenticationFailed`]：两种种类都认证失败。**不区分**「密钥不对」
-///   「密文被篡改」「AAD 不匹配」——区分它们对攻击者有用，对使用者没有可操作价值。
-///   之所以**不是** [`Error::VaultDecryptionFailed`]：那是「保险库文件打不开」，端侧
-///   对它的处置（引导检查主密钥）与「这次同步的载荷不可信」完全不同。
-/// - [`Error::SyncMalformed`]：明文结构自相矛盾。外层与 AAD 都已认证，因此走到这里
-///   意味着**我们自己的编码逻辑写错了**，而不是受到了攻击。
-/// - [`Error::VaultUnknownRecordKind`] 一族：条目明文的内部结构不合法。这是**真的**
-///   可能来自一份合法载荷（旧版本写的编码、新版本读），因此保留具体诊断而不是并进
-///   `SyncMalformed`。
+/// - [`Error::SyncAuthenticationFailed`]: both kinds failed authentication. It **does not
+///   distinguish** a wrong key, tampered ciphertext and an AAD mismatch — telling them apart helps
+///   an attacker and has no actionable value for the user. Why **not**
+///   [`Error::VaultDecryptionFailed`]: that one means "the vault file cannot be opened", and the
+///   client handles it (send the user to check the master key) quite differently from "this sync
+///   payload is untrustworthy".
+/// - [`Error::SyncMalformed`]: the plaintext structure contradicts itself. The outer layer and the
+///   AAD have both authenticated, so reaching this point means **our own encoding logic is wrong**,
+///   not that we are under attack.
+/// - The [`Error::VaultUnknownRecordKind`] family: the internal structure of the entry plaintext is
+///   invalid. This **can** genuinely come from a legitimate payload (an encoding written by an
+///   older version and read by a newer one), so the specific diagnosis is kept instead of folding
+///   it into `SyncMalformed`.
 pub fn open(key: &[u8; 32], record: &Record) -> Result<OpenedRecord> {
     let mut last_error = None;
     for kind in [InnerRecordKind::SyncEntry, InnerRecordKind::SyncTombstone] {
         match try_open_as(key, kind, record) {
             Ok(opened) => return Ok(opened),
-            // 认证失败与结构错误都要继续试下一种。结构错误尤其要试：一段用墓碑种类
-            // 加密的密文，在被当成条目解开后可能「认证通过」（不可能，AAD 不同）或者
-            // 在解析时报结构错误。前者由密码学挡住，后者是这条分支存在的理由。
             Err(err) => last_error = Some(err),
         }
     }
-    // 两种都失败。报「认证失败」而不是上一次的具体错误：上一次的错误可能是一个结构
-    // 诊断，而它只是「用错了种类去解」的副产物，报出去会把人引向错误方向。
     Err(last_error.map_or(Error::SyncAuthenticationFailed, |_| {
         Error::SyncAuthenticationFailed
     }))
 }
 
-/// 按**指定**的种类试解一条记录。
+/// Tries to decrypt a record under a **specified** kind.
 ///
-/// 认证失败是这条路径的**正常**结果之一（种类猜错了），因此调用方必须继续试下一种，
-/// 而不是把错误直接上抛。
+/// Authentication failure is a **normal** outcome on this path (the kind was guessed wrong), so the
+/// caller must continue with the other kind instead of propagating the error.
 fn try_open_as(key: &[u8; 32], kind: InnerRecordKind, record: &Record) -> Result<OpenedRecord> {
     let plaintext = crypto::open_with_key(
         key,
@@ -234,9 +237,10 @@ fn try_open_as(key: &[u8; 32], kind: InnerRecordKind, record: &Record) -> Result
     }
 }
 
-/// 解析一条已经解密并认证过的**条目**明文。
+/// Parses an **entry** plaintext that has already been decrypted and authenticated.
 ///
-/// 明文已被 AEAD 认证，因此这里的检查针对的都是「我们自己的编码写错了」，而不是攻击。
+/// The plaintext is already authenticated by the AEAD, so the checks here all target "our own
+/// encoding is wrong" rather than an attack.
 fn open_entry(id: &EntryId, plaintext: &[u8]) -> Result<OpenedRecord> {
     if plaintext.len() < ENTRY_HEADER_LEN {
         return Err(Error::SyncTruncated);
@@ -261,7 +265,6 @@ fn open_entry(id: &EntryId, plaintext: &[u8]) -> Result<OpenedRecord> {
     let body = plaintext
         .get(ENTRY_HEADER_LEN..ENTRY_HEADER_LEN + declared)
         .ok_or(Error::SyncTruncated)?;
-    // 明文里多出的字节意味着编码逻辑写错了（外层已认证，所以不是攻击信号）。
     if plaintext.len() != ENTRY_HEADER_LEN + declared {
         return Err(Error::SyncMalformed {
             reason: "条目明文含超出声明长度的内容",
@@ -273,9 +276,10 @@ fn open_entry(id: &EntryId, plaintext: &[u8]) -> Result<OpenedRecord> {
     })
 }
 
-/// 解析一条已经解密并认证过的**墓碑**明文。
+/// Parses a **tombstone** plaintext that has already been decrypted and authenticated.
 ///
-/// 直接复用保险库那一侧的墓碑解码：两者是同一套字节布局，见模块文档。
+/// It reuses the vault-side tombstone decoder directly: the two share the same byte layout, see the
+/// module documentation.
 fn open_tombstone(id: &EntryId, plaintext: &[u8]) -> Result<OpenedRecord> {
     let tombstone = crate::vault::decode_tombstone(*id, plaintext)?;
     Ok(OpenedRecord::Tombstone(Box::new(tombstone)))
@@ -288,8 +292,6 @@ mod tests {
     use crate::vault::crypto::RecordKind;
 
     fn key() -> [u8; 32] {
-        // 确定值而不是 `MasterKey::generate()`：测试要能复现，且这里不需要真主密钥——
-        // 记录层只吃一把已派生好的子密钥。
         [0x5A; 32]
     }
 
@@ -347,10 +349,10 @@ mod tests {
         }
     }
 
-    /// 墓碑的三种 `deleted_by` 状态都要能往返。
+    /// Every `deleted_by` state of a tombstone must round-trip.
     ///
-    /// `deleted_by` 是 `Option`，而「有值」与「无值」在编码里只差一个标志字节——
-    /// 正是最容易写错的那种。
+    /// `deleted_by` is an `Option`, and "has a value" versus "has none" differs by a single flag
+    /// byte in the encoding, so both states are exercised.
     #[test]
     fn tombstone_deleted_by_states_roundtrip() {
         let id = EntryId::from_bytes([4; EntryId::LEN]);
@@ -369,7 +371,7 @@ mod tests {
         }
     }
 
-    /// **错一把密钥必须认证失败，且不得被误判成另一种记录。**
+    /// **A wrong key must fail authentication, and must not be misread as the other kind.**
     #[test]
     fn a_wrong_key_is_rejected() {
         let id = EntryId::from_bytes([6; EntryId::LEN]);
@@ -381,10 +383,11 @@ mod tests {
         );
     }
 
-    /// **把条目 A 的密文搬到条目 B 的位置必须失败。**
+    /// **Moving entry A's ciphertext into entry B's slot must fail.**
     ///
-    /// 这是内层逐条认证存在的全部理由：没有它，一份**合法**载荷就能让接收方永久存下
-    /// 一条内容与标识不匹配的记录。
+    /// This is the entire reason the per-record inner authentication exists: without it, a
+    /// **legitimate** payload could make a receiver permanently store a record whose content and
+    /// identifier do not match.
     #[test]
     fn moving_a_ciphertext_to_another_id_is_rejected() {
         let id_a = EntryId::from_bytes([7; EntryId::LEN]);
@@ -399,10 +402,11 @@ mod tests {
         );
     }
 
-    /// 把墓碑的密文当成条目来解必须失败。
+    /// A tombstone's ciphertext must fail when it is read as an entry.
     ///
-    /// 这一条同时验证了「试两种种类」不会引入**误判**：墓碑的密文不能在条目那条路径上
-    /// 认证通过。
+    /// This also verifies that trying both kinds introduces no **misjudgement**: a tombstone
+    /// ciphertext must not authenticate on the entry path, and the normal path must yield a
+    /// tombstone.
     #[test]
     fn a_tombstone_cannot_be_read_as_an_entry() {
         let id = EntryId::from_bytes([9; EntryId::LEN]);
@@ -412,14 +416,13 @@ mod tests {
             deleted_by: None,
         };
         let record = seal_tombstone(&key(), &tombstone).expect("可加密");
-        // 正常路径解出来必须是墓碑，不能是条目。
         match open(&key(), &record).expect("可解密") {
             OpenedRecord::Tombstone(_) => {}
             other => panic!("墓碑被误判成 {other:?}"),
         }
     }
 
-    /// 单字节篡改必须被拒绝，且**每一个**字节位置都要试。
+    /// Flipping a single ciphertext byte must be rejected, at **every** byte position.
     #[test]
     fn flipping_any_ciphertext_byte_is_rejected() {
         let id = EntryId::from_bytes([10; EntryId::LEN]);
@@ -435,9 +438,10 @@ mod tests {
         }
     }
 
-    /// 篡改 nonce 必须被拒绝。
+    /// Tampering with the nonce must be rejected.
     ///
-    /// 单独测它：nonce 不在密文里，翻转密文的那条测试覆盖不到它。
+    /// Tested separately because the nonce is not part of the ciphertext, so the
+    /// ciphertext-flipping test does not cover it.
     #[test]
     fn a_tampered_nonce_is_rejected() {
         let id = EntryId::from_bytes([11; EntryId::LEN]);
@@ -453,7 +457,7 @@ mod tests {
         }
     }
 
-    /// 截断密文必须被拒绝。
+    /// A truncated ciphertext must be rejected.
     #[test]
     fn a_truncated_ciphertext_is_rejected() {
         let id = EntryId::from_bytes([12; EntryId::LEN]);
@@ -465,10 +469,11 @@ mod tests {
         }
     }
 
-    /// 每条记录的 nonce 必须不同。
+    /// Every record must use a different nonce.
     ///
-    /// 192-bit 随机 nonce 在真实规模下不会撞，但「实现里把 nonce 写成了常量」这种错误
-    /// 不会让任何其他测试失败——它只在两侧数据足够多时变成灾难性的密钥流复用。
+    /// A 192-bit random nonce does not collide at real-world scale; the property matters because a
+    /// constant nonce would only become visible as catastrophic keystream reuse once both sides
+    /// hold enough data.
     #[test]
     fn nonces_differ_across_records() {
         let id = EntryId::from_bytes([13; EntryId::LEN]);
@@ -482,10 +487,11 @@ mod tests {
         );
     }
 
-    /// **同步记录的密钥与保险库记录的密钥必须是两把。**
+    /// **The sync record key and the vault record key must be two different keys.**
     ///
-    /// 这是域分离的核心断言。若两者相同，一份同步载荷的密文可以被当成保险库文件的
-    /// 记录喂进来（AAD 可能逐字节相同），而 AEAD 会认证通过。
+    /// This is the core domain-separation assertion. If the two were equal, a sync payload's
+    /// ciphertext could be fed in as a vault file record (the AADs might be identical byte for
+    /// byte) and the AEAD would authenticate it.
     #[test]
     fn sync_and_vault_keys_are_different() {
         let master = crate::vault::MasterKey::generate().expect("随机源可用");
@@ -498,19 +504,18 @@ mod tests {
             "同步记录与保险库记录派生了同一把子密钥，域分离失效"
         );
 
-        // 信封密钥也必须是第三把。
         let envelope_key = crate::sync::derive_envelope_key(&master).expect("可派生");
         assert_ne!(sync_key, envelope_key, "记录密钥与信封密钥相同");
         assert_ne!(vault_key, envelope_key, "保险库密钥与信封密钥相同");
 
-        // 派生必须是确定的，否则第二台设备解不开。
         let again = crate::sync::derive_record_key(&master).expect("可派生");
         assert_eq!(sync_key, again, "同一主密钥两次派生的结果不同");
     }
 
-    /// 常量本身不能悄悄改掉。
+    /// The constants themselves must not change silently.
     ///
-    /// 它是对外契约：改了会让所有已发出去的同步载荷（含二维码里那些）解不开。
+    /// They are an external contract: changing them would make every sync payload already sent out
+    /// (including the ones inside QR codes) undecryptable.
     #[test]
     fn the_domain_separation_constants_are_stable() {
         assert_eq!(
@@ -531,14 +536,15 @@ mod tests {
         assert_eq!(FORMAT_VERSION, 2, "载荷格式版本变了");
     }
 
-    /// **两个域的记录种类字节必须不重叠，且解析器必须互不认账。**
+    /// **The record kind bytes of the two domains must not overlap, and each parser must refuse the
+    /// other's kinds.**
     ///
-    /// 这些是域分离的第二道防线（第一道是 HKDF 的 salt）。写成测试而不是只靠
-    /// `sync.rs` 里的编译期断言，是因为「文件解析器不认同步种类」这件事是一个**行为**
-    /// 断言，编译期断言表达不了。
+    /// These are the second line of defence for domain separation (the first is the HKDF salt). It
+    /// is a test rather than only a compile-time assertion in `sync.rs` because "the file parser
+    /// does not accept sync kinds" is a **behavioural** assertion that a compile-time assertion
+    /// cannot express: the file kinds are `0x01` / `0x02` and the sync kinds are `0x81` / `0x82`.
     #[test]
     fn the_two_domains_kinds_do_not_overlap() {
-        // 文件种类：只认 0x01 / 0x02。
         assert!(RecordKind::from_byte(0x01).is_some());
         assert!(RecordKind::from_byte(0x02).is_some());
         assert!(
@@ -550,7 +556,6 @@ mod tests {
             "文件解析器接受了同步墓碑种类"
         );
 
-        // 同步种类：只认 0x81 / 0x82。
         assert!(RecordKind::from_sync_byte(0x81).is_some());
         assert!(RecordKind::from_sync_byte(0x82).is_some());
         assert!(
@@ -562,30 +567,32 @@ mod tests {
         assert!(RecordKind::from_sync_byte(0xFF).is_none());
     }
 
-    /// 记录长度是「固定头 + 密文」，用于让上层预估载荷大小。
+    /// The encoded length of a record is "fixed header + ciphertext", used by higher layers to
+    /// estimate payload size.
     ///
-    /// # 这条测试**只**覆盖 `record` 这一侧
+    /// The fixed header is a 16-byte identifier, a 24-byte nonce and a 4-byte length; the ciphertext
+    /// already includes the authentication tag, and there is **no** kind byte on the wire — the kind
+    /// lives in the inner AAD, not in the plaintext.
     ///
-    /// 它断言的是「同一条记录自己的长度 = 常量 + 自己的密文长度」，那是个恒等式，
-    /// 抓不到常量本身算错。也就是说：`RECORD_HEADER_LEN` 里多了一个字节，这条测试
-    /// 照样绿——它确实绿了很久。
+    /// # This test covers the `record` side only
     ///
-    /// 真正盯住线格式的是 `sync` 那边的
-    /// `the_plaintext_record_framing_matches_encoded_len`：它把封装好的载荷拆开，
-    /// 按字节读真实明文，与 `encoded_len` 对账。这里保留这条是为了覆盖
-    /// 「`encoded_len` 确实把 nonce 与密文都算进去了」这个下限。
+    /// It asserts that a record's own length equals the constant plus its own ciphertext length,
+    /// which holds by construction and cannot catch a wrong constant: a single extra byte inside
+    /// `RECORD_HEADER_LEN` would leave it passing. What actually pins the wire format down is
+    /// `the_plaintext_record_framing_matches_encoded_len` in `sync`, which unwraps a sealed payload,
+    /// reads the real plaintext byte by byte and reconciles it with `encoded_len`. This one is kept
+    /// to cover the lower bound that `encoded_len` does account for the nonce and the ciphertext.
     #[test]
     fn encoded_len_matches_the_wire_format() {
         let id = EntryId::from_bytes([14; EntryId::LEN]);
         let record = seal_entry(&key(), &id, &sample_entry()).expect("可加密");
-        // 固定头 = 标识 16 + nonce 24 + 长度 4；密文已含认证标签。**没有**种类字节：
-        // 种类在内层 AAD 里，不在明文里。
         assert_eq!(record.encoded_len(), 16 + 24 + 4 + record.ciphertext.len());
     }
 
+    /// Entry identifiers survive the round trip byte for byte, including boundary patterns such as
+    /// all zeros or all `0xFF`, which an encoding is most likely to mistake for "absent".
     #[test]
     fn entry_ids_survive_the_roundtrip_byte_for_byte() {
-        // 标识是全零、全 FF 这类边界值时最容易在编码里被当成「缺失」。
         for pattern in [0x00_u8, 0xFF, 0x80] {
             for position in 0..EntryId::LEN {
                 let mut bytes = [0_u8; EntryId::LEN];

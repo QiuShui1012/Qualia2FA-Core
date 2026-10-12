@@ -13,78 +13,84 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! 并集合并与裁决。
+//! Union merge and adjudication.
 //!
-//! # 合并是「取并集」，但并集在两种情况下不够
+//! The merge takes the union keyed by [`EntryId`], which is the bulk of synchronization. A
+//! random 128-bit identifier collides with negligible probability, so **the same ID on both
+//! sides denotes the same entry** and no version vector or logical clock is needed to
+//! decide which side is newer.
 //!
-//! 以 [`EntryId`] 为键取并集，这是同步的主体。一个随机 128-bit 标识的碰撞概率可以
-//! 忽略，因此**同一个 ID 在两端就代表同一条目**，不需要版本向量或逻辑时钟来判断
-//! 「谁更新」。
+//! The union alone cannot answer two cases, and they become a [`Conflict`]:
 //!
-//! 两种情况并集本身给不出答案，它们进 [`Conflict`]：
-//!
-//! | 本地 | 对端 | 处置 |
+//! | Local | Peer | Handling |
 //! |---|---|---|
-//! | 有条目 | 同 ID 条目，内容不同 | **冲突**：各自改过，交人来裁定 |
-//! | 有条目 | 同 ID 墓碑，且本地条目**之后没改过** | 自动接受删除 |
-//! | 有条目 | 同 ID 墓碑，且本地条目**之后改过** | **冲突** |
-//! | 有条目 | 什么都没有 | 保留本地（对端只是没有这条） |
-//! | 没有 | 条目 / 墓碑 | 收下 |
+//! | entry | entry with the same ID, different content | **conflict**: both sides edited it, a human decides |
+//! | entry | tombstone with the same ID, local entry **not modified since** | deletion accepted automatically |
+//! | entry | tombstone with the same ID, local entry **modified since** | **conflict** |
+//! | entry | nothing | local entry kept (the peer simply does not have it) |
+//! | nothing | entry / tombstone | accepted |
 //!
-//! # 为什么删除必须有墓碑
+//! The tombstone is what makes a deletion synchronizable: in a plain union "this entry does
+//! not exist here" and "this entry was deleted" are the **same observation**, both showing
+//! up as "the peer does not have it". Without tombstones an offline device coming back
+//! online would keep a deleted entry as "I have it, the peer does not" and the deletion
+//! would be silently undone. A tombstone turns "deleted" into **a record with content**
+//! that can be synchronized.
 //!
-//! 「没有这条」与「这条被删了」在并集里是**同一件事**——都表现为「对端没有」。没有
-//! 墓碑，一台离线设备重新上线时会把已删条目当成「我这边有、对面没有」而保留，于是
-//! 删除被静默撤销。墓碑把「删了」变成一个**有内容的记录**，让它能被同步。
+//! This module never decides which side is newer on its own. Timestamps could be used to
+//! guess, but that would decide for the user and deleting a 2FA entry is irreversible;
+//! timestamps also come from the peer device and can be filled in freely by an attacker.
+//! Apart from the two rules below, which need no human judgement, a merge where both sides
+//! hold content **always** reports a conflict:
 //!
-//! # 这个模块不替用户判断「哪边更新」
+//! - **Content identical field by field** → no conflict. This is the most common case: the
+//!   entry was edited on one side only and the other side holds an untouched old copy.
+//!   Without this rule every sync would report a pile of conflicts while nothing changed.
+//! - **Local entry not modified after the tombstone's time** → deletion accepted,
+//!   corresponding to "B deleted it, A never touched it": the user's intent is clear, and
+//!   it is what finally lets a deletion propagate.
 //!
-//! 时间戳可以用来猜，但那是在替用户做决定，而删掉一个 2FA 条目是不可逆的。何况时间
-//! 戳来自对端设备，攻击者随便填。因此除了下面两条不需要人判断的规则，两边都有内容时
-//! **一律**报冲突：
-//!
-//! - **内容逐字段相同** → 无冲突。这是最常见的情况：条目只在一边改过，另一边是原样
-//!   的旧副本。没有这条，每次同步都会弹出一堆「冲突」而其实什么都没变。
-//! - **本地条目在墓碑时间之后没再改过** → 接受删除。对应「B 删了，A 从没动过」，
-//!   用户意图清楚，而且它让删除终于能传播。
-//!
-//! 本地比墓碑新的情形**仍然报冲突**，只是把 `local_is_newer` 一并交给裁决界面——
-//! 那是用户判断该保留哪边时最需要知道的一件事，但库不据此自动选边。
+//! A local entry newer than the tombstone **still reports a conflict**, with
+//! `local_is_newer` handed to the adjudication UI as well — the single most useful fact
+//! when the user decides which side to keep, but the library never picks a side from it.
 
 use std::collections::BTreeMap;
 
 use crate::Result;
 use crate::vault::{Entry as VaultEntry, EntryId, Tombstone, Vault};
 
-/// 一条来自对端的记录，连同它的标识。
+/// A record received from a peer, together with its identifier.
 ///
-/// # 为什么标识在这里而不是在 [`VaultEntry`] 里
+/// The identifier lives here rather than in [`VaultEntry`] because [`VaultEntry`]
+/// deliberately carries no ID: an entry that brought its own identifier would allow two
+/// contradictory identifiers within the same data. Every record in a sync payload **must**
+/// carry its identifier — it is one of the AEAD associated data items and the key of the
+/// union. Sealing the pair in an enum makes the state "there is an entry but its identity
+/// is unknown" unrepresentable, so [`merge_into`] needs no `Result` to report a
+/// self-contradictory record.
 ///
-/// [`VaultEntry`] 刻意不带 ID：一个「自带标识的条目」可以让同一份数据里出现两个互相
-/// 矛盾的标识。但同步载荷里的每条记录**必须**同时带上标识——它是 AEAD 的 AAD 之一，
-/// 也是并集的键。把这个组合封在枚举里，「有条目但不知道它是哪一条」这种状态就不存在，
-/// 于是 [`merge_into`] 不需要返回 `Result` 去报告「记录自相矛盾」。
+/// # No `Clone`
 ///
-/// # 没有 `Clone`
-///
-/// [`VaultEntry`] 刻意不实现 `Clone`（理由见 [`crate::otp::OtpSecret`]），因此这个
-/// 枚举也不能派生它。需要复制时走 [`VaultEntry::duplicate`]——那个入口是显式的，
-/// 调用点必须写下 `duplicate()`，从而在代码审查中可见「这里又复制了一份密钥材料」。
+/// [`VaultEntry`] deliberately does not implement `Clone` (see [`crate::otp::OtpSecret`]),
+/// so this enum cannot derive it either. Copying goes through
+/// [`VaultEntry::duplicate`], an explicit entry point: the call site has to spell out
+/// `duplicate()`, which makes "another copy of key material is made here" visible in
+/// review.
 #[derive(Debug, PartialEq, Eq)]
 pub enum MergedRecord {
-    /// 一条活条目。
+    /// A live entry.
     Entry {
-        /// 条目的标识。
+        /// The identifier of the entry.
         id: EntryId,
-        /// 条目的内容。
+        /// The content of the entry.
         entry: Box<VaultEntry>,
     },
-    /// 一条墓碑（删除记录）。
+    /// A tombstone (deletion record).
     Tombstone(Box<Tombstone>),
 }
 
 impl MergedRecord {
-    /// 这条记录讲的是哪一个条目。
+    /// Which entry this record is about.
     #[must_use]
     pub fn entry_id(&self) -> EntryId {
         match self {
@@ -93,88 +99,93 @@ impl MergedRecord {
         }
     }
 }
-/// 一次合并里发现的、需要人来裁定的分歧。
+/// A disagreement found in one merge that a human has to adjudicate.
 ///
-/// # 为什么这里要复制条目
+/// The entries are copied here because a conflict is by definition "there are two different
+/// versions" and the adjudication UI must see **both** sides at once. The local version is
+/// copied in, and the peer's version (already in hand) is moved in.
 ///
-/// 冲突的本质就是「有两个不同的版本」，而裁决界面必须**同时**看到两边。因此本地那
-/// 一版被复制进这里，而对端那一版（本来就在我们手上）被移进来。
-///
-/// 复制走 [`VaultEntry::duplicate`]，是显式的、可能失败的。这不只是风格问题：同一份
-/// 密钥材料在内存里多存一份就多一份泄露面，而这个复制**只在真的出现分歧时**发生——
-/// 绝大多数同步里 `conflicts` 是空的。
+/// Copying goes through [`VaultEntry::duplicate`], which is explicit and can fail. This is
+/// more than a matter of style: a second copy of the same key material in memory is a
+/// second exposure surface, and the copy happens **only when a disagreement really
+/// exists** — in the vast majority of syncs `conflicts` is empty.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Conflict {
-    /// 出分歧的条目。
+    /// The entry in disagreement.
     pub entry_id: EntryId,
-    /// 分歧的种类。
+    /// The kind of disagreement.
     pub kind: ConflictKind,
 }
 
-/// 分歧的种类。
+/// The kind of disagreement.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConflictKind {
-    /// 两端都有这条条目，但内容不同。
+    /// Both sides have this entry, with different content.
     ///
-    /// 两边的内容**都**保留（而不是只给一个「冲突了」的标记）：裁决界面必须同时展示
-    /// 两边的账号名与备注，否则用户无从判断。
+    /// The content of **both** sides is kept (rather than only a "conflict" marker): the
+    /// adjudication UI has to show the account names and notes of both sides, otherwise
+    /// the user cannot decide.
     EntryMismatch {
-        /// 本地的版本。
+        /// The local version.
         local: Box<VaultEntry>,
-        /// 对端发来的版本。**尚未**写入本地保险库。
+        /// The version received from the peer. **Not yet** written to the local vault.
         incoming: Box<VaultEntry>,
     },
-    /// 一端删了，另一端还在且**被改过**。
+    /// One side deleted the entry while the other still has it and it **was modified**.
     ///
-    /// 本地那条若在删除之后没被动过，这一条不会成为冲突——它会被自动接受为删除。
+    /// If the local entry was not touched after the deletion, this does not become a
+    /// conflict — the deletion is accepted automatically.
     DeletionConflict {
-        /// 本地的版本。
+        /// The local version.
         ///
-        /// # 为什么是 `Option`
+        /// This conflict has **two directions**, and only one of them carries local content
+        /// here:
         ///
-        /// 这个冲突有**两个方向**，只有其中一个方向需要在这里带上本地内容：
+        /// - **The peer sent a tombstone** (the local side has a newer live entry): the
+        ///   local content is already in the vault and the adjudication UI reads it
+        ///   directly, so this is `None`, saving one copy of key material.
+        /// - **The peer sent a live entry** (the local side has a tombstone): the local
+        ///   content is a **tombstone**, while the peer's version of the entry is already
+        ///   in hand and simply moved in, so this holds the peer's version, which tells the
+        ///   adjudication UI that the peer wants to restore the entry.
         ///
-        /// - **对端发来墓碑**（本地有较新的活条目）：本地内容已经在保险库里，裁决
-        ///   界面直接读它就行，因此这里是 `None`。少复制一份密钥材料。
-        /// - **对端发来活条目**（本地有墓碑）：本地内容是一份**墓碑**，而对方那一版
-        ///   条目本来就在我们手上、直接移进来即可——此时这里是对方那一版条目，好让
-        ///   裁决界面知道「对端想要恢复这条」。
-        ///
-        /// 两种情况都避免了为「展示」而复制密钥材料，除了下面 `incoming` 是活条目
-        /// 的那一种——那一种本来就没有本地活条目可读。
+        /// Neither direction copies key material for display, except the one where
+        /// `incoming` below is a live entry — that one has no local live entry to read.
         local: Option<Box<VaultEntry>>,
-        /// 对端发来的墓碑。**尚未**写入本地保险库。
+        /// The tombstone received from the peer. **Not yet** written to the local vault.
         incoming: Box<Tombstone>,
-        /// 本地版本比墓碑晚。
+        /// The local version is later than the tombstone.
         ///
-        /// 这是**提示**，不是判定依据：它告诉裁决界面「这一端在你删完之后还改过」。
-        /// 库不据此自动选边——对端的时间戳由对端填写。
+        /// This is a **hint**, not a basis for the decision: it tells the adjudication UI
+        /// that this side was edited after the deletion. The library does not pick a side
+        /// from it — the peer fills in the peer's own timestamps.
         local_is_newer: bool,
     },
 }
 
-/// 一次合并的结果。
+/// The result of one merge.
 ///
-/// 没有 `Clone`：它可能持有冲突，而冲突持有密钥材料。
+/// No `Clone`: it can hold conflicts, and conflicts hold key material.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct MergeOutcome {
-    /// 新增的条目数。
+    /// Number of entries added.
     pub added: usize,
-    /// 新增的墓碑数。**不**包括「本地已有该墓碑」的情形。
+    /// Number of tombstones added. **Not** including the case where the local vault
+    /// already had that tombstone.
     pub tombstones_added: usize,
-    /// 被接受的删除数（本地条目被墓碑替代）。
+    /// Number of deletions accepted (a local entry replaced by a tombstone).
     pub deletions_applied: usize,
-    /// 内容完全相同、什么都没做的记录数。
+    /// Number of records whose content was completely identical, so nothing was done.
     pub unchanged: usize,
-    /// 需要人来裁定的分歧。
+    /// Disagreements that need a human to adjudicate.
     pub conflicts: Vec<Conflict>,
 }
 
 impl MergeOutcome {
-    /// 这次合并是否什么都没改，也没有待裁决的分歧。
+    /// Whether this merge changed nothing and left no disagreement to adjudicate.
     ///
-    /// 用于让界面跳过「同步完成」这类提示——重复同步同一批数据时它是 `true`，而那
-    /// 正是幂等性的可观察形态。
+    /// Lets the UI skip "sync complete"-style messages — it is `true` when the same batch
+    /// of data is synced again, which is the observable form of idempotence.
     #[must_use]
     pub fn made_no_change(&self) -> bool {
         self.added == 0
@@ -183,40 +194,40 @@ impl MergeOutcome {
             && self.conflicts.is_empty()
     }
 
-    /// 是否有待裁决的分歧。
+    /// Whether there is a disagreement waiting for adjudication.
     #[must_use]
     pub fn needs_adjudication(&self) -> bool {
         !self.conflicts.is_empty()
     }
 }
 
-/// 把一批来自对端的记录并进本地保险库。
+/// Merges a batch of records from a peer into the local vault.
 ///
-/// # 幂等
+/// # Idempotence
 ///
-/// 同一批记录合并两次，第二次的 `added`、`tombstones_added`、`deletions_applied`
-/// 都是 `0`，`unchanged` 是全部，保险库内容逐字节不变。这是**可观察**的幂等性，
-/// 不只是「逻辑上应该幂等」。
+/// Merging the same batch twice leaves `added`, `tombstones_added` and
+/// `deletions_applied` at `0` on the second pass, `unchanged` at the full count, and the
+/// vault contents byte-for-byte identical. The idempotence is **observable**, not merely
+/// "idempotent by argument".
 ///
-/// # 交换律只在保险库内容上成立
+/// # Commutativity holds for the vault contents only
 ///
-/// `merge(merge(v, a), b)` 与 `merge(merge(v, b), a)` 的**保险库内容**相同，但
-/// **冲突列表可能不同**（先后顺序决定哪边被当成 `local`）。库不假装两者等价：冲突
-/// 本来就是「要人来决定」的东西，把顺序差异藏起来只会让裁决界面显示出与用户刚看到
-/// 的不同的内容。
+/// `merge(merge(v, a), b)` and `merge(merge(v, b), a)` leave the **same vault contents**
+/// but can report **different conflict lists** (the order decides which side is treated as
+/// `local`). The library does not pretend the two are equivalent: conflicts are precisely
+/// the things a human has to decide, and hiding the order difference would only make the
+/// adjudication UI show something other than what the user just saw.
 ///
-/// # 这个函数返回 `Result` 只有一个原因
+/// # Errors
 ///
-/// 出现冲突时要**复制**本地那一版（见 [`Conflict`]），而 [`VaultEntry::duplicate`] 是
-/// 可能失败的。除此之外合并只操作内存里的映射，不会失败。
+/// Structural errors other than [`crate::Error::VaultDecryptionFailed`], propagated from
+/// [`VaultEntry::duplicate`], which fails only when the vault holds an entry that violates
+/// the format constraints. Duplicating happens for the local side of a conflict; apart
+/// from that the merge only operates on in-memory maps and cannot fail.
 ///
-/// 冲突里的 `incoming` **不会**被写入：调用方必须先让用户裁定。这是刻意的，因为
-/// 「先写进去、再让用户改回来」会在用户没来得及反应时就把本地数据覆盖掉。
-///
-/// # 错误
-///
-/// [`crate::Error::VaultDecryptionFailed`] 之外的结构错误：由
-/// [`VaultEntry::duplicate`] 传播，只在保险库里存在一个违反格式约束的条目时发生。
+/// The `incoming` side of a conflict is **not** written: the caller has to let the user
+/// adjudicate first. Writing it and letting the user revert would overwrite local data
+/// before the user can react.
 pub fn merge_into<'a>(
     vault: &mut Vault,
     records: impl IntoIterator<Item = &'a MergedRecord>,
@@ -235,16 +246,25 @@ pub fn merge_into<'a>(
     Ok(outcome)
 }
 
-/// 合并一条活条目。
+/// Merges one live entry.
 ///
-/// 会失败**只**因为 [`VaultEntry::duplicate`] 失败（报冲突时要复制本地那一版）。
+/// Three cases: the local vault already has a live entry with this ID (identical content →
+/// `unchanged`, otherwise a [`ConflictKind::EntryMismatch`] conflict); the local vault has a
+/// tombstone and no live entry, which means the entry comes from a device that has **not
+/// received the deletion yet**, so it is reported as a [`ConflictKind::DeletionConflict`]
+/// instead of being inserted and reviving the adjudicated deletion; and no local record at
+/// all, in which case the entry is inserted. `insert_with_id` fails only when the ID already
+/// exists, and both such cases are handled above, so a failure there is unreachable — the
+/// result is still not `expect`-ed, so that no panic branch exists on user data.
+///
+/// Fails **only** because [`VaultEntry::duplicate`] failed (the local version is copied when
+/// a conflict is reported).
 fn merge_entry(
     vault: &mut Vault,
     id: &EntryId,
     entry: &VaultEntry,
     outcome: &mut MergeOutcome,
 ) -> Result<()> {
-    // 本地已有同 ID 的活条目。
     if let Some(existing) = vault.get(id) {
         if entries_identical(existing, entry) {
             outcome.unchanged += 1;
@@ -260,8 +280,6 @@ fn merge_entry(
         return Ok(());
     }
 
-    // 本地有墓碑、没有活条目：这条条目来自一台**还没收到删除**的设备。直接插进去会
-    // 让已裁决的删除复活，因此报冲突而不是插入。
     if let Some(tombstone) = vault.get_tombstone(id) {
         outcome.conflicts.push(Conflict {
             entry_id: *id,
@@ -274,27 +292,37 @@ fn merge_entry(
         return Ok(());
     }
 
-    // 本地完全没有这条。`insert_with_id` 只在 ID 已存在时失败，而上面已经排除了
-    // 那两种情形——因此这里的失败是不可达的。仍然不用 `expect`：一个不可达的 panic
-    // 分支在将来改动之后可能变得可达，而那时它会在用户的数据上触发。
     if vault.insert_with_id(*id, entry.duplicate()?).is_ok() {
         outcome.added += 1;
     }
     Ok(())
 }
 
-/// 合并一条墓碑。
+/// Merges one tombstone.
 ///
-/// 不返回 Result：它不复制任何密钥材料（墓碑里没有秘密），因此没有可失败之处。
+/// If the local vault already knows the tombstone, the **earlier** of the two deletion
+/// times is kept: both tombstones prove that the deletion happened, and taking the earlier
+/// one makes the two sides converge on the same value without refreshing the deletion time,
+/// so a device deleting repeatedly cannot change an adjudicated result.
+///
+/// If the local side holds a live entry whose `updated_at` is not later than the deletion
+/// time, the deletion is accepted: the entry is removed, the tombstone recorded and
+/// `deletions_applied` incremented. `remove` runs before `record_tombstone` because
+/// `Vault::record_tombstone` does **not** remove a live entry, and a live entry coexisting
+/// with a tombstone is the state of an adjudication that has not finished. If the live
+/// entry is newer the result is a [`ConflictKind::DeletionConflict`] with `local` set to
+/// `None`: the local content stays in the vault and the adjudication UI reads it there, so
+/// no key material is copied — `merge_tombstone` returns no `Result`, and copying can fail.
+/// What that conflict has to display is "the local vault has a newer entry, the peer says
+/// it was deleted", unlike the `EntryMismatch` branch, where both sides must be shown
+/// together.
+///
+/// Returns no `Result`: it copies no key material (a tombstone holds no secret) and
+/// therefore has nothing that can fail.
 fn merge_tombstone(vault: &mut Vault, tombstone: &Tombstone, outcome: &mut MergeOutcome) {
     let id = tombstone.entry_id;
 
-    // 已经知道这条墓碑。
     if let Some(existing) = vault.get_tombstone(&id) {
-        // 两端各有一条墓碑但时间不同时，**保留更早的那个**。理由不是「早的更新」，
-        // 而是「删除这件事确实发生过」——两条墓碑都证明用户删过。取更早的让两端
-        // 收敛到同一个值，且不刷新删除时间，因而不会让一台设备反复删除把裁决结果
-        // 改掉。
         if tombstone.deleted_at < existing.deleted_at {
             vault.record_tombstone(tombstone.clone());
         }
@@ -302,31 +330,16 @@ fn merge_tombstone(vault: &mut Vault, tombstone: &Tombstone, outcome: &mut Merge
         return;
     }
 
-    // 本地有活条目。
     if let Some(local) = vault.get(&id) {
         if local.updated_at <= tombstone.deleted_at {
-            // 本地条目在对方删除之前（或同一秒）就没再改过：用户意图很清楚——那边
-            // 删了，这边只是原样的旧副本。接受删除。
-            //
-            // 先 `remove` 再 `record_tombstone`，而不是只 `record_tombstone`：后者
-            // **不删活条目**（见 `Vault::record_tombstone` 的文档），于是会出现
-            // 「活条目与墓碑并存」的状态，而那是裁决尚未完成时才该有的。
             vault.remove(&id, tombstone.deleted_at);
             vault.record_tombstone(tombstone.clone());
             outcome.deletions_applied += 1;
             return;
         }
-        // 本地条目比删除更新：用户在删除之后还改过它。这可能是「用户又想要这条」，
-        // 也可能是「两台设备各干各的」。报冲突。
-        //
-        // 这里**不**复制本地那一版——`merge_tombstone` 目前不返回 `Result`，而复制是
-        // 可能失败的。冲突报出去，裁决界面用自己的方式取本地内容（它本来就能访问
-        // 保险库）。这与 `EntryMismatch` 那条分支不同：那里两边的内容都必须同时呈现，
-        // 而这里真正要展示的是「本地有一条较新的条目，对端说它被删了」。
         outcome.conflicts.push(Conflict {
             entry_id: id,
             kind: ConflictKind::DeletionConflict {
-                // 本地内容已经在保险库里，裁决界面自己读；不复制密钥材料。`None` 是刻意的。
                 local: None,
                 incoming: Box::new(tombstone.clone()),
                 local_is_newer: true,
@@ -339,43 +352,50 @@ fn merge_tombstone(vault: &mut Vault, tombstone: &Tombstone, outcome: &mut Merge
     outcome.tombstones_added += 1;
 }
 
-/// 两条条目是否完全相同。
+/// Whether two entries are completely identical.
 ///
-/// 直接调 [`VaultEntry`] 的 `PartialEq`：那个实现刻意把秘密字段（种子）的比较放在
-/// **最后**，因此名字就不同的一对条目在第一个字段就被排除，不会付出恒定时间比较的
-/// 代价。见 [`crate::vault::Entry`] 的 `PartialEq`。
+/// Calls [`VaultEntry`]'s `PartialEq` directly: that implementation deliberately compares
+/// the secret field (the seed) **last**, so a pair of entries whose names already differ is
+/// excluded at the first field and pays no constant-time comparison. See the `PartialEq` of
+/// [`crate::vault::Entry`].
 ///
-/// 之所以单独包一层而不是直接写 `a == b`：调用点需要一处能写下「为什么这里可以比较
-/// 秘密」的地方。答案是**能执行这个比较的一方已经同时持有两边的明文**，因此普通比较
-/// 不构成降级；但这一点需要被写下来，否则后人看到「秘密被拿来比较」会先怀疑是 bug。
+/// The wrapper exists rather than a plain `a == b` so that the call site has one place to
+/// state why comparing secrets is acceptable here: whoever can perform the comparison
+/// already holds both plaintexts, so an ordinary comparison is no downgrade.
 fn entries_identical(a: &VaultEntry, b: &VaultEntry) -> bool {
     a == b
 }
 
-/// 便于调用方按标识组织记录的容器。
+/// A container that lets callers organize records by identifier.
 ///
-/// # 为什么要按标识去重
+/// # Deduplication by identifier
 ///
-/// 一份载荷里同一个 `EntryId` 出现两次是**合法**的：它可能带着两台设备各自的版本。
-/// 但合并只能落实一个结果，因此必须先定下「用哪一个」。这里采取「先插入的胜出」，
-/// 而载荷的生成方负责把它认为更该被采纳的那个放在前面。
+/// The same `EntryId` appearing twice in one payload is **legal**: it can carry one version
+/// of the entry per device. A merge can only apply one result, so which one is used has to
+/// be fixed first: first-inserted wins, and whoever builds the payload is responsible for
+/// putting the version it wants adopted first.
 ///
-/// **不能**用「后插入的覆盖」：那会让载荷里的顺序变成一个安全相关的性质（最后一条
-/// 说了算），而对端控制着那个顺序。
+/// Last-inserted-wins is **not** used: that would make the order inside a payload a
+/// security-relevant property (the last record decides), while the peer controls that
+/// order.
 ///
-/// # 为什么是泛型的
+/// # Genericity
 ///
-/// 两个地方需要「按标识去重的记录集合」，而它们的元素类型不同：
+/// Two places need a "record set deduplicated by identifier", with different element
+/// types:
 ///
-/// - [`MergedRecord`]：**解密之后**的语义记录，合并层用。
-/// - [`crate::sync::Record`]：**仍然加密**的线格式记录，载荷打包与解析用。
+/// - [`MergedRecord`]: the semantic record **after decryption**, used by the merge layer.
+/// - [`crate::sync::Record`]: the wire-format record that is **still encrypted**, used by
+///   payload packing and parsing.
 ///
-/// 让容器泛型化比写两份的好处不只是省代码：两者的**去重规则必须一致**（都是「先插入
-/// 的胜出」），而两份实现会在某次改动中悄悄分叉，症状是「同一份载荷在发送端去重了、
-/// 在接收端没有」——一个只有在对端手里才复现的故障。
+/// One generic container instead of two implementations is not just less code: the two
+/// deduplication rules **must be identical** (both are first-inserted wins), and two
+/// implementations would silently drift apart, showing up as a payload deduplicated on the
+/// sending side and not on the receiving side — a failure that reproduces only on the peer.
 #[derive(Debug)]
 pub struct RecordSet<T> {
-    /// 按标识索引的记录。BTreeMap 而不是 HashMap：遍历顺序必须确定。
+    /// Records indexed by identifier. A `BTreeMap` rather than a `HashMap`: the iteration
+    /// order has to be deterministic.
     by_id: BTreeMap<EntryId, T>,
 }
 
@@ -388,15 +408,16 @@ impl<T> Default for RecordSet<T> {
 }
 
 impl<T: HasEntryId> RecordSet<T> {
-    /// 空的集合。
+    /// An empty set.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 插入一条记录；同一个 ID 已经存在时**不覆盖**。
+    /// Inserts a record; **does not overwrite** when the same ID already exists.
     ///
-    /// 返回是否真的插入了（`false` 表示这个 ID 已经有了）。
+    /// Returns whether the record was actually inserted (`false` means this ID is already
+    /// present).
     pub fn insert(&mut self, record: T) -> bool {
         let id = record.entry_id();
         if self.by_id.contains_key(&id) {
@@ -406,29 +427,30 @@ impl<T: HasEntryId> RecordSet<T> {
         true
     }
 
-    /// 有多少条。
+    /// How many records there are.
     #[must_use]
     pub fn len(&self) -> usize {
         self.by_id.len()
     }
 
-    /// 是否为空。
+    /// Whether the set is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
     }
 
-    /// 取出某个 ID 的记录。
+    /// Borrows the record for one ID.
     #[must_use]
     pub fn get(&self, id: &EntryId) -> Option<&T> {
         self.by_id.get(id)
     }
 
-    /// 按 ID 顺序遍历。
+    /// Iterates in ID order.
     ///
-    /// `BTreeMap` 而不是 `HashMap`：遍历顺序必须确定，否则同一份载荷在不同设备上会
-    /// 产生不同的合并顺序，而冲突列表的顺序也就跟着变；对线格式而言还会让两份内容
-    /// 相同的载荷产生不同的明文。
+    /// A `BTreeMap` rather than a `HashMap`: the iteration order has to be deterministic,
+    /// otherwise the same payload would produce a different merge order on different
+    /// devices and the order of the conflict list would follow; for the wire format it
+    /// would also make two payloads with identical content produce different plaintext.
     pub fn iter(&self) -> impl Iterator<Item = (&EntryId, &T)> {
         self.by_id.iter()
     }
@@ -438,24 +460,26 @@ impl<'a, T> IntoIterator for &'a RecordSet<T> {
     type Item = &'a T;
     type IntoIter = std::collections::btree_map::Values<'a, EntryId, T>;
 
-    /// 按 ID 顺序借用全部记录。
+    /// Borrows every record in ID order.
     ///
-    /// # 为什么是借用而不是 `records() -> Vec<T>`
-    ///
-    /// 后者要求每条记录都能被复制，而两个元素类型都刻意没有 `Clone`（它们装着密钥
-    /// 材料）。借用让 [`merge_into`] 可以直接吃 `&RecordSet`，不必为了「传参」而复制
-    /// 整份载荷的密钥——一次同步复制几百份种子是完全没有必要的泄露面扩大。
+    /// Borrowing rather than a `records() -> Vec<T>`: the latter requires every record to
+    /// be copyable, and both element types deliberately have no `Clone` (they hold key
+    /// material). Borrowing lets [`merge_into`] take a `&RecordSet` directly, without
+    /// copying the key material of a whole payload just to pass it around — one sync would
+    /// copy hundreds of seeds for no reason at all.
     fn into_iter(self) -> Self::IntoIter {
         self.by_id.values()
     }
 }
 
-/// 「知道自己是哪一条记录」的类型。
+/// A type that knows which record it is.
 ///
-/// [`RecordSet`] 用这个 trait 取去重用的键。它只有这一个方法，因为容器只需要这一件事
-/// ——一个更宽的 trait 会诱使容器去做它不该做的事（比如按内容排序，那需要读密钥）。
+/// [`RecordSet`] uses this trait for the key of deduplication. It has this one method and
+/// no more because the container needs this one thing — a wider trait would tempt the
+/// container into doing what it should not (such as ordering by content, which requires
+/// reading key material).
 pub trait HasEntryId {
-    /// 这条记录讲的是哪一个条目。
+    /// Which entry this record is about.
     fn entry_id(&self) -> EntryId;
 }
 

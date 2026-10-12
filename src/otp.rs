@@ -13,32 +13,38 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! HOTP（RFC 4226）与 TOTP（RFC 6238）。
+//! HOTP (RFC 4226) and TOTP (RFC 6238).
 //!
-//! # 纯度
+//! # Purity
 //!
-//! 本模块**不读取时钟**。HOTP 要计数器，TOTP 要 Unix 时间戳，两者都由调用方
-//! 以参数传入。这不是风格偏好——时钟不可注入就无法对 RFC 测试向量做确定性
-//! 验证，也就无法证明实现正确。
+//! This module **does not read the clock**. HOTP needs a counter, TOTP needs a
+//! Unix timestamp, and both are passed in by the caller. This is not a matter of
+//! style: with a clock that cannot be injected, the RFC test vectors cannot be
+//! verified deterministically, and correctness therefore cannot be demonstrated.
 //!
-//! # 支持的算法与种子长度
+//! # Supported algorithms and secret lengths
 //!
-//! | `Algorithm` | RFC 6238 附录 B 的种子长度 | HMAC 块大小 |
+//! | `Algorithm` | Secret length, RFC 6238 Appendix B | HMAC block size |
 //! |---|---|---|
-//! | [`Algorithm::Sha1`]（默认） | 20 字节 | 64 字节 |
-//! | [`Algorithm::Sha256`] | 32 字节 | 64 字节 |
-//! | [`Algorithm::Sha512`] | 64 字节 | 128 字节 |
+//! | [`Algorithm::Sha1`] (default) | 20 bytes | 64 bytes |
+//! | [`Algorithm::Sha256`] | 32 bytes | 64 bytes |
+//! | [`Algorithm::Sha512`] | 64 bytes | 128 bytes |
 //!
-//! **为什么 SHA-1 是必需的，而不是安全妥协**：SHA-1 对**碰撞**已破，但 HMAC 的
-//! 安全性不依赖碰撞抗性——HMAC-SHA1 在 TOTP 场景下仍安全，且绝大多数真实服务端
-//! 只支持 SHA-1。RFC 6238 本身就把 SHA-1 列为必需实现。
+//! **SHA-1 is required here, and that is not a security compromise**: SHA-1 is
+//! broken for **collisions**, but HMAC security does not rest on collision
+//! resistance — HMAC-SHA1 remains sound for TOTP, and the vast majority of
+//! real-world services support SHA-1 only. RFC 6238 itself lists SHA-1 as a
+//! required implementation.
 //!
-//! # 关于种子长度校验
+//! # On secret length validation
 //!
-//! 上表的长度是 RFC 的**建议**，不是 HMAC 的**要求**（HMAC 接受任意长度密钥）。
-//! 因此本模块**只拒绝空种子**，不拒绝短种子——真实世界里存在短种子，硬拒会让
-//! 用户无法导入本可用的账号。长度不足应在 UI 层作为**警告**呈现，而不是核心层
-//! 的错误。可用 [`recommended_min_secret_len`] 取建议长度用于告警。
+//! The lengths in the table are RFC **recommendations**, not HMAC
+//! **requirements** (HMAC accepts a key of any length). This module therefore
+//! **rejects only an empty secret** and does not reject short ones — short
+//! secrets exist in the real world, and rejecting them outright would keep users
+//! from importing accounts that work. A short length belongs in the UI as a
+//! **warning**, not in the core as an error.
+//! [`recommended_min_secret_len`] returns the recommended length for it.
 
 use sha1::Sha1;
 use sha2::{Sha256, Sha512};
@@ -46,27 +52,25 @@ use subtle::ConstantTimeEq;
 
 use crate::{Error, ExposeSecret, Result, secret::SecretBox};
 
-// `zeroize` 不是本 crate 的直接依赖，从 `secrecy` 取用可保证与实际生效的版本一致。
-// 仅在测试中用于验证中间缓冲可被显式擦除，故加 `cfg(test)` 以免生产构建告警。
 #[cfg(test)]
 use secrecy::zeroize::Zeroize;
 
-/// HOTP/TOTP 使用的哈希算法。
+/// Hash algorithm used by HOTP/TOTP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Algorithm {
-    /// HMAC-SHA-1。TOTP 的默认值，也是绝大多数服务的唯一选项。
+    /// HMAC-SHA-1. The TOTP default and the only option most services offer.
     #[default]
     Sha1,
-    /// HMAC-SHA-256。
+    /// HMAC-SHA-256.
     Sha256,
-    /// HMAC-SHA-512。
+    /// HMAC-SHA-512.
     Sha512,
 }
 
 impl Algorithm {
-    /// RFC 6238 建议的种子长度（字节），用于向用户告警。
+    /// Secret length recommended by RFC 6238 (bytes), used to warn the user.
     ///
-    /// 这些值等于对应哈希函数的输出长度。
+    /// These values equal the output length of the corresponding hash function.
     #[must_use]
     pub const fn recommended_secret_len(self) -> usize {
         match self {
@@ -76,19 +80,18 @@ impl Algorithm {
         }
     }
 
-    /// 从 `otpauth://` 的 `algorithm` 参数解析。
+    /// Parses the `algorithm` parameter of an `otpauth://` URI.
     ///
-    /// 接受大小写不敏感的 `SHA1` / `SHA256` / `SHA512`。
-    /// 缺失该参数时由调用方使用 [`Algorithm::default`]。
+    /// Accepts `SHA1` / `SHA256` / `SHA512`, case-insensitively; a name longer
+    /// than 8 bytes is rejected on length alone. When the parameter is absent
+    /// the caller uses [`Algorithm::default`].
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 无法识别时返回 [`Error::UnsupportedAlgorithm`]——**拒绝而非回退到 SHA-1**，
-    /// 因为静默回退会让用户拿到一个恒错的验证码，而错误信息无从查起。
+    /// Returns [`Error::UnsupportedAlgorithm`] for an unrecognised name —
+    /// **rejected rather than falling back to SHA-1**, because a silent fallback
+    /// gives the user a permanently wrong code and leaves nothing to diagnose.
     pub fn parse(value: &str) -> Result<Self> {
-        // 先做 ASCII 大写归一，避免为每个分支处理大小写。
-        // 用栈缓冲而非 `to_uppercase()`：后者会为 `String` 分配，且做完整 Unicode
-        // 映射（此处只需要 ASCII）。
         let mut buf = [0_u8; 8];
         let bytes = value.as_bytes();
         if bytes.len() > buf.len() {
@@ -99,7 +102,6 @@ impl Algorithm {
         for (slot, &byte) in buf.iter_mut().zip(bytes) {
             *slot = byte.to_ascii_uppercase();
         }
-        // 上面只填了前 len 个字节，这里按实际长度比较。
         let normalized = &buf[..bytes.len()];
 
         match normalized {
@@ -113,14 +115,15 @@ impl Algorithm {
     }
 }
 
-/// 把无法识别的算法名截断后再放进错误，避免把超长（甚至来自攻击者的）输入
-/// 原样带进日志。
+/// Truncates an unrecognised algorithm name before placing it into an error, so
+/// that oversized (possibly attacker-supplied) input never reaches the logs
+/// verbatim. The cut is moved back to the nearest UTF-8 character boundary and
+/// the result ends with `…`.
 fn truncate_for_error(value: &str) -> String {
     const MAX: usize = 16;
     if value.len() <= MAX {
         return value.into();
     }
-    // 必须在字符边界截断，否则 `&value[..MAX]` 会在多字节字符中间切开而 panic。
     let mut end = MAX;
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
@@ -130,21 +133,21 @@ fn truncate_for_error(value: &str) -> String {
     out
 }
 
-/// 支持的数字位数。RFC 4226 只要求 6 位，RFC 6238 允许 8 位；
-/// 7 位在真实世界存在（部分银行），故一并支持。
+/// Supported digit counts. RFC 4226 requires only 6 digits, RFC 6238 allows 8;
+/// 7 digits occur in the real world (some banks), so it is supported as well.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Digits {
-    /// 6 位（默认，覆盖绝大多数场景）。
+    /// 6 digits (the default, covering the vast majority of services).
     #[default]
     Six,
-    /// 7 位。
+    /// 7 digits.
     Seven,
-    /// 8 位。
+    /// 8 digits.
     Eight,
 }
 
 impl Digits {
-    /// 位数本身。
+    /// The digit count itself.
     #[must_use]
     pub const fn count(self) -> u32 {
         match self {
@@ -154,13 +157,14 @@ impl Digits {
         }
     }
 
-    /// 从 `otpauth://` 的 `digits` 参数解析。
+    /// Parses the `digits` parameter of an `otpauth://` URI.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 只接受 6、7、8；其它值返回 [`Error::UnsupportedDigits`]。
-    /// 这是**攻击者可控参数**，必须严格校验——若接受任意值，`10^digits`
-    /// 会在超大位数上溢出。
+    /// Only 6, 7 and 8 are accepted; any other value returns
+    /// [`Error::UnsupportedDigits`]. This is an **attacker-controlled
+    /// parameter** and must be validated strictly — accepting arbitrary values
+    /// would overflow `10^digits` for large digit counts.
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "6" => Ok(Self::Six),
@@ -172,7 +176,7 @@ impl Digits {
         }
     }
 
-    /// `10^digits`，用于取模。
+    /// `10^digits`, used as the modulus.
     #[must_use]
     const fn modulus(self) -> u32 {
         match self {
@@ -183,24 +187,27 @@ impl Digits {
     }
 }
 
-/// 一个已校验的 OTP 种子。
+/// A validated OTP secret.
 ///
-/// 用专属类型而非裸 `SecretBytes`，是为了把「非空」这一不变量固定在类型里，
-/// 并让调用方无法把任意字节流误当作种子传入。
+/// A dedicated type rather than a bare `SecretBytes` pins the "non-empty"
+/// invariant in the type and keeps a caller from passing an arbitrary byte
+/// stream where a secret is expected.
 ///
-/// **刻意不实现 `Clone`**：克隆会让同一密钥在内存中多存一份、各自独立擦除，
-/// 增加泄露面。需要多处使用时传引用。
+/// **`Clone` is deliberately not implemented**: cloning would keep a second copy
+/// of the same key in memory with its own independent erasure, widening the
+/// exposure. Pass a reference where the secret is needed in more than one place.
 pub struct OtpSecret {
-    /// 种子字节。`SecretBox` 在 `Drop` 时擦除，且其 `Debug` 只输出脱敏标记。
+    /// Secret bytes. `SecretBox` erases them on `Drop` and its `Debug` prints
+    /// only a redaction marker.
     bytes: SecretBox<[u8]>,
 }
 
 impl OtpSecret {
-    /// 用原始字节构造。
+    /// Builds a secret from raw bytes.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 空输入返回 [`Error::SecretEmpty`]。
+    /// Returns [`Error::SecretEmpty`] for an empty input.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         if bytes.is_empty() {
             return Err(Error::SecretEmpty);
@@ -210,22 +217,20 @@ impl OtpSecret {
         })
     }
 
-    /// 从 Base32 字符串构造（`otpauth://` 种子在 URI 里的表示形式）。
+    /// Builds a secret from a Base32 string (how an `otpauth://` URI carries a
+    /// secret).
     ///
-    /// 宽容策略与转义规则见 [`crate::base32::decode`]。
+    /// Tolerance and escaping rules are documented in [`crate::base32::decode`].
     pub fn from_base32(encoded: &str) -> Result<Self> {
         let decoded = crate::base32::decode(encoded)?;
         Self::from_bytes(decoded.expose_secret().to_vec())
     }
 
-    /// 种子长度（字节）。长度本身不是秘密。
+    /// Secret length in bytes. The length itself is not a secret.
     ///
-    /// # 为什么没有 `is_empty`
-    ///
-    /// clippy 的 `len_without_is_empty` 会对此告警，但本类型**不存在空状态**：
-    /// `OtpSecret` 的唯一构造入口都会拒绝空输入（见 [`Error::SecretEmpty`]）。
-    /// 加一个恒返回 `false` 的 `is_empty` 只会制造一个永不成立的 API 承诺，
-    /// 反而误导调用方以为需要判断。故显式豁免并说明原因。
+    /// There is no `is_empty`: every constructor of `OtpSecret` rejects empty input
+    /// (see [`Error::SecretEmpty`]), so the type has no empty state and the lint is
+    /// exempted below.
     #[expect(
         clippy::len_without_is_empty,
         reason = "本类型的不变量保证非空，`is_empty` 恒为 false，提供它反而误导"
@@ -235,38 +240,41 @@ impl OtpSecret {
         self.bytes.expose_secret().len()
     }
 
-    /// 是否短于该算法建议的长度——用于向用户**告警**，不是错误。
+    /// Whether the secret is shorter than the length the algorithm recommends —
+    /// used to **warn** the user, not as an error.
     #[must_use]
     pub fn is_shorter_than_recommended(&self, algorithm: Algorithm) -> bool {
         self.len() < algorithm.recommended_secret_len()
     }
 
-    /// 借出种子字节，供计算使用。
+    /// Borrows the secret bytes for computation.
     ///
-    /// `pub(crate)` 而非私有：保险库需要把种子序列化进密文（见
-    /// [`crate::vault::Entry`] 的持久化路径），而那是本 crate 内的另一个模块。
-    /// **对外仍然不公开**——外部只能通过 [`OtpSecret::to_base32`] 拿到可显示的
-    /// 表示，无法把种子当作普通字节流取走。
+    /// `pub(crate)` rather than private: the vault serialises the secret into
+    /// ciphertext (see the persistence path of [`crate::vault::Entry`]), which
+    /// lives in another module of this crate. It is **not public** — outside
+    /// callers can only obtain a displayable form via [`OtpSecret::to_base32`]
+    /// and cannot take the secret away as a plain byte stream.
     pub(crate) fn expose(&self) -> &[u8] {
         self.bytes.expose_secret()
     }
-    /// 把种子导出为 Base32 字符串（**无填充**大写形式）。
+    /// Exports the secret as a Base32 string (**unpadded**, upper case).
     ///
-    /// 供 URI 序列化与二维码生成使用。之所以提供这个方法而不是公开 `expose`，
-    /// 是为了让「种子离开本类型」只有这一条窄路径：它产出的是可显示、可编码的
-    /// 表示，而不是可被误当作普通字节流处理的裸切片。
+    /// Used for URI serialisation and QR code generation. This method exists
+    /// instead of a public `expose` so that the secret leaves the type through
+    /// exactly one narrow path: the result is a displayable, encodable form, not
+    /// a bare slice that could be mistaken for ordinary bytes.
     ///
-    /// 无填充形式是各认证器最普遍的写法，也能避免二维码里出现 `=` 带来的转义问题。
+    /// The unpadded form is what most authenticators write and it keeps `=` out
+    /// of the QR code, avoiding the escaping issues it would bring.
     #[must_use]
     pub fn to_base32(&self) -> String {
         let encoded = crate::base32::encode(self.expose());
-        // `trim_end_matches` 只会在有填充时截断，无填充时原样返回。
         encoded.trim_end_matches('=').to_owned()
     }
 }
 
 impl core::fmt::Debug for OtpSecret {
-    /// 只打印长度，**绝不**打印内容。
+    /// Prints only the length, **never** the contents.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("OtpSecret")
             .field("len", &self.len())
@@ -276,70 +284,59 @@ impl core::fmt::Debug for OtpSecret {
 }
 
 impl PartialEq for OtpSecret {
-    /// 恒定时间比较种子字节。
+    /// Compares secret bytes in constant time.
     ///
-    /// # 为什么不是派生出来的比较
+    /// Compares secret bytes in constant time through [`subtle::ConstantTimeEq`]: a derived
+    /// `PartialEq` returns early at the first differing byte, so the comparison time leaks
+    /// "how many leading bytes were guessed right".
     ///
-    /// 派生的 `PartialEq` 会在第一个不同的字节处提前返回，于是比较耗时泄露了「猜对
-    /// 了前几个字节」。种子是秘密，而这个比较会出现在认证路径上（判断两个条目是否
-    /// 是同一条），因此必须走 [`subtle::ConstantTimeEq`]。
+    /// # Cost
     ///
-    /// # 代价
-    ///
-    /// 恒定时间意味着**总是**比较全部字节，即使第一个字节就不同。同步的合并循环要对
-    /// 成千上万对条目做这个判断，因此 [`crate::vault::Entry`] 的 `PartialEq` 刻意先比
-    /// 那些廉价的字段（名字、账号、时间戳），只有它们全部相同才走到这里——名字不同的
-    /// 一对条目在第一个字段就被排除了，不会付出恒定时间的代价。
+    /// Constant time means **every** byte is always compared, even when the
+    /// first one already differs. The sync merge loop makes this decision for
+    /// thousands of entry pairs, so `PartialEq` for [`crate::vault::Entry`]
+    /// deliberately compares the cheap fields first (name, account, timestamps)
+    /// and only reaches this one when they all match — a pair with different
+    /// names is excluded on the first field and never pays the constant-time
+    /// cost.
     fn eq(&self, other: &Self) -> bool {
         use subtle::ConstantTimeEq as _;
-        // 长度不同时 `ct_eq` 直接返回 `false`——长度本身不是秘密（它明文存在于
-        // 密文长度里），因此这条早退不泄露任何东西。
         self.expose().ct_eq(other.expose()).into()
     }
 }
 
 impl Eq for OtpSecret {}
 
-/// 返回该算法建议的最小种子长度（字节），供 UI 告警使用。
+/// Returns the minimum secret length (bytes) recommended for the algorithm, for
+/// UI warnings.
 #[must_use]
 pub const fn recommended_min_secret_len(algorithm: Algorithm) -> usize {
     algorithm.recommended_secret_len()
 }
 
-/// 计算 HMAC 摘要并按 RFC 4226 §5.3 做**动态截断**。
+/// Computes the HMAC digest and applies **dynamic truncation** per RFC 4226 §5.3.
 ///
-/// 动态截断：取摘要最后一字节的低 4 位作为偏移量 `offset`，然后从 `offset`
-/// 起取 4 字节组成大端 31 位整数（最高位被掩掉）。
+/// Dynamic truncation: the low 4 bits of the digest's last byte give the offset
+/// `offset`; the 4 bytes starting there form a big-endian 31-bit integer (the
+/// top bit is masked off).
 ///
-/// # 为什么用 `SimpleHmac` 而不是 `Hmac`
-///
-/// `hmac` 0.13 提供两个实现：`Hmac<D>` 要求 `D: EagerHash + CoreProxy`（为吞吐
-/// 优化的块级实现），`SimpleHmac<D>` 只要求 `D: Digest + BlockSizeUser`（可移植
-/// 实现）。两者产出**完全相同**的 HMAC 值。
-///
-/// 本模块按算法在运行时三选一分派，泛型约束的可写性直接决定代码可读性。
-/// TOTP 每 30 秒算一次、每次几十字节，吞吐差异无实际意义，故选可移植实现。
+/// `SimpleHmac<D>` is used rather than `Hmac<D>`: both produce **identical** HMAC
+/// values, but `SimpleHmac<D>` only requires `D: Digest + BlockSizeUser`, which
+/// keeps the three-way runtime dispatch readable. TOTP runs once per 30 seconds
+/// over a few dozen bytes, so the throughput difference has no practical effect.
 fn hmac_truncate(secret: &OtpSecret, algorithm: Algorithm, message: &[u8]) -> u32 {
-    // `BlockSizeUser` 在 `digest 0.11` 体系里由 `crypto-common` 定义，而 `digest`
-    // 以 `pub use common` 再导出该 crate。不要写 `digest::block_buffer::*`——
-    // 那个模块（包名已改为 `crypto-common`，模块名是历史沿用）并不再导出此 trait。
     use hmac::digest::common::BlockSizeUser;
     use hmac::digest::{Digest, KeyInit, Mac};
 
-    /// 按算法分派到泛型实现。
+    /// Dispatches to the generic implementation by algorithm.
     ///
-    /// 写成嵌套函数是为了让 `D` 的约束只在一处出现，避免调用方被泛型纠缠。
-    ///
-    /// 注意 `SimpleHmac` 实现的是 `Mac`（含 `update` / `finalize`），**不是**
-    /// `Digest`——虽然其类型参数 `D` 必须是 `Digest`。写成 `Digest::update` 会
-    /// 编译失败。
+    /// Note that `SimpleHmac` implements `Mac` (with `update` / `finalize`),
+    /// **not** `Digest` — even though its type parameter `D` must be `Digest`.
+    /// Calling `Digest::update` would not compile.
     fn digest_with<D>(key: &[u8], message: &[u8]) -> Option<Vec<u8>>
     where
         D: Digest + BlockSizeUser,
     {
-        // `KeyInit::new_from_slice` 唯一失败情形是「密钥长度非法」。HMAC 明确
-        // 接受任意长度密钥（超长会先做哈希压缩），故此处实际不会失败；
-        // 用 `ok()?` 而非 `unwrap` 以满足「库内禁 panic」。
         let mut mac = <hmac::SimpleHmac<D> as KeyInit>::new_from_slice(key).ok()?;
         Mac::update(&mut mac, message);
         Some(Mac::finalize(mac).into_bytes().to_vec())
@@ -351,13 +348,10 @@ fn hmac_truncate(secret: &OtpSecret, algorithm: Algorithm, message: &[u8]) -> u3
         Algorithm::Sha512 => digest_with::<Sha512>(secret.expose(), message),
     };
 
-    // 万一将来约束被破坏，结果是恒定错误的验证码，而不是崩溃。
     let Some(bytes) = digest else {
         return 0;
     };
 
-    // 摘要长度由算法保证 ≥ 20 字节，故偏移与切片恒在界内。
-    // 仍然做条件判断而非直接索引，以便未来新增算法时不会悄悄越界。
     let Some(last) = bytes.last() else {
         return 0;
     };
@@ -367,33 +361,32 @@ fn hmac_truncate(secret: &OtpSecret, algorithm: Algorithm, message: &[u8]) -> u3
     }
     let truncated = &bytes[offset..offset + 4];
 
-    // 组装大端 31 位整数。用 fold 而非 `u32::from_be_bytes` + `try_into`，
-    // 以避免为固定 4 字节引入 panic 路径。
     let value = truncated
         .iter()
         .fold(0_u32, |acc, &b| (acc << 8) | u32::from(b));
     value & 0x7fff_ffff
 }
 
-/// 计算 HOTP 数值（RFC 4226）。
+/// Computes the HOTP value (RFC 4226).
 ///
-/// `counter` 是 8 字节大端计数器。[`Digits::Six`] 时返回 0..=999_999。
+/// `counter` is an 8-byte big-endian counter. Returns 0..=999_999 for
+/// [`Digits::Six`].
 ///
-/// 需要定宽字符串（含前导零）时用 [`hotp_code`]。
+/// Use [`hotp_code`] for a fixed-width string with leading zeros.
 #[must_use]
 pub fn hotp(secret: &OtpSecret, counter: u64, algorithm: Algorithm, digits: Digits) -> u32 {
     let truncated = hmac_truncate(secret, algorithm, &counter.to_be_bytes());
     truncated % digits.modulus()
 }
 
-/// 计算 TOTP 数值（RFC 6238）。
+/// Computes the TOTP value (RFC 6238).
 ///
-/// `unix_time` 是 Unix 秒（**由调用方提供，本模块不读时钟**）。
-/// `period` 为 0 时返回 [`Error::InvalidPeriod`]。
+/// `unix_time` is Unix seconds (**supplied by the caller; this module does not
+/// read the clock**). A `period` of 0 returns [`Error::InvalidPeriod`].
 ///
-/// # 错误
+/// # Errors
 ///
-/// `period == 0` 会导致除零，故必须拒绝。
+/// `period == 0` would divide by zero, so it must be rejected.
 pub fn totp(
     secret: &OtpSecret,
     unix_time: u64,
@@ -407,22 +400,22 @@ pub fn totp(
     Ok(hotp(secret, unix_time / period, algorithm, digits))
 }
 
-/// 把 OTP 数值格式化为**定宽**十进制字符串（含前导零）。
+/// Formats an OTP value as a **fixed-width** decimal string with leading zeros.
 ///
-/// 这是显示给用户的最终形式。前导零不能丢——`012345` 与 `12345` 是不同的验证码。
+/// This is the final form shown to the user. Leading zeros must not be dropped —
+/// `012345` and `12345` are different codes.
 #[must_use]
 pub fn format_code(value: u32, digits: Digits) -> String {
-    // 用 `{:0width$}` 而非手动补零：格式化宏直接处理宽度与补零，且不分配中间缓冲。
     format!("{:0width$}", value, width = digits.count() as usize)
 }
 
-/// 计算 HOTP 并直接返回定宽字符串。
+/// Computes HOTP and returns the fixed-width string directly.
 #[must_use]
 pub fn hotp_code(secret: &OtpSecret, counter: u64, algorithm: Algorithm, digits: Digits) -> String {
     format_code(hotp(secret, counter, algorithm, digits), digits)
 }
 
-/// 计算 TOTP 并直接返回定宽字符串。
+/// Computes TOTP and returns the fixed-width string directly.
 pub fn totp_code(
     secret: &OtpSecret,
     unix_time: u64,
@@ -436,17 +429,13 @@ pub fn totp_code(
     ))
 }
 
-/// 以**常量时间**比较两个 OTP 字符串。
+/// Compares two OTP strings in **constant time**.
 ///
-/// # 为什么不能用 `==`
+/// The comparison is constant time: `==` short-circuits at the first differing character, so its
+/// comparison time leaks how many leading characters are correct. A length mismatch returns
+/// `false` immediately, which is safe — the length is not a secret.
 ///
-/// `==` 在首个不同字符处短路返回，比较耗时因而泄露「前多少个字符是对的」——
-/// 攻击者可据此逐位爆破验证码。虽然网络抖动通常足以掩盖这类差异，但**远程计时
-/// 攻击在 TOTP 上是有实际先例的**，且常量时间比较的成本几乎为零。
-///
-/// 长度不等时立即返回 `false` 是安全的：长度不是秘密。
-///
-/// # 示例
+/// # Examples
 ///
 /// ```
 /// use qualia2fa_core::otp::{self, Algorithm, Digits, OtpSecret};
@@ -467,22 +456,22 @@ pub fn verify_code(expected: &str, provided: &str) -> bool {
     a.ct_eq(b).into()
 }
 
-/// 校验提供的时间步是否落在允许的漂移窗口内，并返回命中的偏移量。
+/// Checks whether the supplied time step lies inside the allowed drift window
+/// and returns the offset that matched.
 ///
-/// 返回 `Some(offset)` 表示 `provided_counter == counter + offset` 成立，
-/// `offset ∈ [-window, +window]`。返回 `None` 表示窗口内均不匹配。
+/// `Some(offset)` means `provided_counter == counter + offset` holds for an
+/// `offset ∈ [-window, +window]`; `None` means nothing in the window matched.
 ///
-/// # 为什么要返回偏移量而不是 `bool`
+/// The matched offset is handed out so a caller can **calibrate the server counter to the
+/// matching step** after a hit without recomputing it.
 ///
-/// 调用方通常需要在命中后**把服务端计数器校准到命中值**，否则用户每次都要
-/// 依赖漂移窗口。把偏移量交出去，校准逻辑就不必重算一遍。
+/// # Window direction
 ///
-/// # 窗口方向
-///
-/// `window = 1` 时检查 `counter-1`、`counter`、`counter+1` 共 3 个时间步。
-/// **先检查当前步**，命中即返回 0——绝大多数请求都是当前步命中，这样能让
-/// 常见路径最快返回。注意这**不构成计时泄露**：偏移量本来就是攻击者已知的
-/// 输入，泄露它无意义；真正的秘密是种子。
+/// With `window = 1` the steps `counter-1`, `counter` and `counter+1` are
+/// checked — 3 in total. **The current step is checked first** and returns 0 on a
+/// hit, which makes the common path return fastest. This is **not a timing
+/// leak**: the offset is attacker-known input anyway, so leaking it means
+/// nothing; the real secret is the seed.
 #[must_use]
 pub fn verify_with_drift(
     secret: &OtpSecret,
@@ -492,7 +481,7 @@ pub fn verify_with_drift(
     digits: Digits,
     provided_code: &str,
 ) -> Option<i64> {
-    /// 检查单个偏移量。返回是否匹配。
+    /// Checks one offset. Returns whether it matched.
     fn matches(
         secret: &OtpSecret,
         counter: u64,
@@ -508,7 +497,6 @@ pub fn verify_with_drift(
         verify_code(&expected, provided_code)
     }
 
-    // 当前步优先。
     if matches(
         secret,
         provided_counter,
@@ -519,10 +507,8 @@ pub fn verify_with_drift(
     ) {
         return Some(0);
     }
-    // 其余偏移按「离当前步由近到远」的顺序检查，使常见情况尽早返回。
     for distance in 1..=window {
         let Ok(distance_i64) = i64::try_from(distance) else {
-            // window 超过 i64 范围时不可能有合法偏移，直接停止。
             break;
         };
         if matches(
@@ -549,20 +535,21 @@ pub fn verify_with_drift(
     None
 }
 
-/// Steam Guard 使用的自定义字母表（去掉了易混字符）。
+/// Custom alphabet used by Steam Guard (visually confusable characters removed).
 const STEAM_ALPHABET: &[u8; 26] = b"23456789BCDFGHJKMNPQRTVWXY";
 
-/// Steam Guard 验证码位数恒为 5。
+/// The Steam Guard code length is always 5.
 pub const STEAM_DIGITS: usize = 5;
 
-/// 计算 Steam Guard 验证码。
+/// Computes a Steam Guard code.
 ///
-/// Steam 不用十进制：它把 31 位截断值反复对 26 取模，映射到
-/// `23456789BCDFGHJKMNPQRTVWXY` 这个去掉了 `0/O/1/I/L/S/U` 等易混字符的字母表。
-/// 5 位固定长度。
-//
-// 说明：此处刻意**不加** `#[must_use]`——返回类型是 `Result<String>`，
-// 二者本身都已标记 `must_use`，再加会触发 clippy 的 `double_must_use`。
+/// Steam does not use decimal digits: it repeatedly reduces the 31-bit truncated
+/// value modulo 26 and maps the remainders onto the alphabet
+/// `23456789BCDFGHJKMNPQRTVWXY`, which drops confusable characters such as
+/// `0/O/1/I/L/S/U`. The length is a fixed 5 characters.
+///
+/// No `#[must_use]` here: the `Result<String>` return type already carries it,
+/// and adding another would trip clippy's `double_must_use`.
 pub fn steam_guard_code(
     secret: &OtpSecret,
     unix_time: u64,
@@ -577,23 +564,18 @@ pub fn steam_guard_code(
     let mut out = String::with_capacity(STEAM_DIGITS);
     for _ in 0..STEAM_DIGITS {
         let index = (value % STEAM_ALPHABET.len() as u32) as usize;
-        // 字母表固定 26 项且索引来自取模，恒在界内。
         out.push(char::from(STEAM_ALPHABET[index]));
         value /= STEAM_ALPHABET.len() as u32;
     }
     Ok(out)
 }
 
-// 说明：本模块的测试向量放在 `tests/rfc_vectors.rs`（集成测试）而不是此处，
-// 因为 RFC 4226 附录 D 与 RFC 6238 附录 B 的向量是**验收标准**，值得作为独立
-// 测试文件存在以便审阅时一眼看到全貌。此处只放实现细节的单元测试。
-//
-// 但下面这条测试必须留在模块内：它验证 `Zeroize` 的接线，属于实现细节。
-
-/// 让 `zeroize` 的导入有实际用途，并锁住「种子在被替换时会先擦除」的语义。
+/// Gives the `zeroize` import a real use and pins the semantics of "a secret is
+/// erased before it is replaced".
 ///
-/// `SecretBox<[u8]>` 自身已实现 `ZeroizeOnDrop`；这里额外确认 `Vec<u8>`
-/// 在交给构造器前若被中途丢弃，也能被显式擦除。
+/// `SecretBox<[u8]>` already implements `ZeroizeOnDrop`; this additionally
+/// confirms that a `Vec<u8>` dropped before it reaches the constructor can be
+/// erased explicitly.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,12 +607,12 @@ mod tests {
         }
     }
 
-    /// 多字节字符的截断必须在字符边界发生，否则会 panic。
+    /// Truncating a multibyte string must happen at a character boundary,
+    /// otherwise it panics.
     #[test]
     fn truncate_for_error_handles_multibyte_boundary() {
-        let long = "算".repeat(20); // 每个字符 3 字节
+        let long = "算".repeat(20);
         let text = truncate_for_error(&long);
-        // 不应 panic，且结果应是原串的前缀加省略号。
         assert!(text.ends_with('…'), "应带省略号：{text}");
         assert!(long.starts_with(text.trim_end_matches('…')));
     }
@@ -705,7 +687,6 @@ mod tests {
 
     #[test]
     fn short_secret_is_flagged_but_accepted() {
-        // 真实世界存在短种子；核心层不得拒绝，只负责标记。
         let secret = OtpSecret::from_bytes(vec![1, 2, 3, 4]).expect("非空短种子应被接受");
         assert!(secret.is_shorter_than_recommended(Algorithm::Sha1));
         assert_eq!(secret.len(), 4);
@@ -723,7 +704,8 @@ mod tests {
         assert!(!verify_code("123456", ""));
     }
 
-    /// `verify_with_drift` 必须能找到窗口内的偏移，并报告正确的偏移量。
+    /// `verify_with_drift` must find offsets inside the window and report the
+    /// correct one.
     #[test]
     fn drift_window_finds_neighbouring_steps() {
         let secret = OtpSecret::from_bytes((0..20).collect::<Vec<u8>>()).expect("非空");
@@ -731,7 +713,6 @@ mod tests {
         let now = 1_700_000_000_u64;
         let counter = now / period;
 
-        // 分别用 -1、0、+1 步的验证码去校验，偏移量应被正确报出。
         for expected_offset in [-1_i64, 0, 1] {
             let target = counter.checked_add_signed(expected_offset).expect("不越界");
             let code = hotp_code(&secret, target, Algorithm::Sha1, Digits::Six);
@@ -753,12 +734,12 @@ mod tests {
         );
     }
 
-    /// 计数器为 0 且窗口向左扩展时不得下溢 panic。
+    /// A counter of 0 with the window extended to the left must neither
+    /// underflow nor panic.
     #[test]
     fn drift_window_handles_counter_underflow() {
         let secret = OtpSecret::from_bytes(vec![7_u8; 20]).expect("非空");
         let code = hotp_code(&secret, 0, Algorithm::Sha1, Digits::Six);
-        // counter = 0 时向左检查会下溢，必须安全返回而不是 panic。
         let got = verify_with_drift(&secret, 0, 3, Algorithm::Sha1, Digits::Six, &code);
         assert_eq!(got, Some(0), "当前步应命中");
     }
@@ -777,7 +758,8 @@ mod tests {
         }
     }
 
-    /// Steam 码随时间步变化——若恒定不变说明计数器没被用上。
+    /// Steam codes change with the time step — a constant code would mean the
+    /// counter is not being used.
     #[test]
     fn steam_codes_change_across_steps() {
         let secret = OtpSecret::from_bytes((0..20).collect::<Vec<u8>>()).expect("非空");
@@ -786,7 +768,8 @@ mod tests {
         assert_ne!(a, b, "相邻时间步应产出不同 Steam 码");
     }
 
-    /// 借出接口只为测试提供的内部方法，确保其语义与公开路径一致。
+    /// Exercises the crate-internal borrow accessor and checks that its
+    /// semantics match the public path.
     #[test]
     fn internal_expose_matches_public_secret() {
         let secret = OtpSecret::from_bytes(vec![1, 2, 3]).expect("非空");
@@ -794,7 +777,8 @@ mod tests {
         assert_eq!(secret.len(), 3);
     }
 
-    /// 显式擦除：确认 `Vec<u8>` 的 `zeroize` 可用（供将来处理中间缓冲）。
+    /// Explicit erasure: confirms `zeroize` is usable on `Vec<u8>` (for
+    /// intermediate buffers).
     #[test]
     fn zeroize_is_available_for_intermediate_buffers() {
         let mut buffer = vec![0xAA_u8; 16];
@@ -802,7 +786,8 @@ mod tests {
         assert!(buffer.iter().all(|&b| b == 0), "擦除后应全为零");
     }
 
-    /// `SecretBox` 的 `expose_secret` 通过 trait 提供；此处确认导入可用。
+    /// `SecretBox::expose_secret` is provided through a trait; this confirms the
+    /// import is usable.
     #[test]
     fn secret_box_expose_is_reachable() {
         let boxed: SecretBox<[u8]> = vec![1_u8, 2, 3].into();

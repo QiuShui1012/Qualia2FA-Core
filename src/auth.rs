@@ -13,99 +13,97 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! 挑战-应答：向对方证明「我持有主密钥」，而不把主密钥交出去。
+//! Challenge-response: prove possession of the master key without handing it over.
 //!
-//! # 为什么需要它
+//! # What it does
 //!
-//! [`crate::pairing`] 解决「怎么把主密钥交给一台新设备」。但两台**已经配对过**的
-//! 设备之后要反复通信（M4 的同步就是），每次重新扫二维码显然不可接受，而直接互发
-//! 主密钥更不行——那等于把主密钥撒在信道上。
+//! [`crate::pairing`] covers handing the master key to a new device. Two devices that are
+//! **already paired** then communicate repeatedly (the sync layer does), and re-scanning a
+//! QR code every time is not acceptable, while sending the master key itself is worse —
+//! that would put it on the wire.
 //!
-//! 本模块给出这一层的答案：**持有**主密钥本身就可以作为身份凭证，只要能在不泄露
-//! 它的前提下证明这一点。做法是标准的挑战-应答。
+//! Holding the master key is itself a credential, provided possession can be proven without
+//! revealing it. This module implements that proof as a standard challenge-response
+//! exchange.
 //!
-//! # 与配对协议的分工
+//! # Division of labour with the pairing protocol
 //!
-//! | | 配对（[`crate::pairing`]） | 挑战-应答（本模块） |
+//! | | Pairing ([`crate::pairing`]) | Challenge-response (this module) |
 //! |---|---|---|
-//! | 前提 | 双方**没有**共同的秘密 | 双方**已经**有共同的主密钥 |
-//! | 目的 | 建立共同秘密 | 确认对方仍然持有它 |
-//! | 是否传主密钥 | 是（加密后） | **否** |
-//! | 抗中间人 | 靠二维码带外认证 | **不提供**（见下） |
+//! | Precondition | the two sides share **no** secret | the two sides **already** share the master key |
+//! | Goal | establish a shared secret | confirm the other side still holds it |
+//! | Sends the master key | yes, encrypted | **no** |
+//! | Man-in-the-middle resistance | out-of-band authentication through the QR code | **not provided** (see below) |
 //!
-//! ## 本模块不抗中间人，这是刻意的
+//! ## This module does not resist man in the middle, deliberately
 //!
-//! 中间人能否冒充，取决于它能不能通过应答。攻击者没有主密钥，就算不出 tag，
-//! 于是冒充失败——**这一点是成立的**。但主动中间人可以**转发**双方的消息，让两端
-//! 都以为在与对方通话。这是所有非信道绑定协议的共同限制。
+//! Whether a man in the middle can impersonate a peer depends on passing the response. An
+//! attacker without the master key cannot compute the tag, so impersonation fails. An
+//! **active** man in the middle can still **forward** the two sides' messages and make both
+//! believe they are talking to each other; that is a limitation shared by every protocol
+//! that is not channel-bound.
 //!
-//! 不在这里解决它的理由：本项目的通信目标是「同一 WiFi / 热点 / 二维码」，而
-//! M4.5 会用 iroh 建连，那里有基于 `EndpointId` 的信道绑定。把抗中间人压进这一层
-//! 会让它依赖具体传输方式，而本层刻意做成**传输无关**的。
+//! This layer is deliberately **transport-agnostic**, so it does not solve that problem
+//! itself. A caller that needs man-in-the-middle resistance should **bind** this layer's
+//! session identifier to the peer identity of the transport and verify the pair:
+//! [`Verified::session_id`] and [`Responder::session_id`] exist to provide an anchor that
+//! both sides agree on and that is determined by both sides' inputs.
 //!
-//! 需要抗中间人时，调用方应当把本层的会话标识与传输层的对端身份**绑定起来**校验
-//! ——[`Verified::session_id`] 与 [`Responder::session_id`] 存在的意义就是提供这个
-//! 双方一致、且由双方输入共同决定的锚点。
+//! A **responder** (`Responder`) that does not know who the presented ephemeral public key
+//! belongs to can likewise be led by a man in the middle: the verifier side only obtains the
+//! session identifier after [`Verifier::verify`] succeeds, so a caller should check that
+//! identifier against the transport once authentication completes, before exchanging any
+//! data.
 //!
-//! 另外，**应答方（`Responder`）不知道自己面对的临时公钥属于谁**时也可能被中间人
-//! 牵着走：验证方一侧在 [`Verifier::verify`] 成功后才拿到会话标识，因此调用方应当
-//! 等认证完成后、在开始交换任何数据之前，拿这个标识去核对传输层。
-//!
-//! # 协议
+//! # Protocol
 //!
 //! ```text
-//!   A（验证方）                                B（应答方）
+//!   A (verifier)                            B (responder)
 //!       │                                          │
-//!       │ ① 生成临时密钥对 (a, A_pub) 与随机 nonce_A
-//!       │ ──────── 挑战 = { A_pub, nonce_A } ─────► │
+//!       │ ① generate an ephemeral key pair (a, A_pub) and a random nonce_A
+//!       │ ────── challenge = { A_pub, nonce_A } ─► │
 //!       │                                          │ ② S = ECDH(b, A_pub)
-//!       │                                          │    从主密钥派生 K_proof
+//!       │                                          │    derive K_proof from the master key
 //!       │                                          │    tag = HMAC(K_proof, sid)
-//!       │ ◄── 应答 = { B_pub, nonce_B, 设备公钥, ─── │    sid = H(A_pub‖n_A‖B_pub‖n_B)
-//!       │        tag, 设备签名 } ────────────────── │
-//!       │ ③ 复算 tag，比对                           │
-//!       │    验证设备签名（证明是哪台设备）            │
-//!       │ ──────── 确认 = HMAC(K_confirm, sid) ───► │ ④ 校验确认
+//!       │ ◄── response = { B_pub, nonce_B, device ─ │    sid = H(A_pub‖n_A‖B_pub‖n_B)
+//!       │       public key, tag, signature } ───── │
+//!       │ ③ recompute the tag and compare          │
+//!       │    verify the device signature           │
+//!       │ ────── confirm = HMAC(K_confirm, sid) ─► │ ④ check the confirmation
 //!       │                                          │
 //! ```
 //!
-//! ## 为什么 tag 还要绑 ECDH
+//! `sid` contains **both** sides' ephemeral public keys and nonces, and the ECDH shared
+//! secret takes part in the derivation as the HKDF salt. The tag's key comes from the
+//! **master key** (the only source of "proves possession of it"), while its input has to
+//! contain something **only A and B can compute**, so A feeds the nonce its peer claims into
+//! its own transcript, not only its own. Therefore:
 //!
-//! tag 的密钥来自**主密钥**（这是「证明持有它」的唯一来源），但它的输入里必须有
-//! **只有 A 与 B 能算出的**东西。
+//! - the attacker changes any field → the two sides compute different `sid`s → the tag does not match.
+//! - the attacker replays a whole response into a new session → the new `A_pub`/`nonce_A` make `sid` differ → no match.
+//! - the attacker has no master key → it cannot compute the tag.
 //!
-//! 否则会这样：攻击者录下一条 `tag = HMAC(K_proof, nonce_A)`，然后自己扮演 B，
-//! 等 A 发来**新的**挑战、把抢到的 `nonce_A` 冒充成自己的 `nonce_B` 回过去。A 复算
-//! `HMAC(K_proof, 它自己刚生成的 nonce_A)`——对不上。**关键在于 A 必须把对方声称的
-//! nonce 纳入自己的 transcript**，而不是只用自己的那个。
+//! The tag proves "the peer holds the master key", and **any** device holding the master key
+//! can compute it. A caller that needs to know "which device is answering" adds a device
+//! identity signature (ECDSA P-256, see [`qualia_dik::device`]). The two prove different
+//! things, so both are present:
 //!
-//! 本实现的做法是让 `sid` 同时包含**双方**的临时公钥与 nonce，并由 ECDH 的共享
-//! 秘密作为 HKDF 的 salt 参与派生。于是：
+//! - tag → "you do hold the master key" (**unforgeable**, even if the attacker controls the channel)
+//! - signature → "you are device X" (forgeable by whoever holds X's private key, which is the definition of X)
 //!
-//! - 攻击者改任何一个字段 → 双方算出不同的 `sid` → tag 不匹配。
-//! - 攻击者重放整条应答到新会话 → 新的 `A_pub`/`nonce_A` 让 `sid` 不同 → 不匹配。
-//! - 攻击者没有主密钥 → 算不出 tag。
+//! The signature covers `sid` and both sides' public values, so one device's signature
+//! **cannot** be transplanted into another session.
 //!
-//! ## 为什么还要设备签名
+//! # Replay protection
 //!
-//! tag 证明的是「对方持有主密钥」——但**任何**持有主密钥的设备都能算出它。若调用方
-//! 需要知道「现在回答的是哪一台设备」，就必须叠加设备身份签名（ECDSA P-256，见
-//! [`qualia_dik::device`]）。两者证明的事情不同，因此都要有：
+//! Three layers, all required:
 //!
-//! - tag → 「你确实有主密钥」（**不可伪造**，即使攻击者控制了信道）
-//! - 签名 → 「你是设备 X」（可由持有 X 私钥的一方伪造，而那正是 X 的定义）
-//!
-//! 签名覆盖 `sid` 与双方的公开值，因此**不能**把某台设备的签名移植到别的会话上。
-//!
-//! # 重放防护
-//!
-//! 三层，缺一不可：
-//!
-//! 1. **输入层**：`sid` 由双方的临时公钥与 nonce 共同决定，每次会话都不同。
-//! 2. **会话层**：[`Verifier::verify`] 收 `self`，类型系统保证同一个挑战不会被
-//!    验证两次。
-//! 3. **跨重启**：调用方可以把用过的 `sid` 记进 [`crate::pairing::NonceLog`]，
-//!    从而在进程重启后仍然认出「这次会话我处理过」。
+//! 1. **Input**: `sid` is determined by both sides' ephemeral public keys and nonces, and
+//!    differs for every session.
+//! 2. **Session**: [`Verifier::verify`] takes `self`, so the type system guarantees one
+//!    challenge cannot be verified twice.
+//! 3. **Across restarts**: a caller can record used `sid`s in [`crate::pairing::NonceLog`]
+//!    and keep recognising "this session was already handled" after a process restart.
 
 use crate::pairing::{CONFIRMATION_LEN, NONCE_LEN, PUBLIC_KEY_LEN, SESSION_ID_LEN};
 use crate::vault::MasterKey;
@@ -120,55 +118,57 @@ use qualia_dik::{DevicePublicKey, DeviceSignature};
 use secrecy::zeroize::Zeroize;
 use sha2::{Digest, Sha256};
 
-/// 挑战的字节长度：`A_pub ‖ nonce_A`。
+/// Byte length of the challenge: `A_pub ‖ nonce_A`.
 pub const CHALLENGE_LEN: usize = PUBLIC_KEY_LEN + NONCE_LEN;
 
-/// 应答**不含签名**部分的字节长度：`B_pub ‖ nonce_B ‖ 设备公钥 ‖ tag`。
+/// Byte length of the response **without its signature**: `B_pub ‖ nonce_B ‖ device public key ‖ tag`.
 pub const RESPONSE_LEN: usize = PUBLIC_KEY_LEN + NONCE_LEN + PUBLIC_KEY_LEN + CONFIRMATION_LEN;
 
-/// 应答的完整字节长度（含设备签名）。
+/// Full byte length of the response, including the device signature.
 pub const RESPONSE_SIGNED_LEN: usize = RESPONSE_LEN + qualia_dik::device::SIGNATURE_LEN;
 
-/// 确认标签的字节长度。
+/// Byte length of the confirmation tag.
 pub const CONFIRM_LEN: usize = CONFIRMATION_LEN;
 
-/// 从主密钥派生证明密钥的域分离串。
+/// Domain-separation string for the proof key derived from the master key.
 const HKDF_INFO_PROOF: &[u8] = b"Qualia2FA auth v1 proof key";
 
-/// 从主密钥派生确认密钥的域分离串。
+/// Domain-separation string for the confirmation key derived from the master key.
 const HKDF_INFO_CONFIRM: &[u8] = b"Qualia2FA auth v1 confirm key";
 
-/// 证明标签的域分离串。
+/// Domain-separation string for the proof tag.
 const PROOF_LABEL: &[u8] = b"Qualia2FA auth v1 proof";
 
-/// 确认标签的域分离串。
+/// Domain-separation string for the confirmation tag.
 const CONFIRM_LABEL: &[u8] = b"Qualia2FA auth v1 confirm";
 
-/// 会话标识的域分离串。
+/// Domain-separation string for the session identifier.
 const SESSION_LABEL: &[u8] = b"Qualia2FA auth v1 session";
 
-/// 设备签名覆盖消息的域分离串。
+/// Domain-separation string for the message covered by the device signature.
 const SIGNATURE_LABEL: &[u8] = b"Qualia2FA auth v1 device signature";
 
-/// 验证方 A：已发出挑战，等待应答。
+/// Verifier A: has sent a challenge and awaits the response.
 ///
-/// # 一次性
+/// # Single use
 ///
-/// [`Verifier::verify`] 收 `self`。同一个挑战不可能被验证两次——这条约束由类型系统
-/// 保证，因此「攻击者重放应答」在会话层面直接不成立：没有会话可以传进去。
+/// [`Verifier::verify`] takes `self`, so one challenge cannot be verified twice. That
+/// constraint is enforced by the type system, which rules out replaying a response at the
+/// session level: there is no session left to pass it to.
 ///
-/// 临时私钥在 `Drop` 时由 `p256` 擦除（`EphemeralSecret` 实现 `ZeroizeOnDrop`）。
+/// The ephemeral private key is erased on `Drop` by `p256` (`EphemeralSecret` implements
+/// `ZeroizeOnDrop`).
 pub struct Verifier {
-    /// 本方的临时私钥。
+    /// This side's ephemeral private key.
     secret: EphemeralSecret,
-    /// 本方生成的 nonce。
+    /// The nonce generated by this side.
     nonce: [u8; NONCE_LEN],
-    /// 本方临时公钥的 SEC1 编码。
+    /// SEC1 encoding of this side's ephemeral public key.
     public_key: [u8; PUBLIC_KEY_LEN],
 }
 
 impl Verifier {
-    /// 要发给应答方的挑战字节。
+    /// The challenge bytes to send to the responder.
     #[must_use]
     pub fn challenge(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(CHALLENGE_LEN);
@@ -177,39 +177,47 @@ impl Verifier {
         out
     }
 
-    /// 本方（验证方）的临时公钥。
+    /// This side's (the verifier's) ephemeral public key.
     #[must_use]
     pub const fn public_key(&self) -> &[u8; PUBLIC_KEY_LEN] {
         &self.public_key
     }
 
-    /// 本方 nonce。
+    /// This side's nonce.
     #[must_use]
     pub const fn nonce(&self) -> &[u8; NONCE_LEN] {
         &self.nonce
     }
 
-    /// 校验应答，并生成要发回的确认标签。
+    /// Verify the response and produce the confirmation tag to send back.
     ///
-    /// # 参数
+    /// # Parameters
     ///
-    /// - `response`: 应答方给出的完整应答（含签名）。
-    /// - `master`: 本方持有的主密钥。**它只用于复算 tag，不会出现在任何输出里。**
+    /// - `response`: the responder's full response, signature included.
+    /// - `master`: the master key held by this side. It is used **only** to recompute the
+    ///   tag and never appears in any output.
     ///
-    /// # 返回
+    /// # Returns
     ///
-    /// [`Verified`]：对方的设备身份、会话标识、以及要发回的确认标签。
+    /// [`Verified`]: the peer's device identity, the session identifier, and the
+    /// confirmation tag to send back.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// - 长度不对、或其中的公钥不是合法曲线点：[`Error::AuthMessageMalformed`]
-    /// - **tag 不匹配**（对方没有主密钥）：[`Error::AuthProofFailed`]
-    /// - **设备签名不通过**：[`Error::DeviceSignatureInvalid`]
+    /// - wrong length, or a public key that is not a valid curve point:
+    ///   [`Error::AuthMessageMalformed`]
+    /// - **tag mismatch** (the peer has no master key): [`Error::AuthProofFailed`]
+    /// - **device signature does not verify**: [`Error::DeviceSignatureInvalid`]
     ///
-    /// 后两者**刻意分开**：tag 失败意味着「对方没有主密钥」，签名失败意味着「对方
-    /// 有主密钥，但不是它声称的那台设备」。这两种情况对使用者的含义完全不同（前者
-    /// 危险，后者通常只是设备身份换了），而且都不涉及秘密值——攻击者从一个失败结果
-    /// 里能学到的，只有它已经知道的事情。
+    /// The checks run in this order: response length and SEC1 decoding of both public keys,
+    /// then the tag, then the device signature. The device public key is validated because it
+    /// is handed to the caller as the answer to "who is the peer".
+    ///
+    /// The last two errors are **deliberately distinct**: a tag failure means "the peer has
+    /// no master key", a signature failure means "the peer has the master key but is not the
+    /// device it claims to be". The two mean very different things to a user (the first is
+    /// dangerous, the second usually just means the device identity changed), and neither
+    /// involves secret values — a failure tells an attacker only what it already knew.
     pub fn verify(self, response: &[u8], master: &MasterKey) -> Result<Verified> {
         if response.len() != RESPONSE_SIGNED_LEN {
             return Err(Error::AuthMessageMalformed {
@@ -233,7 +241,6 @@ impl Verifier {
                 reason: "应答里的临时公钥不是合法的 P-256 SEC1 点",
             }
         })?;
-        // 设备公钥必须验证：它会被交给调用方当作「对方是谁」的结论。
         let device_key = DevicePublicKey::from_sec1_bytes(&device_public).map_err(|_| {
             Error::AuthMessageMalformed {
                 reason: "应答里的设备公钥不是合法的 P-256 SEC1 点",
@@ -253,8 +260,6 @@ impl Verifier {
             return Err(Error::AuthProofFailed);
         }
 
-        // 设备签名：覆盖会话标识 + 双方的临时公钥与 nonce + tag。因此签名不能从
-        // 别的会话搬过来，也不能配在别的 tag 上。
         let message = signature_message(
             &session_id,
             &self.public_key,
@@ -288,45 +293,48 @@ impl core::fmt::Debug for Verifier {
     }
 }
 
-/// [`Verifier::verify`] 的结果。
+/// The result of [`Verifier::verify`].
 pub struct Verified {
-    /// 本次会话的标识（双方一致）。
+    /// Identifier of this session (both sides agree on it).
     session_id: [u8; SESSION_ID_LEN],
-    /// 对方的设备身份公钥（强类型）。
+    /// The peer's device identity public key (strongly typed).
     device_key: DevicePublicKey,
-    /// 对方的设备身份公钥（SEC1 原始字节，供调用方自行解释／落库）。
+    /// The peer's device identity public key (raw SEC1 bytes, for the caller to interpret or store).
     device_public: [u8; PUBLIC_KEY_LEN],
-    /// 派生出的确认密钥。
+    /// The derived confirmation key.
     confirm: [u8; 32],
 }
 
 impl Verified {
-    /// 会话标识。
+    /// Session identifier.
     ///
-    /// 调用方应当把它与传输层的对端身份绑定校验，否则中间人可以转发消息（见模块
-    /// 文档「不抗中间人」一节）。
+    /// A caller should bind-verify it against the peer identity of the transport, otherwise a
+    /// man in the middle can forward messages (see the "does not resist man in the middle"
+    /// section of the module documentation).
     #[must_use]
     pub const fn session_id(&self) -> &[u8; SESSION_ID_LEN] {
         &self.session_id
     }
 
-    /// 对方的设备身份公钥。
+    /// The peer's device identity public key.
     #[must_use]
     pub const fn device_key(&self) -> &DevicePublicKey {
         &self.device_key
     }
 
-    /// 对方的设备身份公钥的 SEC1 编码。
+    /// SEC1 encoding of the peer's device identity public key.
     #[must_use]
     pub const fn device_public(&self) -> &[u8; PUBLIC_KEY_LEN] {
         &self.device_public
     }
 
-    /// 要发回应答方的确认标签。
+    /// The confirmation tag to send back to the responder.
     ///
-    /// 应答方据此确认「对面确实有主密钥」。**单向认证是不够的**：只验证应答方时，
-    /// 攻击者可以冒充验证方去骗取一次成功的应答——虽然拿不到主密钥，但能让应答方
-    /// 误以为自己在与合法设备通信，从而愿意继续交换数据。
+    /// It lets the responder confirm that the other side really holds the master key.
+    /// **One-way authentication is not enough**: if only the responder were verified, an
+    /// attacker could impersonate the verifier and solicit one successful response. It would
+    /// not obtain the master key, but the responder would believe it was talking to a
+    /// legitimate device and go on to exchange data.
     #[must_use]
     pub fn confirmation(&self) -> [u8; CONFIRM_LEN] {
         confirm_tag(&self.confirm, &self.session_id)
@@ -343,22 +351,22 @@ impl core::fmt::Debug for Verified {
     }
 }
 
-/// 应答方 B：已收到挑战。
+/// Responder B: has received the challenge.
 pub struct Responder {
-    /// 本方的临时私钥。
+    /// This side's ephemeral private key.
     secret: EphemeralSecret,
-    /// 本方临时公钥的 SEC1 编码。
+    /// SEC1 encoding of this side's ephemeral public key.
     public_key: [u8; PUBLIC_KEY_LEN],
-    /// 本方的 nonce。
+    /// This side's nonce.
     nonce: [u8; NONCE_LEN],
-    /// 验证方的临时公钥。
+    /// The verifier's ephemeral public key.
     verifier_public: [u8; PUBLIC_KEY_LEN],
-    /// 验证方的 nonce。
+    /// The verifier's nonce.
     verifier_nonce: [u8; NONCE_LEN],
 }
 
 impl Responder {
-    /// 会话标识。
+    /// Session identifier.
     #[must_use]
     pub fn session_id(&self) -> [u8; SESSION_ID_LEN] {
         session_id_of(
@@ -369,41 +377,43 @@ impl Responder {
         )
     }
 
-    /// 本方临时公钥的 SEC1 编码。
+    /// SEC1 encoding of this side's ephemeral public key.
     #[must_use]
     pub const fn public_key(&self) -> &[u8; PUBLIC_KEY_LEN] {
         &self.public_key
     }
 
-    /// 本方 nonce。不是秘密，但**唯一**。
+    /// This side's nonce. Not a secret, but **unique**.
     #[must_use]
     pub const fn nonce(&self) -> &[u8; NONCE_LEN] {
         &self.nonce
     }
 
-    /// 生成应答。
+    /// Produce the response.
     ///
-    /// # 参数
+    /// # Parameters
     ///
-    /// - `master`: 本方持有的主密钥。**它不会出现在应答里**——只用于派生 tag。
-    /// - `device_public`: 本方设备身份公钥的 SEC1 编码。
-    /// - `sign`: 用设备私钥对**原始消息**签名的回调。
+    /// - `master`: the master key held by this side. It **never appears in the response** —
+    ///   it only derives the tag.
+    /// - `device_public`: SEC1 encoding of this side's device identity public key.
+    /// - `sign`: callback that signs the **raw message** with the device private key.
     ///
-    ///   之所以是回调而不是直接传 `DeviceSigner`：签名是平台代码（`qualia2fa-keystore`
-    ///   的 `DeviceSigner`），而**核心库不能依赖 keystore**——依赖方向是
-    ///   keystore → core。回调让这一层保持无平台依赖，也让它能在任何平台上测试。
+    ///   It is a callback rather than a `DeviceSigner` because signing is platform code
+    ///   (`DeviceSigner` from `qualia-dik`) and **the core library must not depend on
+    ///   the keystore** — the dependency direction is keystore → core. The callback keeps
+    ///   this layer free of platform dependencies and testable on any platform.
     ///
-    ///   回调收到的是**消息本身**，不是摘要。因此平台实现若要对接只吃摘要的硬件
-    ///   API（Windows CNG 的 `NCryptSignHash` 形参就叫 `pbHashValue`），应当自己
-    ///   做一次 SHA-256 再走 `sign_digest`。哈希次数只能有一处归属：
-    ///   验证侧固定走 [`qualia_dik::device::verify`]，它在标准 ECDSA 模式下**自己哈希
-    ///   一次**。签名侧若再多哈希一次，表现为每次握手都失败，而错误信息
-    ///   （"签名与公钥或消息不匹配"）完全不指向真正的原因。
+    ///   The callback receives the **message itself**, not a digest. A platform implementation
+    ///   that talks to a digest-only hardware API (Windows CNG's `NCryptSignHash` names its
+    ///   parameter `pbHashValue`) must therefore hash once with SHA-256 itself and go through
+    ///   `sign_digest`. The number of hashes has exactly one owner: the verifying side always
+    ///   goes through [`qualia_dik::device::verify`], which in standard ECDSA mode **hashes the
+    ///   message once itself**.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// - 设备公钥长度或曲线成员资格不对：[`Error::AuthMessageMalformed`]
-    /// - `sign` 返回错误时原样透传
+    /// - wrong device public key length or curve membership: [`Error::AuthMessageMalformed`]
+    /// - errors returned by `sign` are passed through unchanged
     pub fn respond(
         &self,
         master: &MasterKey,
@@ -439,13 +449,6 @@ impl Responder {
             &self.nonce,
             &tag,
         );
-        // 把**原始消息**交给回调，由调用方决定怎么签。
-        //
-        // 早期版本在这里先算好 SHA-256 摘要再传出去，结果测试里 `p256` 又在摘要上
-        // 哈希了一次——变成 `Sign(SHA256(SHA256(message)))`，而验证侧走
-        // `qualia_dik::device::verify` 只哈希一次，于是每一次握手都以
-        // `DeviceSignatureInvalid { reason: "签名与公钥或消息不匹配" }` 失败。
-        // 传消息而不是摘要，让「哈希几次」这件事只有一个归属方。
         let signature = sign(&message)?;
 
         let mut out = Vec::with_capacity(RESPONSE_SIGNED_LEN);
@@ -468,11 +471,12 @@ impl core::fmt::Debug for Responder {
     }
 }
 
-/// 验证方开始一次认证，得到要发给应答方的挑战。
+/// Start one authentication as the verifier and return the challenge to send to the
+/// responder.
 ///
-/// # 错误
+/// # Errors
 ///
-/// 只在 OS 随机源不可用时失败（[`Error::RandomnessUnavailable`]）。
+/// Fails only when the OS random source is unavailable ([`Error::RandomnessUnavailable`]).
 #[must_use = "挑战必须被发出去，否则这次认证无法开始"]
 pub fn begin() -> Result<(Vec<u8>, Verifier)> {
     let secret = EphemeralSecret::generate();
@@ -496,12 +500,16 @@ pub fn begin() -> Result<(Vec<u8>, Verifier)> {
     ))
 }
 
-/// 应答方接收挑战。
+/// Accept a challenge as the responder.
 ///
-/// # 错误
+/// # Errors
 ///
-/// - 挑战长度不对、或其中的公钥不在曲线上：[`Error::AuthMessageMalformed`]
-/// - OS 随机源不可用：[`Error::RandomnessUnavailable`]
+/// - wrong challenge length, or a public key that is not on the curve:
+///   [`Error::AuthMessageMalformed`]
+/// - the OS random source is unavailable: [`Error::RandomnessUnavailable`]
+///
+/// The verifier's ephemeral public key is checked for curve membership here, before it is
+/// handed to ECDH.
 pub fn accept(challenge: &[u8]) -> Result<Responder> {
     if challenge.len() != CHALLENGE_LEN {
         return Err(Error::AuthMessageMalformed {
@@ -513,7 +521,6 @@ pub fn accept(challenge: &[u8]) -> Result<Responder> {
     let mut verifier_nonce = [0_u8; NONCE_LEN];
     verifier_nonce.copy_from_slice(&challenge[PUBLIC_KEY_LEN..]);
 
-    // 曲外点必须在这里就拒绝：它会被送进 ECDH。
     PublicKey::from_sec1_bytes(&verifier_public).map_err(|_| Error::AuthMessageMalformed {
         reason: "挑战里的临时公钥不是合法的 P-256 SEC1 点",
     })?;
@@ -534,16 +541,20 @@ pub fn accept(challenge: &[u8]) -> Result<Responder> {
     })
 }
 
-/// 应答方校验验证方发来的确认标签。
+/// Let the responder check the confirmation tag sent back by the verifier.
 ///
-/// # 参数
+/// # Parameters
 ///
-/// `session_id` 与 `confirmation` 来自 [`Verified`] 经由通信信道传回的内容；其余由
-/// 调用方从自己的 [`Responder`] 与 `master` 提供。
+/// `session_id` and `confirmation` are what [`Verified`] returned over the communication
+/// channel; the caller supplies the rest from its own [`Responder`] and `master`.
 ///
-/// # 错误
+/// # Errors
 ///
-/// 标签不匹配时返回 [`Error::AuthProofFailed`]。
+/// Returns [`Error::AuthProofFailed`] when the tag does not match. The checks run in this
+/// order: confirmation length, the returned `session_id` against the one this responder
+/// computes, SEC1 decoding of the verifier's ephemeral public key, then the tag. A
+/// `session_id` mismatch means the two sides disagree about this session (the messages may
+/// have been substituted), and the exchange **must not** continue past it.
 pub fn confirm(
     master: &MasterKey,
     responder: &Responder,
@@ -555,8 +566,6 @@ pub fn confirm(
             reason: "确认标签长度不对",
         });
     }
-    // 校验对方回传的 session_id 与自己算出的一致：不一致说明双方对这次会话的理解
-    // 不同（可能是被换了消息），此时**不能**继续。
     if *session_id != responder.session_id() {
         return Err(Error::AuthProofFailed);
     }
@@ -573,42 +582,35 @@ pub fn confirm(
     Ok(())
 }
 
-/// 从主密钥与 ECDH 共享秘密派生出的两份密钥。
+/// The two keys derived from the master key and the ECDH shared secret.
 ///
-/// # 为什么要主密钥**和** ECDH，两个都要
-///
-/// - **主密钥**提供「只有持有它的一方能算出」这条性质。没有它，任何截获信道的人
-///   都能回答挑战。
-/// - **ECDH 共享秘密**（作为 HKDF 的 salt）把结果绑定到**这一次**会话。没有它，
-///   tag 就只是 `f(主密钥, sid)`，而 `sid` 完全由信道上可见的字节构成——攻击者
-///   可以照抄一次录下的会话，把它重放成一次「看起来全新」的会话。
-///
-/// 两者缺一不可。这也解释了为什么本模块需要 ECDH，而不只是 HMAC。
+/// The two keys are derived from the master key **and** the ECDH shared secret: the master key
+/// makes the tag computable only by a holder, and the shared secret (as the HKDF salt) binds it to
+/// **this** session, so a recorded session cannot be replayed as a brand new one even though every
+/// byte of `sid` is visible on the channel.
 struct AuthKeys {
-    /// 应答方用来证明持有主密钥的密钥。
+    /// The key the responder uses to prove it holds the master key.
     proof: [u8; 32],
-    /// 验证方用来确认的密钥。
+    /// The key the verifier uses to confirm.
     confirm: [u8; 32],
 }
 
 impl AuthKeys {
-    /// 派生。
+    /// Derive both keys.
+    ///
+    /// The master key is the HKDF input key material and the ECDH shared secret is the salt.
+    /// `session_id` does not enter the derivation; the tags are computed over it by the
+    /// callers. `expand` can only fail for output lengths above `255 * HashLen`, which 32 bytes
+    /// never reach, and a failure is still not unwrapped, because no input may panic in this
+    /// library. On failure both keys are zeroized, so later authentication necessarily fails
+    /// instead of silently using a predictable key.
     fn derive(master: &MasterKey, shared: &[u8], session_id: &[u8; SESSION_ID_LEN]) -> Self {
-        // 主密钥当作 HKDF 的输入密钥材料，ECDH 共享秘密当作 salt。
-        //
-        // 反过来（共享秘密当 ikm、主密钥当 salt）也可以，但这里的选择让
-        // 「主密钥是**唯一**的秘密来源」这件事在代码上更显眼：proof 与 confirm
-        // 都是从它展开出来的，而共享秘密只负责把这次展开锚定到本会话。
         let hkdf = Hkdf::<Sha256>::new(Some(shared), master.expose());
         let mut proof = [0_u8; 32];
         let mut confirm = [0_u8; 32];
-        // `expand` 只在输出长度超过 255 * HashLen 时失败，32 字节不可能触发。
-        // 仍然不 `unwrap`：库内「任何输入都不得 panic」的约定不允许例外。
         let failed = hkdf.expand(HKDF_INFO_PROOF, &mut proof).is_err()
             || hkdf.expand(HKDF_INFO_CONFIRM, &mut confirm).is_err();
         if failed {
-            // 走到这里说明输出长度参数被改坏了。全零密钥会让后续认证必然失败，
-            // 而不是悄悄用一个可预测的密钥。
             proof.zeroize();
             confirm.zeroize();
         }
@@ -624,9 +626,11 @@ impl Drop for AuthKeys {
     }
 }
 
-/// 计算会话标识。
+/// Compute the session identifier.
 ///
-/// 输入顺序写死在**这一个**函数里，两个方向都调用它。
+/// SHA-256 over `SESSION_LABEL`, the verifier's ephemeral public key and nonce, then the
+/// responder's. The input order is fixed inside **this single** function; both directions
+/// call it.
 fn session_id_of(
     verifier_public: &[u8; PUBLIC_KEY_LEN],
     verifier_nonce: &[u8; NONCE_LEN],
@@ -645,11 +649,13 @@ fn session_id_of(
     out
 }
 
-/// 设备签名覆盖的消息。
+/// The message covered by the device signature:
+/// `SIGNATURE_LABEL ‖ session_id ‖ A_pub ‖ n_A ‖ B_pub ‖ n_B ‖ tag`.
 ///
-/// 覆盖会话标识、双方的公开值与 tag，因此**一条签名只对一次会话有效**。少了任何
-/// 一项，攻击者就能把某台设备的一次签名搬到别的会话里——那会让「签名证明是哪台
-/// 设备」这条性质失效。
+/// It covers the session identifier, both sides' public values and the tag, so **one signature
+/// is valid for one session only**. Dropping any item would let an attacker move a device's
+/// signature into another session, which would break the property that the signature proves
+/// which device is answering.
 fn signature_message(
     session_id: &[u8; SESSION_ID_LEN],
     verifier_public: &[u8; PUBLIC_KEY_LEN],
@@ -677,28 +683,29 @@ fn signature_message(
     message
 }
 
-/// 从字节切片构造设备签名。
+/// Build a device signature from a byte slice.
 ///
-/// 走 [`DeviceSignature::from_bytes`] 而不是自己拼数组：长度校验只应有一处。
+/// Goes through [`DeviceSignature::from_bytes`] instead of assembling the array here: length
+/// validation belongs in exactly one place.
 fn signature_of(bytes: &[u8]) -> Result<DeviceSignature> {
-    // `?` 把 `qualia_dik::Error` 经 `Error::Device` 转换过来——那一步由 `#[from]`
-    // 提供；不能直接返回 `Ok(..)` 之外的表达式，因为 `Ok` 的类型不会自动转换。
     Ok(DeviceSignature::from_bytes(bytes)?)
 }
 
-/// 计算证明标签。
+/// Compute the proof tag.
 fn proof_tag(key: &[u8; 32], session_id: &[u8; SESSION_ID_LEN]) -> [u8; CONFIRMATION_LEN] {
     tag(key, PROOF_LABEL, session_id)
 }
 
-/// 计算确认标签。
+/// Compute the confirmation tag.
 fn confirm_tag(key: &[u8; 32], session_id: &[u8; SESSION_ID_LEN]) -> [u8; CONFIRM_LEN] {
     tag(key, CONFIRM_LABEL, session_id)
 }
 
-/// 通用标签计算。
+/// Generic tag computation: `HMAC-SHA256(key, label ‖ session_id)`.
+///
+/// `new_from_slice` accepts a key of any length for HMAC-SHA256 and cannot fail; should it
+/// fail anyway, the result is an all-zero tag rather than a panic.
 fn tag(key: &[u8; 32], label: &[u8], session_id: &[u8; SESSION_ID_LEN]) -> [u8; CONFIRMATION_LEN] {
-    // `new_from_slice` 对 HMAC-SHA256 接受任意长度密钥，不会失败。仍然不 `unwrap`。
     let Ok(mut mac) = <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(key) else {
         return [0_u8; CONFIRMATION_LEN];
     };
@@ -710,7 +717,7 @@ fn tag(key: &[u8; 32], label: &[u8], session_id: &[u8; SESSION_ID_LEN]) -> [u8; 
     out
 }
 
-/// 常量时间比较。
+/// Constant-time comparison.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     if a.len() != b.len() {
@@ -724,19 +731,17 @@ mod tests {
     use super::*;
     use p256::ecdsa::{SigningKey, signature::Signer as _};
 
-    /// 生成一台"设备"：软件保存的 P-256 私钥 + 对应的公开信息。
+    /// Build one "device": a software-held P-256 private key plus the matching public material.
     ///
-    /// # 为什么测试里可以用软件密钥
+    /// In production the device private key lives in platform hardware and signing is
+    /// initiated by `qualia-dik`, but **this module does not care where the private
+    /// key is stored** — it only asks a callback for a signature. A software key therefore
+    /// exercises the same protocol properties; the real hardware path is covered by
+    /// integration tests in the keystore repository.
     ///
-    /// 生产环境里设备私钥住在平台硬件里，签名由 `qualia2fa-keystore` 发起。但**本模块
-    /// 不关心私钥存在哪里**——它只通过回调要一段签名。测试里用软件密钥构造回调，
-    /// 验证的是本模块的协议性质，与密钥保管无关。真实硬件路径由 keystore 仓库的
-    /// 集成测试覆盖。
-    ///
-    /// 标量固定为 `n`（而不是随机）时更方便调试；这里用随机值，因为"两台不同的
-    /// 设备"是本模块大部分测试的前提。
+    /// `scalar` selects a specific device, so a test can name one. Small values such as 1, 2, 3
+    /// are far below the curve order and are always valid private keys.
     fn device(scalar: u8) -> (SigningKey, [u8; PUBLIC_KEY_LEN]) {
-        // 用一个确定的小标量：1、2、3……远小于曲线阶，必定是合法私钥。
         let mut bytes = [0_u8; 32];
         bytes[31] = scalar;
         let signing = SigningKey::from_bytes((&bytes).into()).expect("合法标量");
@@ -746,15 +751,16 @@ mod tests {
         (signing, out)
     }
 
-    /// 造一个主密钥。
+    /// Create a master key.
     fn new_master() -> MasterKey {
         MasterKey::generate().expect("随机源可用")
     }
 
-    /// 跑完一次完整握手，返回各方的中间结果。
+    /// Run one complete handshake and return both sides' intermediate results.
     ///
-    /// 返回 `Responder` 而非只返回确认结果，是为了让"确认标签是对的还是错的"能被
-    /// 分开检验。**`Responder` 不能被复制**，所以每条测试各自跑一次握手。
+    /// It returns the `Responder` rather than only the confirmation result so that "is the
+    /// confirmation tag right or wrong" can be checked separately. A `Responder` cannot be
+    /// copied, so every test runs its own handshake.
     fn handshake(master: &MasterKey) -> (Verified, Responder, [u8; PUBLIC_KEY_LEN], Vec<u8>) {
         let (signing, device_public) = device(7);
         let (challenge, verifier) = begin().expect("生成挑战");
@@ -769,7 +775,7 @@ mod tests {
         (verified, responder, device_public, response)
     }
 
-    /// 正常握手必须成功，且双方对会话标识的看法一致。
+    /// A normal handshake must succeed, and both sides must agree on the session identifier.
     #[test]
     fn handshake_succeeds_and_both_sides_agree_on_the_session() {
         let master = new_master();
@@ -782,7 +788,6 @@ mod tests {
         );
         assert_eq!(verified.device_public(), &device_public);
 
-        // 确认标签必须被应答方接受。
         confirm(
             &master,
             &responder,
@@ -792,9 +797,9 @@ mod tests {
         .expect("确认标签应当被接受");
     }
 
-    /// **攻击者没有主密钥时必须失败。**
-    ///
-    /// 这是本模块存在的理由：攻击者能看见挑战，也能看见应答，但它算不出 tag。
+    /// **A responder without the master key must fail.** The response is produced with a
+    /// different master key and must be rejected with [`Error::AuthProofFailed`], because an
+    /// attacker can see the challenge and the response but cannot compute the tag.
     #[test]
     fn responder_without_the_master_key_cannot_answer() {
         let real = new_master();
@@ -803,7 +808,6 @@ mod tests {
         let (challenge, verifier) = begin().expect("生成挑战");
         let responder = accept(&challenge).expect("接受挑战");
 
-        // 应答方拿的是**另一个**主密钥。
         let response = responder
             .respond(&wrong, &device_public, |digest| {
                 let (signing, _) = device(7);
@@ -821,20 +825,15 @@ mod tests {
         );
     }
 
-    /// 没有私钥的攻击者无法伪造签名——**即使它把 tag 那一关过了**。
-    ///
-    /// 这条测试说明「tag」与「签名」各自挡住什么。攻击者能拿到正确的 tag（它看得见
-    /// 信道），但它没有设备私钥，因此签名这一关仍然挡着。
-    ///
-    /// 做法是让应答**由攻击者的密钥签名**，但 tag 是合法的：把合法应答的签名段
-    /// 换成另一个密钥对同一消息的签名。
+    /// An attacker without the private key cannot forge a signature, **even when the tag is
+    /// valid**: a genuine response has its signature segment replaced (the tag stays valid,
+    /// since the attacker can see the channel) and must be rejected by the signature check.
     #[test]
     fn forged_signature_is_rejected_even_with_a_valid_tag() {
         let master = new_master();
 
         let (challenge, verifier) = begin().expect("生成挑战");
         let responder = accept(&challenge).expect("接受挑战");
-        // 真正的设备。
         let (real_signing, real_device) = device(7);
         let response = responder
             .respond(&master, &real_device, |message| {
@@ -843,21 +842,13 @@ mod tests {
             })
             .expect("生成应答");
 
-        // 攻击者只知道消息的一部分：它无法重算 message（需要 responder 的临时私钥
-        // 才能完成 ECDH），因此这里只能换一个「签名不对」的版本。
-        //
-        // 这正是要害：**签名覆盖的消息里含有 ECDH 派生的会话标识**，攻击者既算不出
-        // 正确的 tag，也算不出签名要覆盖的消息。
         let (_attacker_signing, attacker_device) = device(9);
         let mut forged = response.clone();
-        // 让签名段变成全零：一定不合法。
         for byte in &mut forged[RESPONSE_LEN..] {
             *byte = 0;
         }
         assert_ne!(attacker_device, real_device);
 
-        // 验签失败由设备身份库报出，经 `Error::Device` 包装上来。断言内层变体：
-        // 「是验签不过」这个事实属于设备身份库，包装只是把它带上来。
         assert!(
             matches!(
                 verifier.verify(&forged, &master),
@@ -869,7 +860,7 @@ mod tests {
         );
     }
 
-    /// **篡改应答里除签名外的任意一个字节都必须被发现。**
+    /// **Tampering with any byte of the response except the signature must be detected.**
     #[test]
     fn tampering_with_the_response_is_detected() {
         let master = new_master();
@@ -893,7 +884,7 @@ mod tests {
         }
     }
 
-    /// 挑战长度不对必须被拒绝。
+    /// A challenge with the wrong length must be rejected.
     #[test]
     fn challenge_with_wrong_length_is_rejected() {
         for length in [0_usize, 1, CHALLENGE_LEN - 1, CHALLENGE_LEN + 1] {
@@ -908,12 +899,11 @@ mod tests {
         }
     }
 
-    /// 挑战里的公钥不在曲线上必须被拒绝。
+    /// A challenge whose public key is not on the curve must be rejected.
     #[test]
     fn challenge_with_off_curve_key_is_rejected() {
         let (challenge, _) = begin().expect("生成挑战");
         let mut broken = challenge.clone();
-        // 改掉公钥的最后一个字节：前缀仍是 0x04，但坐标不再满足曲线方程。
         broken[PUBLIC_KEY_LEN - 1] ^= 0x01;
 
         assert!(matches!(
@@ -922,7 +912,7 @@ mod tests {
         ));
     }
 
-    /// 应答里的公钥不在曲线上必须被拒绝（**在算 tag 之前**）。
+    /// A response whose public key is not on the curve must be rejected (**before the tag is computed**).
     #[test]
     fn response_with_off_curve_key_is_rejected() {
         let master = new_master();
@@ -943,7 +933,8 @@ mod tests {
         ));
     }
 
-    /// 确认标签错误必须被拒绝。
+    /// A wrong confirmation tag must be rejected, and so must a confirmation of the wrong
+    /// length.
     #[test]
     fn wrong_confirmation_is_rejected() {
         let master = new_master();
@@ -956,7 +947,6 @@ mod tests {
             Err(Error::AuthProofFailed)
         ));
 
-        // 长度不对同样必须被拒绝。
         assert!(matches!(
             confirm(
                 &master,
@@ -968,9 +958,8 @@ mod tests {
         ));
     }
 
-    /// **会话标识不一致时必须拒绝**，即使标签本身是对的。
-    ///
-    /// 这挡住的是「把一次会话的确认标签搬到另一次会话上」。
+    /// **A mismatched session identifier must be rejected**, even when the tag itself is
+    /// correct. This blocks moving one session's confirmation tag onto another session.
     #[test]
     fn confirmation_with_a_mismatched_session_id_is_rejected() {
         let master = new_master();
@@ -989,7 +978,7 @@ mod tests {
         ));
     }
 
-    /// 用错误的 master 做确认校验必须失败。
+    /// Confirmation with the wrong master key must fail.
     #[test]
     fn confirmation_with_the_wrong_master_key_is_rejected() {
         let master = new_master();
@@ -1007,9 +996,8 @@ mod tests {
         ));
     }
 
-    /// **两次会话的会话标识与 tag 必须都不同。**
-    ///
-    /// 否则攻击者可以重放整条应答。
+    /// **Two sessions must never share a session identifier or a tag**; otherwise an attacker
+    /// could replay a whole response.
     #[test]
     fn two_sessions_never_share_a_session_id_or_tag() {
         let master = new_master();
@@ -1032,7 +1020,7 @@ mod tests {
         }
     }
 
-    /// 应答的**长度**是固定契约。
+    /// The **lengths** of the messages are a fixed contract.
     #[test]
     fn message_lengths_are_stable() {
         assert_eq!(CHALLENGE_LEN, 65 + 32);
@@ -1041,7 +1029,7 @@ mod tests {
         assert_eq!(CONFIRM_LEN, 32);
     }
 
-    /// 应答里**不得**出现主密钥明文。
+    /// The master key must **not** appear in plaintext inside a response.
     #[test]
     fn response_never_contains_the_master_key() {
         let master = new_master();
@@ -1054,10 +1042,9 @@ mod tests {
         );
     }
 
-    /// `Debug` 输出必须被脱敏。
-    ///
-    /// 秘密材料不得进入日志、错误消息或 `Debug`——这是本仓库的不可协商约束之一。
-    /// 这里检查的是本模块的三个类型：临时私钥、nonce、以及派生出的确认密钥。
+    /// `Debug` output must be redacted: secret material must not reach logs, error messages or
+    /// `Debug` output. This checks the module's three types: the ephemeral private key, the
+    /// nonces, and the derived confirmation key.
     #[test]
     fn debug_output_is_redacted() {
         let master = new_master();
@@ -1070,15 +1057,12 @@ mod tests {
                 signature_of(&signature.to_bytes())
             })
             .expect("生成应答");
-        // `Debug` 字符串必须在 `verify` 之前取：`verify` 收 `self`，会消耗 `verifier`。
         let verifier_text = format!("{verifier:?}");
         let responder_text = format!("{responder:?}");
         let verified = verifier.verify(&response, &master).expect("验证");
         let verified_text = format!("{verified:?}");
 
-        // 主密钥的十六进制形式不得出现在任何 Debug 输出里。
         let master_hex: String = master.expose().iter().map(|b| format!("{b:02x}")).collect();
-        // 双方的 nonce 也不得出现（它们是会话相关的秘密材料）。
         let responder_nonce_hex: String = responder_side_nonce(&response)
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -1097,7 +1081,6 @@ mod tests {
                 !text.contains(&responder_nonce_hex),
                 "{what} 的 Debug 输出泄露了 nonce"
             );
-            // 被脱敏的字段必须是显式的占位符，而不是「碰巧没打印」。
             assert!(
                 text.contains("redacted") || text.contains("bytes"),
                 "{what} 的 Debug 输出没有出现脱敏占位符：{text}"
@@ -1105,14 +1088,14 @@ mod tests {
         }
     }
 
-    /// 取应答里携带的应答方 nonce（应答体的 `PUBLIC_KEY_LEN..PUBLIC_KEY_LEN+NONCE_LEN`）。
+    /// Take the responder's nonce out of a response body (`PUBLIC_KEY_LEN..PUBLIC_KEY_LEN+NONCE_LEN`).
     fn responder_side_nonce(response: &[u8]) -> [u8; NONCE_LEN] {
         let mut out = [0_u8; NONCE_LEN];
         out.copy_from_slice(&response[PUBLIC_KEY_LEN..PUBLIC_KEY_LEN + NONCE_LEN]);
         out
     }
 
-    /// 常量时间比较的行为必须正确。
+    /// Constant-time comparison must behave correctly.
     #[test]
     fn constant_time_eq_behaves() {
         assert!(constant_time_eq(&[1, 2, 3], &[1, 2, 3]));

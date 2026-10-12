@@ -13,23 +13,24 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! 保险库的密码学原语：主密钥、子密钥派生、条目 AEAD。
+//! Cryptographic primitives of the vault: master key, subkey derivation, record AEAD.
 //!
-//! # 这一层负责什么
+//! # Scope
 //!
-//! 只负责「把一段字节加密成另一段字节」以及密钥材料的生命周期。文件格式、
-//! 条目语义、原子落盘都在别的模块——把格式与密码学混在一起会让「改格式」
-//! 与「动密码学」变成同一件事，那是审计上最糟的耦合。
+//! Turning one byte string into another and owning the lifetime of key material. The
+//! file format, entry semantics and atomic writes live in other modules.
 //!
-//! # 三个不可协商的性质
+//! # Three invariants
 //!
-//! 1. **随机 nonce 必须 192-bit**。多设备各自独立加密、无中心协调，随机 nonce
-//!    是唯一现实选择；96-bit 在保险库规模下会撞生日界。见 [`Nonce::LEN`]。
-//! 2. **AAD 必须绑定条目身份与格式版本**。否则攻击者可以把条目 A 的密文搬到
-//!    条目 B 的位置，或者把一个旧格式的密文塞进新格式的文件——两种搬运都不会
-//!    被 AEAD 发现，因为密文本身完全合法。见 [`build_aad`]。
-//! 3. **主密钥必须经 HKDF 派生子密钥后再使用**，不能直接当 AEAD 密钥。
-//!    见 [`entry_key`]。
+//! 1. **The random nonce is 192-bit.** Devices encrypt independently and without
+//!    central coordination, so a random nonce is the only workable choice; 96 bits
+//!    reaches the birthday bound at vault scale. See [`Nonce::LEN`].
+//! 2. **The AAD binds entry identity and format version.** Without it, the ciphertext
+//!    of entry A could be moved to the position of entry B, or the ciphertext of an
+//!    older format could be placed into a newer file: both moves would pass the AEAD,
+//!    because the ciphertext itself is valid. See [`build_aad`].
+//! 3. **The master key is only used through HKDF-derived subkeys**, never directly as
+//!    an AEAD key. See [`entry_key`].
 
 use super::entry::EntryId;
 use crate::{Error, ExposeSecret, Result, SecretBytes};
@@ -39,58 +40,63 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use subtle::ConstantTimeEq as _;
 
-/// 主密钥的字节长度。
+/// Length of the master key in bytes.
 ///
-/// 256-bit。对称密码的密钥长度超过 256-bit 不带来实际安全增益（Grover 算法
-/// 下的 128-bit 有效强度已是量子搜索的极限），却会让「恢复密钥」变长、
-/// 更难人工抄写。
+/// 256-bit. Symmetric key lengths above 256-bit give no practical security gain
+/// (128-bit effective strength under Grover's algorithm is the limit of quantum
+/// search), while they make a recovery key longer and harder to copy by hand.
 pub const MASTER_KEY_LEN: usize = 32;
 
-/// 主密钥：256-bit CSPRNG 随机数。
+/// The master key: a 256-bit CSPRNG random value.
 ///
-/// # 它是整个应用唯一的长期秘密
+/// # It is the only long-lived secret of the application
 ///
-/// OTP 种子、设备身份、同步内容全部由它派生或加密。「无中心、无账号密码」
-/// 的设计下没有找回途径——**丢了就丢了**。这也是 M3 要把它放进平台硬件密钥库
-/// （Windows TPM）的原因。
+/// OTP seeds, device identities and sync payloads are all derived from it or encrypted
+/// under it. With no central server and no account, there is no recovery path: a lost
+/// key is lost. The key is meant to be held by the platform hardware key store (Windows
+/// TPM).
 ///
-/// # 秘密保护的边界
+/// # Boundaries of secret protection
 ///
-/// - 不实现 `Clone`（那会静默复制明文）、不实现 `Debug` 的明文输出
-/// - `Drop` 时擦除（由 [`SecretBytes`] 保证）
-/// - **不防**编译器把明文复制到寄存器、栈副本或交换区；`forbid(unsafe_code)`
-///   之下无法用 `mlock` 阻止换页
-/// - **不防**同进程内的恶意代码。取用明文必须显式调用 [`MasterKey::expose`]，
-///   使每一处使用点在代码审查中可见
+/// - No `Clone` (which would silently copy the plaintext) and no plaintext in `Debug`
+///   output.
+/// - Erased on `Drop` (guaranteed by [`SecretBytes`]).
+/// - The plaintext is **not** protected from being copied into registers, stack copies
+///   or the swap file; `forbid(unsafe_code)` rules out `mlock` to prevent paging.
+/// - Malicious code in the same process is **not** defended against. Reading the
+///   plaintext requires an explicit call to [`MasterKey::expose`], which keeps every
+///   use site visible in code review.
 pub struct MasterKey(SecretBytes);
 
 impl MasterKey {
-    /// 生成一个新的随机主密钥。
+    /// Generates a new random master key.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// OS 随机源不可用时返回 [`Error::RandomnessUnavailable`]。此时**必须失败**，
-    /// 不得回退到任何用户态 PRNG：一个可预测的主密钥会让攻击者解密全部条目，
-    /// 而且这种失败是静默的——用户看到功能正常，直到数据被读走。
+    /// Returns [`Error::RandomnessUnavailable`] when the OS random source is
+    /// unavailable, and there is no fallback to a user-space PRNG: a predictable master
+    /// key would let an attacker decrypt every entry, and such a failure would be
+    /// silent. The key bytes are handed to [`SecretBytes`], which owns the buffer and
+    /// erases it on drop.
     pub fn generate() -> Result<Self> {
         let mut bytes = [0_u8; MASTER_KEY_LEN];
         crate::getrandom::fill(&mut bytes).map_err(|_| Error::RandomnessUnavailable)?;
-        // 用一个会被立即擦除的中间数组承接：`SecretBytes` 从 `Vec` 构造，
-        // 那个 `Vec` 的所有权会转移进 `secrecy`，由它负责擦除。
         Ok(Self(Vec::from(bytes).into()))
     }
 
-    /// 从已有字节恢复主密钥。
+    /// Restores the master key from existing bytes.
     ///
-    /// **安全性契约**：调用方必须保证 `bytes` 来自可信来源且随后被擦除。
-    /// 这个函数存在的唯一理由是 M3 的设备登录——主密钥需要从平台密钥库或
-    /// 带外信道（二维码）取回。**不要**用它把主密钥存进普通文件。
+    /// **Security contract**: the caller must ensure that `bytes` come from a trusted
+    /// source and are erased afterwards. Device login is the only consumer: the master
+    /// key is recovered from the platform key store or from an out-of-band channel (a
+    /// QR code). This is **not** a way to keep a master key in an ordinary file.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 长度不是 [`MASTER_KEY_LEN`] 时返回 [`Error::MasterKeyWrongLength`]。
-    /// 长度错误必须拒绝而不是补齐或截断：补齐会静默降低强度，截断会让两台
-    /// 设备派生出不同子密钥，表现为「同步后条目全都解不开」这种极难定位的故障。
+    /// Returns [`Error::MasterKeyWrongLength`] when the length is not
+    /// [`MASTER_KEY_LEN`]. A wrong length is rejected rather than padded or truncated:
+    /// padding would silently weaken the key, and truncation would make two devices
+    /// derive different subkeys.
     pub fn from_bytes(bytes: SecretBytes) -> Result<Self> {
         if bytes.expose_secret().len() != MASTER_KEY_LEN {
             return Err(Error::MasterKeyWrongLength {
@@ -101,10 +107,11 @@ impl MasterKey {
         Ok(Self(bytes))
     }
 
-    /// 显式取用主密钥明文。
+    /// Explicitly reads the master key plaintext.
     ///
-    /// 之所以不实现 `Deref` 或 `AsRef`：那样「取明文」会在无数地方静默发生，
-    /// 而显式方法名让每一处使用点在 `grep` 与代码审查中可见。
+    /// `Deref` and `AsRef` are deliberately not implemented: they would read the
+    /// plaintext silently in many places, whereas an explicit method name keeps every
+    /// use site visible to `grep` and code review.
     #[must_use]
     pub fn expose(&self) -> &[u8] {
         self.0.expose_secret()
@@ -112,117 +119,116 @@ impl MasterKey {
 }
 
 impl core::fmt::Debug for MasterKey {
-    /// 只打印类型名，**连长度都不打印**。
+    /// Prints the type name only, not even the length.
     ///
-    /// 长度在这里没有诊断价值（它是一个常量），所以没有理由打印它。
+    /// The length carries no diagnostic value here, since it is a constant.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("MasterKey([REDACTED])")
     }
 }
 
-/// 主密钥的序列化形式。
+/// Serialized form of the master key.
 ///
-/// **只供 M3 的设备登录流程使用**：把主密钥交给平台密钥库或二维码封装。
-/// 返回的容器会在 `Drop` 时擦除，但调用方仍须尽快交出去。
+/// For the device login flow only: it hands the master key to the platform key store or
+/// to a QR-code envelope. The returned container is erased on `Drop`, but the caller
+/// should still hand it over as soon as possible.
+///
+/// The [`SecretBytes`] clone is intentional: the caller takes independent ownership of
+/// one copy, and both copies erase themselves.
 #[must_use]
 pub fn master_key_to_bytes(key: &MasterKey) -> SecretBytes {
-    // `SecretBytes`（`SecretSlice<u8>`）可克隆——此处刻意如此：调用方需要一份
-    // 独立的所有权去交给密钥库，而克隆出的两份会各自独立擦除。
     key.0.clone()
 }
 
-/// nonce 的字节长度。
+/// Length of a nonce in bytes.
 ///
-/// **192-bit，这不是可调参数。** 多设备各自独立加密、彼此无中心协调，
-/// 随机 nonce 是唯一现实选择；而 96-bit nonce 在随机取值下会撞生日界——
-/// 保险库规模下 `aes-gcm` 的随机 nonce 用法属于已知不安全。
+/// **192-bit, not a tunable parameter.** Devices encrypt independently and without
+/// central coordination, so a random nonce is the only workable choice, and a 96-bit
+/// random nonce reaches the birthday bound at vault scale: random-nonce `aes-gcm` is
+/// known to be unsafe there.
 pub const NONCE_LEN: usize = 24;
 
-/// Poly1305 认证标签的字节长度。
+/// Length of the Poly1305 authentication tag in bytes.
 pub const TAG_LEN: usize = 16;
 
-/// 一条记录的加密 nonce。
+/// The encryption nonce of a record.
 ///
-/// 每次加密都**新生成**一个，不复用、不递增。递增计数器需要跨设备协调，
-/// 而本应用没有协调中心。
+/// A **fresh** one is generated for every encryption; nonces are neither reused nor
+/// incremented. An incrementing counter would need coordination between devices, and
+/// this application has no coordination point.
 pub type Nonce = [u8; NONCE_LEN];
 
-/// 生成一个新的随机 nonce。
+/// Generates a new random nonce from the OS random source.
 pub(crate) fn random_nonce() -> Result<Nonce> {
     let mut nonce = [0_u8; NONCE_LEN];
     crate::getrandom::fill(&mut nonce).map_err(|_| Error::RandomnessUnavailable)?;
     Ok(nonce)
 }
 
-/// 子密钥派生用的 HKDF 上下文串。
+/// HKDF context string for subkey derivation.
 ///
-/// # 为什么派生而不直接用主密钥
+/// The master key also takes part in device pairing and recovery, so keys are derived
+/// per purpose: a subkey leaked in one context exposes neither the master key itself nor
+/// the data of another context.
 ///
-/// 主密钥将来还要参与设备配对与恢复流程（M3/M4）。用途分离意味着即使某个
-/// 子密钥在某个场景下泄露，也不会连带暴露主密钥本身，更不会让攻击者能用
-/// 同一个密钥去解开别的用途的数据。
-///
-/// 串里带版本号（`v1`）：将来若更换算法或密钥长度，新版本用新串，旧数据仍可
-/// 用旧串解开——这比在文件里存一个算法标识更简单，且不扩大攻击面。
+/// The string carries a version (`v1`): a future algorithm or key-length change uses a
+/// new string while old data stays readable under the old one.
 const HKDF_INFO_ENTRY: &[u8] = b"Qualia2FA vault v1 entry encryption";
 
-/// HKDF 的 salt。
+/// HKDF salt.
 ///
-/// # 为什么是固定的空值
+/// Fixed and all-zero. HKDF's salt separates several unrelated protocols that share one
+/// input key material; here the input material (the master key) is already 256-bit
+/// uniformly random and dedicated to this application, so no such sharing exists. A
+/// fixed salt also keeps derivation **deterministic**: the same master key yields the
+/// same subkey on every device, otherwise synced entries could not be opened.
 ///
-/// HKDF 的 salt 用于「多个不相关协议共享同一份输入密钥材料」的场景。这里
-/// 输入材料（主密钥）本来就是 256-bit 均匀随机、专用于本应用，不存在需要
-/// salt 来分离的多协议共享局面。固定为全零同时保证了派生结果是**确定性的**：
-/// 同一主密钥在任何设备上都派生出同一子密钥，否则同步过来的条目将无法解开。
-///
-/// 域分离由 [`HKDF_INFO_ENTRY`] 承担，那才是这个场景的正确工具。
+/// Domain separation is carried by [`HKDF_INFO_ENTRY`], which is the right tool for it.
 const HKDF_SALT: [u8; 32] = [0_u8; 32];
 
-/// 从主密钥派生用于条目加密的子密钥。
+/// Derives the subkey used for entry encryption from the master key.
 ///
-/// 每次调用都重新派生而不缓存：HKDF 的代价是两次 HMAC-SHA256，在 30 秒一次的
-/// 验证码场景下完全可以忽略，而缓存意味着子密钥要在内存里多留一段时间。
+/// Derivation happens on every call and is not cached: HKDF costs two HMAC-SHA256
+/// operations, which is negligible for a code generated once every 30 seconds, whereas
+/// caching would keep the subkey in memory longer.
 ///
-/// `pub(crate)` 而非私有：同步层需要**验证**它与自己那把不同（域分离的核心断言，见
-/// `crate::sync::record` 的测试）。那个断言只能拿这里给出的值来做——如果同步层自己
-/// 抄一遍保险库的派生，它验证的就只是「我抄的那份与我自己不同」，毫无意义。
+/// `pub(crate)` rather than private: the sync layer **verifies** that its own key
+/// differs from this one, and that check can only use the value produced here.
 pub(crate) fn entry_key(master: &MasterKey) -> Result<[u8; 32]> {
     derive_key(master, HKDF_INFO_ENTRY)
 }
 
-/// 用一段上下文串从主密钥派生 32 字节子密钥。
+/// Derives a 32-byte subkey from the master key with a context string.
 ///
-/// # 域分离全靠 `info`
+/// # Domain separation relies on `info`
 ///
-/// 同一个主密钥派生出的每把子密钥**必须**有不同的 `info`。两处共用一串的后果不是
-/// 「稍微弱一点」而是彻底的域混淆：一个域里合法的密文在另一个域里也合法，于是
-/// 「把同步载荷里的密文塞进保险库文件」这类搬运会通过认证。
+/// Every subkey derived from the same master key **must** use a different `info`.
+/// Sharing one string between two places is not a slight weakening but full domain
+/// confusion: a ciphertext that is valid in one domain is valid in the other, so moving
+/// a ciphertext from a sync payload into a vault file would authenticate.
 ///
-/// 单独抽出来是因为 [`crate::sync`] 也要派生自己的密钥，而那里的派生规则必须与
-/// 这里**同源**——两处各自手写一遍 HKDF 调用，迟早会有一处的 salt 或输出长度
-/// 悄悄不同，而那种错误在功能上完全看不出来（两边各用各的密钥，各自都能解自己的
-/// 密文），只在互操作时炸。
+/// Extracted into one function so that [`crate::sync`] derives its keys through the same
+/// rules instead of repeating the HKDF call.
 pub(crate) fn derive_key(master: &MasterKey, info: &[u8]) -> Result<[u8; 32]> {
     derive_key_with_salt(master, &HKDF_SALT, info)
 }
 
-/// 用指定的 salt 与上下文串从主密钥派生 32 字节子密钥。
+/// Derives a 32-byte subkey from the master key with the given salt and context string.
 ///
-/// # 为什么 salt 也要能指定
+/// # The salt is a parameter
 ///
-/// [`crate::sync`] 的记录与保险库文件的记录**可能拥有逐字节相同的 AAD**——两者都是
-/// 「一个种类字节 + 一个 16 字节标识 + 一个版本字节」。AAD 相同就意味着两个域的密文
-/// 可以互换，而那是真实的攻击：把一份同步载荷的内容当成保险库文件喂进来，AEAD 会
-/// 认证通过。
+/// Records of [`crate::sync`] and records of a vault file can carry byte-identical AAD
+/// (one kind byte, a 16-byte identifier and a version byte). Identical AAD means the
+/// ciphertexts of the two domains are interchangeable: a sync payload fed to the vault
+/// parser as a file would authenticate.
 ///
-/// 靠「把种类字节排得不一样」来防是脆弱的——它依赖两处实现永远保持这个巧合。用不同
-/// 的 salt 则是**结构性**的：两个域的子密钥在 HKDF-Extract 阶段就分开了，与 AAD 怎么
-/// 排无关。
+/// Distinct salts separate the domains **structurally**: their subkeys diverge during
+/// HKDF-Extract, independently of how the AAD is laid out.
 ///
-/// # 错误
+/// # Errors
 ///
-/// 只有输出长度超限（255 × HashLen）才会失败，32 字节不可能触发；仍然返回 `Result`
-/// 以遵守「库内不 panic」的约定。
+/// Fails only when the output length exceeds 255 × HashLen, which 32 bytes cannot
+/// reach; the `Result` exists to honour the crate's no-panic rule.
 pub(crate) fn derive_key_with_salt(
     master: &MasterKey,
     salt: &[u8],
@@ -235,26 +241,27 @@ pub(crate) fn derive_key_with_salt(
     Ok(key)
 }
 
-/// 内层同步记录用的 HKDF 上下文串。
+/// HKDF context string for inner sync records.
 ///
-/// 与保险库用的 [`HKDF_INFO_ENTRY`] 不同。**两处刻意用同一个字符串**——域分离由
-/// salt 承担（见 [`derive_key_with_salt`]），info 描述的是「这是什么用途的记录」，
-/// 而「条目加密」这个用途在两个域里是同一件事。这样命名比「vault entry」/「sync
-/// entry」两个近义串更难写错：写错一个字符的后果是两个域都用同一把密钥，而字符串
-/// 只差一个词时没人会注意到。
+/// Not a different string from [`HKDF_INFO_ENTRY`]: **the two deliberately share one**,
+/// because domain separation is carried by the salt (see [`derive_key_with_salt`]).
+/// `info` describes the purpose of a record, and "entry encryption" is the same purpose
+/// in both domains.
 pub(crate) const HKDF_INFO_SYNC_RECORD: &[u8] = HKDF_INFO_ENTRY;
 
-/// 外层信封用的 HKDF 上下文串。
+/// HKDF context string for the outer envelope.
 pub(crate) const HKDF_INFO_SYNC_ENVELOPE: &[u8] = b"Qualia2FA sync v1 envelope";
 
-/// 用一个已派生好的密钥加密一段**不参与记录格式**的字节（同步载荷的信封层）。
+/// Encrypts bytes that are **outside the record format** (the envelope of a sync
+/// payload) with an already derived key.
 ///
-/// 与 [`seal_with_key`] 的区别：那个把「种类 + 条目 ID + 版本」绑进 AAD，这个把调用方
-/// 给的任意 AAD 原样绑进去。信封的 AAD 是整个明文头，不是记录的三元组。
+/// Unlike [`seal_with_key`], which binds kind + entry ID + version into the AAD, this
+/// binds the caller-supplied AAD as is: the envelope's AAD is the whole plaintext
+/// header, not the record triple.
 ///
-/// # 错误
+/// # Errors
 ///
-/// 只可能因随机源不可用而失败。
+/// Can only fail when the random source is unavailable.
 pub(crate) fn seal_bytes(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<(Nonce, Vec<u8>)> {
     let cipher = XChaCha20Poly1305::new(&Key::from(*key));
     let nonce = random_nonce()?;
@@ -265,14 +272,15 @@ pub(crate) fn seal_bytes(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result
     Ok((nonce, buffer))
 }
 
-/// [`seal_bytes`] 的逆操作。
+/// Inverse of [`seal_bytes`].
 ///
-/// # 错误
+/// # Errors
 ///
-/// 认证失败一律返回 [`Error::VaultDecryptionFailed`]，不区分原因。这**不是**同步层
-/// 暴露给调用方的错误——[`crate::sync::Payload::open`] 会把它翻译成
-/// [`Error::SyncAuthenticationFailed`]，因为端侧对「文件打不开」与「这次同步不可信」
-/// 的处置完全不同。
+/// Any authentication failure returns [`Error::VaultDecryptionFailed`] without
+/// distinguishing causes. That is **not** the error the sync layer exposes to callers:
+/// [`crate::sync::Payload::open`] translates it into
+/// [`Error::SyncAuthenticationFailed`], because an unopenable file and an untrusted sync
+/// are handled differently at the application boundary.
 pub(crate) fn open_bytes(
     key: &[u8; 32],
     aad: &[u8],
@@ -287,68 +295,65 @@ pub(crate) fn open_bytes(
     Ok(buffer)
 }
 
-/// 主密钥检查值的字节长度。
+/// Length of the master key check value in bytes.
 pub const KEY_CHECK_LEN: usize = 32;
 
-/// 主密钥检查值派生用的 HKDF 上下文串。
+/// HKDF context string for deriving the master key check value.
 ///
-/// 与 [`HKDF_INFO_ENTRY`] 不同：域分离靠的就是这一串不同。若两者共用，检查值就
-/// 等于条目子密钥，而检查值是**明文写在文件里**的——那等于把主密钥的子密钥公开。
+/// Different from [`HKDF_INFO_ENTRY`]: this string is what separates the two domains.
+/// Sharing it would make the check value equal to the entry subkey, and the check value
+/// is **written into the file in plaintext**.
 const HKDF_INFO_KEY_CHECK: &[u8] = b"Qualia2FA vault v1 master key check";
 
-/// 派生「这个文件是用哪把主密钥写的」的检查值。
+/// Derives the check value that states which master key wrote a file.
 ///
-/// # 它解决什么问题
+/// # What it establishes
 ///
-/// 主密钥原本只参与每条记录的 AEAD，而文件头里没有它的任何信息。于是**一个条目
-/// 为空的保险库文件对任何 32 字节密钥都能解析成功**——主密钥存错了要等用户加进
-/// 第一条条目、或同步进来第一条记录才暴露，而那时界面早已显示「打开成功」。
-/// 把检查值写进文件，`parse` 就能在**读第一条记录之前**判定密钥对错。
+/// The master key takes part only in each record's AEAD, and the file header holds
+/// nothing about it, so **an empty vault file parses successfully under any 32-byte
+/// key**; a wrong master key would only surface once the user adds a first entry or a
+/// first record is synced in. With the check value in the file, `parse` decides whether
+/// the key is correct **before reading the first record**.
 ///
-/// # 为什么固定值比「随机 salt + HKDF」更合适
+/// # Properties
 ///
-/// 固定派生意味着**同一把主密钥在任何文件里都得到同一个检查值**，于是这一层不
-/// 提供任何「这两个文件是否来自同一把密钥」之外的关联能力——而那件事本来就能从
-/// 「记录能否解开」推出来。
+/// The derivation is fixed, so the same master key yields the same check value in every
+/// file, and this layer reveals nothing beyond the single bit "the guessed master key is
+/// correct". An attacker holding the file could test keys record by record anyway, since
+/// the AEAD tag is a ready-made verifier.
 ///
-/// # 它泄露了什么
+/// The artefact that resists offline brute force is the **recovery-key file**: its key is
+/// encrypted under a key derived from a user passphrase with Argon2id, so every attempt
+/// costs 64 MiB of memory and 3 iterations. A vault file holds no passphrase and relies
+/// on the master key being 256-bit uniformly random and unenumerable.
 ///
-/// 只有「猜测的主密钥对不对」这一个比特。这不构成新的攻击面：拿到文件的攻击者
-/// **本来**就能用同样的方式逐条试解（AEAD 标签就是现成的验证器），本函数没有给
-/// 他任何新能力，只是让诚实的调用方也能用上同一个判定。
-///
-/// 真正不可离线暴力破解的是**恢复密钥文件**：那里的主密钥由用户口令经 Argon2id
-/// 派生密钥加密，每次尝试都要付出 64 MiB / 3 次迭代的代价。保险库文件不含口令，
-/// 本来就不承担「抵抗离线暴力破解」的职责——它的前提是主密钥本身是 256-bit 均匀
-/// 随机、不可枚举的。
+/// The 32-byte `expand` cannot fail (the HKDF output limit is 255 × 32 bytes), so the
+/// `expect` is unreachable. It is used instead of `unwrap` because the crate's no-panic
+/// rule admits no exception, and the function returns an array with no error channel.
 #[must_use]
 pub fn key_check(master: &MasterKey) -> [u8; KEY_CHECK_LEN] {
     let hkdf = Hkdf::<Sha256>::new(Some(&HKDF_SALT), master.expose());
     let mut check = [0_u8; KEY_CHECK_LEN];
-    // 32 字节不可能让 `expand` 失败（上限是 255 * 32 字节），因此这里的
-    // `expect` 不可达。仍然不用 `unwrap`：本 crate 的 nopanic 约定不接受例外，
-    // 而这个函数返回数组、无从返回错误，只能显式失败。
     hkdf.expand(HKDF_INFO_KEY_CHECK, &mut check)
         .expect("HKDF 输出 32 字节不可能失败");
     check
 }
 
-/// 校验文件里的主密钥检查值。
+/// Verifies the master key check value stored in a file.
 ///
-/// # 错误
+/// # Errors
 ///
-/// 长度不对返回 [`Error::VaultBadKeyCheck`]（结构性）；长度对但值不符返回
-/// [`Error::VaultDecryptionFailed`]（认证失败）。
+/// A wrong length returns [`Error::VaultBadKeyCheck`] (structural); a correct length with
+/// a mismatching value returns [`Error::VaultDecryptionFailed`] (authentication). The two
+/// are kept apart because the first says the file is malformed while the second says the
+/// **master key is wrong or the file was modified**, and the two are handled differently
+/// at the application boundary.
 ///
-/// 两者刻意分开：前者说明文件被构造坏了，后者说明**主密钥不对或文件被改过**，
-/// 而端侧对这两种情况的处置完全不同。都归为 `VaultDecryptionFailed` 会让「文件
-/// 结构坏了」被误报成「密钥错了」，用户会去比对密钥，而问题不在那里。
+/// # Constant-time comparison
 ///
-/// # 为什么用常量时间比较
-///
-/// 检查值是明文，攻击者可以本地反复调用这个函数测时间。虽然本函数只回答「你猜的
-/// 密钥对不对」——而这本来就能从试解一条记录得到——但既然比较的代价一样，就没有
-/// 理由在这里留一个非常量时间的分支。
+/// The check value is plaintext, so an attacker can call this function repeatedly
+/// locally to measure timing. Comparing in constant time costs the same, so there is no
+/// reason for a non-constant-time branch here.
 pub fn verify_key_check(master: &MasterKey, stored: &[u8]) -> Result<()> {
     let stored: &[u8; KEY_CHECK_LEN] = stored.try_into().map_err(|_| Error::VaultBadKeyCheck)?;
     if key_check(master).ct_eq(stored).into() {
@@ -358,40 +363,41 @@ pub fn verify_key_check(master: &MasterKey, stored: &[u8]) -> Result<()> {
     }
 }
 
-/// 记录的种类，参与 AAD 构造。
+/// The kind of a record, part of the AAD construction.
 ///
-/// # 为什么种类必须进 AAD
+/// The kind is part of the AAD, so a tombstone's ciphertext cannot be moved into the position of a
+/// live entry (or the other way round): a live entry and a tombstone use the same key and the same
+/// AEAD, and both are valid ciphertexts that the AEAD alone cannot tell apart.
 ///
-/// 「活条目」与「墓碑」用的是同一个密钥、同一种 AEAD。若种类不进 AAD，
-/// 攻击者可以把一条墓碑记录的密文搬到活条目的位置，让一个条目凭空消失
-/// （或反过来，把已删除的条目复活）。两者都是合法密文，AEAD 不会察觉。
+/// # The sync kinds are here but outside the vault file's value range
 ///
-/// # 同步记录的种类在这里，但不在保险库文件的取值范围内
+/// The variants cover **two** record sets: `Entry`/`Tombstone` for vault files and
+/// `SyncEntry`/`SyncTombstone` for sync payloads. They share one subkey and are
+/// separated by the kind byte and by the format version.
 ///
-/// 前四个种类是**两套**用途：`Entry`/`Tombstone` 用于保险库文件，
-/// `SyncEntry`/`SyncTombstone` 用于同步载荷。它们共用一把子密钥，靠种类字节与
-/// 格式版本两层分开。
-///
-/// 取值刻意落在高半区（`0x80` 起），与文件里会出现的值（`0x01`/`0x02`）隔开一大段：
-/// 将来若给文件格式加种类，会从低半区往上排，不会撞上同步那几个。更重要的是
-/// [`RecordKind::from_byte`] **不认**同步种类——保险库解析器因此会把一条混进文件的
-/// 同步记录报成 [`crate::Error::VaultUnknownRecordKind`]，而不是当成合法记录收下。
+/// The values sit in the high half (from `0x80`), far from the values that occur in a
+/// file (`0x01`/`0x02`), so kinds added to the file format are taken from the low half
+/// and cannot collide with the sync kinds. Moreover, [`RecordKind::from_byte`] does
+/// **not** accept the sync kinds, so the vault parser reports a sync record inside a file
+/// as [`crate::Error::VaultUnknownRecordKind`] instead of accepting it as a valid
+/// record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecordKind {
-    /// 活条目（保险库文件）。
+    /// A live entry (vault file).
     Entry,
-    /// 墓碑（保险库文件）。
+    /// A tombstone (vault file).
     Tombstone,
-    /// 活条目，出现在**同步载荷**里。
+    /// A live entry, found in a **sync payload**.
     SyncEntry,
-    /// 墓碑，出现在**同步载荷**里。
+    /// A tombstone, found in a **sync payload**.
     SyncTombstone,
 }
 
 impl RecordKind {
-    /// 写入文件与参与 AAD 的字节值。
+    /// The byte value written to the file and fed into the AAD.
     ///
-    /// **这个值是对外契约**：它同时进 AAD，改动会让所有既有密文解不开。
+    /// **This value is a public contract**: it is part of the AAD, so changing it makes
+    /// every existing ciphertext undecryptable.
     pub(crate) const fn as_byte(self) -> u8 {
         match self {
             Self::Entry => 0x01,
@@ -401,14 +407,15 @@ impl RecordKind {
         }
     }
 
-    /// 从**保险库文件**里读到的字节还原种类。
+    /// Restores a kind from a byte read from a **vault file**.
     ///
-    /// 未知值一律拒绝（返回 `None`）而不是当作活条目处理：把未知种类当成
-    /// 「大概是个条目」会让一个未来版本写出的墓碑被旧版本当成活条目复活。
+    /// Unknown values are rejected (`None`) rather than treated as a live entry: taking
+    /// an unknown kind for "probably an entry" would revive a tombstone written by a
+    /// future version as a live entry.
     ///
-    /// 同步种类刻意不在这里——它们只出现在同步载荷里，而那一层的解析器按种类试解密
-    /// （见 [`crate::sync::record`] 的模块文档）。让一个函数同时认两套取值，就等于让
-    /// 「文件里出现同步记录」这件事变成合法的。
+    /// The sync kinds are deliberately absent: they only occur in sync payloads, and the
+    /// parser of that layer tries decryption per kind (see the module documentation of
+    /// [`crate::sync::record`]).
     pub(crate) const fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             0x01 => Some(Self::Entry),
@@ -417,17 +424,18 @@ impl RecordKind {
         }
     }
 
-    /// 从**同步载荷**里读到的字节还原种类。
+    /// Restores a kind from a byte read from a **sync payload**.
     ///
-    /// # 当前没有生产调用点，但它是承重的
+    /// # No production call site, but load-bearing
     ///
-    /// 载荷的解析器不靠这个函数选种类（它按种类试解密），因此它在正常路径上没有调用
-    /// 者。保留它是因为它定义了「哪些字节值是合法的同步记录种类」这一事实，而
-    /// `crate::sync` 里的编译期断言与单元测试都依赖它——没有它，那两个断言就只能拿
-    /// 字面量 `0x81` / `0x82` 去比，而那是把契约抄了两遍。
+    /// The payload parser does not choose kinds with this function (it tries decryption
+    /// per kind), so the normal path never calls it. It is kept because it defines which
+    /// byte values are valid sync record kinds, and the compile-time assertions and unit
+    /// tests in `crate::sync` depend on it.
     ///
-    /// 与 [`RecordKind::from_byte`] 严格互斥：一台设备把同步载荷解成「条目集合」之后
-    /// 才能去改自己的保险库，因此两层之间不该有同一个记录种类同时合法的位置。
+    /// Strictly disjoint from [`RecordKind::from_byte`]: a device decodes a sync payload
+    /// into a set of entries before touching its own vault, so no record kind may be
+    /// valid in both layers.
     #[cfg_attr(
         not(test),
         expect(
@@ -444,24 +452,26 @@ impl RecordKind {
     }
 }
 
-/// AAD 的字节长度：1（种类）+ 16（entry_id）+ 1（格式版本）。
+/// AAD length in bytes: 1 (kind) + 16 (entry_id) + 1 (format version).
 const AAD_LEN: usize = 1 + EntryId::LEN + 1;
 
-/// 构造附加认证数据（AAD）。
+/// Builds the additional authenticated data (AAD).
 ///
-/// # 它防住的三件事
+/// # The three moves it blocks
 ///
-/// 1. **密文跨条目搬运**——把条目 A 的密文复制到条目 B 的位置。AAD 含
-///    `entry_id`，位置一变认证即失败。
-/// 2. **密文跨种类搬运**——把墓碑密文当作条目密文（删除被静默撤销），
-///    或反过来（条目被静默删除）。AAD 含 [`RecordKind`]。
-/// 3. **密文跨格式版本搬运**——把旧格式的密文塞进新格式的文件，绕过新格式
-///    的额外校验。AAD 含格式版本。
+/// 1. **Ciphertext moved between entries** — the ciphertext of entry A copied to the
+///    position of entry B. The AAD contains `entry_id`, so authentication fails as soon
+///    as the position changes.
+/// 2. **Ciphertext moved between kinds** — a tombstone ciphertext used as an entry
+///    ciphertext (a deletion silently undone) or the reverse (an entry silently
+///    deleted). The AAD contains [`RecordKind`].
+/// 3. **Ciphertext moved between format versions** — an old-format ciphertext placed
+///    into a new-format file to bypass the new format's extra checks. The AAD contains
+///    the format version.
 ///
-/// # 为什么不做成可读的结构
-///
-/// 固定长度的字节串比任何自描述编码都更难写错，也更容易逐字节核对。
-/// 它的布局必须与 [`crate::vault::FORMAT_VERSION`] 一同演进。
+/// The layout is a fixed-length byte string rather than a self-describing encoding, so it
+/// is easy to check byte by byte, and it evolves together with
+/// [`crate::vault::FORMAT_VERSION`].
 pub(crate) fn build_aad(kind: RecordKind, entry_id: &EntryId, format_version: u8) -> [u8; AAD_LEN] {
     let mut aad = [0_u8; AAD_LEN];
     aad[0] = kind.as_byte();
@@ -470,17 +480,18 @@ pub(crate) fn build_aad(kind: RecordKind, entry_id: &EntryId, format_version: u8
     aad
 }
 
-/// 加密一段记录明文。
+/// Encrypts record plaintext.
 ///
-/// 返回的密文**含** 16 字节 Poly1305 认证标签（追加在末尾），因此长度是
-/// `plaintext.len() + TAG_LEN`。调用方把 nonce 一并存进文件——nonce 不是秘密，
-/// 但被篡改会导致解密失败，而失败正是我们要的结果。
+/// The returned ciphertext **includes** the 16-byte Poly1305 authentication tag
+/// (appended at the end), so its length is `plaintext.len() + TAG_LEN`. The caller stores
+/// the nonce in the file: a nonce is not a secret, but tampering with it makes decryption
+/// fail, which is the wanted outcome.
 ///
-/// # 错误
+/// # Errors
 ///
-/// 只可能因随机源不可用而失败（[`Error::RandomnessUnavailable`]）。加密本身
-/// 不会失败：XChaCha20-Poly1305 对任意长度的输入都有定义，不存在「明文太长」
-/// 这类情况。
+/// Can only fail when the random source is unavailable
+/// ([`Error::RandomnessUnavailable`]). Encryption itself cannot fail:
+/// XChaCha20-Poly1305 is defined for inputs of any length.
 pub(crate) fn seal(
     master: &MasterKey,
     kind: RecordKind,
@@ -492,15 +503,17 @@ pub(crate) fn seal(
     seal_with_key(&key, kind, entry_id, format_version, plaintext)
 }
 
-/// 用一把**已经派生好的**子密钥加密。
+/// Encrypts with a subkey that is **already derived**.
 ///
-/// 单独抽出来是为了让「一次同步只派生一次子密钥」成为可能：同步载荷里有成百上千条
-/// 记录，逐条重新派生 HKDF 会把两次 HMAC-SHA256 乘以条目数。派生一次然后传给这个
-/// 函数，代价从 O(n) 次派生降到 1 次。
+/// Extracted so that one sync derives its subkey once: a payload holds hundreds or
+/// thousands of records, and re-deriving HKDF per record would multiply two HMAC-SHA256
+/// operations by the record count. The plaintext is encrypted in place, so no second copy
+/// of it stays in memory.
 ///
-/// # 错误
+/// # Errors
 ///
-/// 只可能因随机源不可用而失败（[`Error::RandomnessUnavailable`]）。
+/// Can only fail when the random source is unavailable
+/// ([`Error::RandomnessUnavailable`]).
 pub(crate) fn seal_with_key(
     key: &[u8; 32],
     kind: RecordKind,
@@ -512,21 +525,21 @@ pub(crate) fn seal_with_key(
     let nonce = random_nonce()?;
     let aad = build_aad(kind, entry_id, format_version);
     let mut buffer = plaintext.to_vec();
-    // 原地加密，避免再多一份明文副本在内存里停留。
     cipher
         .encrypt_in_place(&XNonce::from(nonce), &aad, &mut buffer)
         .map_err(|_| Error::VaultDecryptionFailed)?;
     Ok((nonce, buffer))
 }
 
-/// 解密一段记录密文。
+/// Decrypts record ciphertext.
 ///
-/// # 错误
+/// # Errors
 ///
-/// 认证失败一律返回 [`Error::VaultDecryptionFailed`]，**不区分**「密钥不对」
-/// 「密文被篡改」「AAD 不匹配」三种原因。区分它们对攻击者有用（可以据此判断
-/// 猜测的密钥是否正确、篡改的是哪一部分），对使用者没有可操作价值——三种
-/// 情况的应对都是「这份保险库打不开」。
+/// Any authentication failure returns [`Error::VaultDecryptionFailed`], **without**
+/// distinguishing a wrong key, a modified ciphertext and a mismatching AAD. Telling them
+/// apart would help an attacker (it reveals whether a guessed key is right and which part
+/// was modified) and gives the user nothing actionable: all three mean that this vault
+/// cannot be opened.
 pub(crate) fn open(
     master: &MasterKey,
     kind: RecordKind,
@@ -539,12 +552,13 @@ pub(crate) fn open(
     open_with_key(&key, kind, entry_id, format_version, nonce, ciphertext)
 }
 
-/// 用一把**已经派生好的**子密钥解密。理由同 [`seal_with_key`]。
+/// Decrypts with a subkey that is **already derived**. Same reasoning as
+/// [`seal_with_key`].
 ///
-/// # 错误
+/// # Errors
 ///
-/// 认证失败一律返回 [`Error::VaultDecryptionFailed`]，**不区分**「密钥不对」
-/// 「密文被篡改」「AAD 不匹配」三种原因。
+/// Any authentication failure returns [`Error::VaultDecryptionFailed`], **without**
+/// distinguishing a wrong key, a modified ciphertext and a mismatching AAD.
 pub(crate) fn open_with_key(
     key: &[u8; 32],
     kind: RecordKind,
@@ -577,7 +591,6 @@ mod tests {
 
         let debug = format!("{k:?}");
         assert!(debug.contains("REDACTED"), "Debug 未脱敏：{debug}");
-        // 明文不得以十进制或十六进制形态出现。
         for byte in k.expose() {
             assert!(
                 !debug.contains(&format!("{byte}")),
@@ -607,7 +620,8 @@ mod tests {
         assert_eq!(k.expose(), &[7_u8; MASTER_KEY_LEN]);
     }
 
-    /// 同一主密钥必须派生出同一子密钥，否则同步过来的条目解不开。
+    /// The same master key must derive the same subkey, otherwise synced entries cannot
+    /// be opened.
     #[test]
     fn derived_key_is_deterministic() {
         let bytes: SecretBytes = vec![3_u8; MASTER_KEY_LEN].into();
@@ -619,7 +633,7 @@ mod tests {
         );
     }
 
-    /// 不同主密钥必须派生出不同子密钥。
+    /// Different master keys must derive different subkeys.
     #[test]
     fn derived_key_differs_per_master_key() {
         let a = MasterKey::from_bytes(vec![1_u8; MASTER_KEY_LEN].into()).expect("长度正确");
@@ -630,10 +644,9 @@ mod tests {
         );
     }
 
-    /// 子密钥**不得**等于主密钥本身。
+    /// A subkey must **not** equal the master key itself.
     ///
-    /// 若派生被误实现成恒等映射（例如 info 拼错导致走了一条退化路径），
-    /// 这个测试会抓住它。
+    /// Catches a derivation that degenerates into the identity map.
     #[test]
     fn derived_key_is_not_the_master_key() {
         let bytes: SecretBytes = vec![5_u8; MASTER_KEY_LEN].into();
@@ -662,7 +675,8 @@ mod tests {
         assert_eq!(opened, plaintext);
     }
 
-    /// 每次加密必须用新 nonce——随机 nonce 的安全性依赖这一点。
+    /// Every encryption must use a fresh nonce; the security of a random nonce depends
+    /// on it.
     #[test]
     fn each_seal_uses_a_fresh_nonce() {
         let k = key();
@@ -672,7 +686,8 @@ mod tests {
         assert_ne!(n1, n2, "两次加密复用了 nonce");
     }
 
-    /// 同一明文两次加密的密文必须不同（否则等于泄露「这两条内容相同」）。
+    /// Two encryptions of the same plaintext must differ, otherwise they leak that the
+    /// two contents are equal.
     #[test]
     fn ciphertext_is_not_deterministic() {
         let k = key();
@@ -682,7 +697,7 @@ mod tests {
         assert_ne!(c1, c2);
     }
 
-    /// 换一个主密钥必须解不开。
+    /// Another master key must fail to decrypt.
     #[test]
     fn wrong_master_key_fails() {
         let id = EntryId::generate().expect("OS 随机源可用");
@@ -692,7 +707,8 @@ mod tests {
         assert!(matches!(err, Err(Error::VaultDecryptionFailed)));
     }
 
-    /// **AAD 的核心测试**：密文跨条目搬运必须失败。
+    /// **Core AAD test**: ciphertext must not move between entries. It opens at its
+    /// original position and fails at another `entry_id`.
     #[test]
     fn ciphertext_cannot_move_between_entry_ids() {
         let k = key();
@@ -700,10 +716,8 @@ mod tests {
         let b = EntryId::generate().expect("OS 随机源可用");
         let (nonce, ciphertext) = seal(&k, RecordKind::Entry, &a, 1, b"payload").expect("可加密");
 
-        // 原位置能解开
         assert!(open(&k, RecordKind::Entry, &a, 1, &nonce, &ciphertext).is_ok());
 
-        // 搬到另一个 entry_id 的位置必须失败
         let err = open(&k, RecordKind::Entry, &b, 1, &nonce, &ciphertext);
         assert!(
             matches!(err, Err(Error::VaultDecryptionFailed)),
@@ -711,7 +725,8 @@ mod tests {
         );
     }
 
-    /// 密文跨种类搬运必须失败（墓碑冒充条目、条目冒充墓碑）。
+    /// Ciphertext must not move between kinds (a tombstone impersonating an entry and
+    /// the reverse).
     #[test]
     fn ciphertext_cannot_move_between_kinds() {
         let k = key();
@@ -725,7 +740,7 @@ mod tests {
         assert!(open(&k, RecordKind::Entry, &id, 1, &nonce2, &ciphertext2).is_err());
     }
 
-    /// 密文跨格式版本搬运必须失败。
+    /// Ciphertext must not move between format versions.
     #[test]
     fn ciphertext_cannot_move_between_format_versions() {
         let k = key();
@@ -734,9 +749,10 @@ mod tests {
         assert!(open(&k, RecordKind::Entry, &id, 2, &nonce, &ciphertext).is_err());
     }
 
-    /// **篡改密文、nonce、标签的任意一个字节都必须失败。**
+    /// **Flipping any single byte of the ciphertext, the nonce or the tag must fail.**
     ///
-    /// 逐个位置翻转，覆盖密文体、nonce 全部 24 字节、以及标签 16 字节。
+    /// Every position is flipped, covering the ciphertext body, all 24 nonce bytes and
+    /// the 16 tag bytes.
     #[test]
     fn flipping_any_ciphertext_byte_fails_authentication() {
         let k = key();
@@ -765,7 +781,8 @@ mod tests {
         }
     }
 
-    /// AAD 的长度与布局是对外契约（写进文件语义），锁住它。
+    /// The AAD length and layout are a public contract (they define file semantics); the
+    /// test pins them down.
     #[test]
     fn aad_layout_is_stable() {
         let id = EntryId::from_bytes([0xAB; EntryId::LEN]);
@@ -779,7 +796,7 @@ mod tests {
         assert_eq!(build_aad(RecordKind::Tombstone, &id, 7)[17], 7);
     }
 
-    /// 种类字节必须能往返，且未知值被拒绝。
+    /// Kind bytes must round-trip and unknown values must be rejected.
     #[test]
     fn record_kind_byte_roundtrips_and_rejects_unknown() {
         for kind in [RecordKind::Entry, RecordKind::Tombstone] {
@@ -790,7 +807,7 @@ mod tests {
         }
     }
 
-    /// 空明文也必须能往返（边界）。
+    /// Empty plaintext must round-trip too (boundary).
     #[test]
     fn empty_plaintext_roundtrips() {
         let k = key();
@@ -801,7 +818,7 @@ mod tests {
         assert!(opened.is_empty());
     }
 
-    /// 截断密文必须失败——不能把「标签不完整」当成合法短明文。
+    /// Truncated ciphertext must fail; an incomplete tag is not a valid short plaintext.
     #[test]
     fn truncated_ciphertext_fails() {
         let k = key();
@@ -818,7 +835,7 @@ mod tests {
         }
     }
 
-    /// `master_key_to_bytes` 必须给出可用于重建的字节。
+    /// `master_key_to_bytes` must produce bytes that rebuild the same key.
     #[test]
     fn master_key_bytes_roundtrip() {
         let original = MasterKey::from_bytes(vec![9_u8; MASTER_KEY_LEN].into()).expect("长度正确");

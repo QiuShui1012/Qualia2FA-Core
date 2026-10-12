@@ -13,43 +13,49 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! 传输抽象：本模块只认识「把一段字节送到某个对端」，不认识 WiFi、二维码、蓝牙。
+//! Transport abstraction: this module only knows how to move a run of bytes to a peer. It
+//! knows nothing about WiFi, QR codes or Bluetooth.
 //!
-//! # 它为什么在核心库里，而具体通道不在
+//! The boundary between this module and the concrete channels follows from the core
+//! library's properties: it has `#![forbid(unsafe_code)]` and performs no I/O, while every
+//! real transport needs I/O — UDP multicast needs a socket, QR codes need a camera and a
+//! screen, Quick Share needs platform APIs. This module defines what one synchronization
+//! exchange looks like; the platform side implements how the bytes get across.
 //!
-//! 核心库有 `#![forbid(unsafe_code)]`、不依赖任何 I/O。而**每一种真实的传输方式都要
-//! I/O**：UDP 组播要 socket，二维码要摄像头与屏幕，Quick Share 要平台 API。因此边界
-//! 只能划在这里：核心库定义「一次同步交换长什么样」，平台侧实现「字节怎么过去」。
+//! The same protocol also runs in-process without a network. Protocol correctness (which
+//! payload arrives first, how conflicts are reported, how replays are blocked) is therefore
+//! verified in a single process rather than by pairing two real devices; see the
+//! implementation contract on [`Transport`] and the tests in this module.
 //!
-//! 这也让同一套协议能在**测试里跑通**而不需要网络——见 [`Transport`] 的实现要求与
-//! 本模块的测试。协议的正确性（谁的载荷先到、冲突怎么报、重放怎么挡）因此可以在
-//! 一个进程里验证，而不是靠两台真机对拍。
+//! # Three transports, one protocol
 //!
-//! # 三种传输方式，一套协议
+//! | Transport | Roster | Per-message limit | Notes |
+//! |-----------|--------|-------------------|-------|
+//! | QR code | two-party | yes (a few kilobytes per code; split across codes when it does not fit) | single-use, out-of-band |
+//! | LAN (QWBP) | multi-party | none (reliable byte stream) | primary transport |
+//! | Hotspot | multi-party | none | a LAN variant; platform differences live in the implementation |
 //!
-//! | 方式 | 队形 | 单条上限 | 说明 |
-//! |------|------|----------|------|
-//! | 二维码 | 两方 | 有（一张几千字节，装不下时拆成多张） | 一次性、带外 |
-//! | 局域网（QWBP） | 多方 | 无（可靠字节流） | 主要方式 |
-//! | 热点 | 多方 | 无 | 局域网的一种，平台差异在实现里 |
+//! [`TransportCapabilities`] describes every difference between them, so [`SyncSession`]
+//! needs no per-transport branch.
 //!
-//! 三者的差别全部被 [`TransportCapabilities`] 描述，因此 [`SyncSession`] 不需要为
-//! 它们各写一条分支。
+//! **A "message" is not a single physical artifact.** When a QR code cannot hold the
+//! payload, the channel may display several codes in sequence and let the peer scan them
+//! one by one and reassemble the payload (animated QR codes); the core library is
+//! deliberately unaware of that layer. The channel declares how many bytes one message can
+//! carry (the sum over the codes), while how frames are cut and reassembled is the
+//! channel's business. The core library therefore never needs to know about frames: it
+//! only ever compares byte counts, see [`TransportCapabilities::max_message_len`].
 //!
-//! **「一条消息」不等于「一个物理制品」。** 二维码装不下时可以连续显示多张、由对端
-//! 逐张扫回来拼成一份载荷（动态二维码），而核心库对这一层是**无感**的：通道声明的是
-//! 「一条消息能带过去多少字节」（各张之和），帧怎么切、怎么拼都属于通道实现。核心库
-//! 因此不需要认识「帧」——它比较的始终是字节数，见
-//! [`TransportCapabilities::max_message_len`]。
+//! # Two-party and multi-party channels
 //!
-//! # 两方与多方的分工（用户要求）
+//! A two-party channel starts transferring immediately: only one peer will ever show up,
+//! so there is nobody to wait for. On a multi-party channel the initiator decides when to
+//! start; otherwise the device that connects first would finish exchanging payloads before
+//! the others arrive, and the result of that round would depend on who connected first.
 //!
-//! **两方通道直接开始传**——只有一个人会来，没有「等谁来」的问题。
-//! **多方通道由发起方决定何时开始**——否则先连上的设备会在其他人到齐之前就把载荷
-//! 换完，而那一轮同步的结果取决于谁先连上。
-//!
-//! 这条规则写成 [`TransportCapabilities::needs_start_signal`]，而不是散在调用点的
-//! `if`，因为它是**协议性质**：任何一方判错都会导致「同步成功了但少了几条」。
+//! That rule is exposed as [`TransportCapabilities::needs_start_signal`] rather than left
+//! to `if` statements at the call sites because it is a protocol property: a single side
+//! getting it wrong ends in a sync that "succeeded" but is missing records.
 
 use core::fmt;
 
@@ -58,101 +64,106 @@ use crate::sync::{self, MergedRecord, Payload, PayloadKind, SeenSyncIds, SyncId}
 use crate::vault::{MasterKey, Vault};
 use qualia_dik::DeviceId;
 
-/// 一次同步里有几方。
+/// How many parties take part in one sync.
 ///
-/// 决定「要不要等发起方下令」。这个区分必须在**通道**层面声明，而不是由调用方猜：
-/// 同一份代码在二维码上是两方、在局域网上的同一次使用却可能是多方。
+/// Decides whether the initiator's start signal must be awaited. The distinction has to be
+/// declared by the transport rather than guessed by the caller: the same code is two-party
+/// over QR codes and may be multi-party for the same use over a LAN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Roster {
-    /// 只会有两方。连上就开始传。
+    /// Exactly two parties. Transfer starts as soon as they connect.
     TwoParty,
-    /// 可能有三方或更多。由发起方决定何时开始。
+    /// Three or more parties. The initiator decides when to start.
     MultiParty,
 }
 
 impl Roster {
-    /// 是否需要在开始前等发起方下令。
+    /// Whether the initiator's start signal must be awaited before transferring.
     #[must_use]
     pub const fn needs_start_signal(self) -> bool {
         matches!(self, Self::MultiParty)
     }
 }
 
-/// 收件人。
+/// The recipient of a message.
 ///
-/// # 为什么发送时必须指定收件人，而不是所有方法都当成广播
-///
-/// 载荷里的每条记录都被主密钥保护，因此**广播本身不会泄露内容**。问题在别处：一次
-/// 多设备同步里，「我这一轮把 B 的改动转发给 C」与「我把我自己的改动广播出去」是
-/// 两个不同的动作，而后者会在 B 与 C 各自已经直接收到过的情况下重复传一遍。把收件人
-/// 变成显式参数，能让误用（想发给一个却发给了全部）在签名上就看得出来。
+/// Every record in a payload is protected by the master key, so broadcasting leaks no
+/// content by itself. The recipient is still an explicit parameter: in a multi-device sync,
+/// "forward B's changes to C in this round" and "broadcast my own changes" are two different
+/// actions, and sending to everyone when one peer was meant should be visible in the
+/// signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recipient {
-    /// 只发给这一个对端。
+    /// Send to this peer only.
     One(DeviceId),
-    /// 发给本次会话里的全部对端。
+    /// Send to every peer in the current session.
     All,
 }
 
-/// 一种传输方式能做什么。
+/// What a transport can do.
 ///
-/// # 为什么能力要「声明」而不是「试探」
+/// # Capabilities are declared, not probed
 ///
-/// 试探的代价是真实且不可逆的：二维码要试探「装不装得下」就得先生成一张码，而用户
-/// 已经把它举到另一台设备的摄像头前了。声明则让调用方在**开始之前**就知道该选哪种
-/// 模式，装不下时直接引导用户改用局域网。
+/// The answer has to be available before the exchange starts: the caller picks the mode up
+/// front and can send the user to a LAN transfer when the payload does not fit, without
+/// first displaying a code to be scanned.
 ///
-/// 远期要支持智能手表时，唯一变化的就是这里的一个数字——那是把它做成能力声明的
-/// 全部理由。
+/// # One message may span several physical artifacts
 ///
-/// # 一条消息可以横跨多个物理制品
+/// When a QR code cannot hold the whole payload, the channel may display the same message
+/// as several codes in sequence (animated QR codes) and let the peer scan them one by one
+/// and reassemble the original bytes; other channels may have their own fragmentation
+/// (several files, several clipboard chunks). The core library is deliberately unaware of
+/// that layer:
 ///
-/// 二维码装不下整份载荷时，通道可以把同一条消息**连续显示成好几张码**（动态二维码），
-/// 由对端逐张扫、拼回原来的字节；将来别的通道也可能有自己的分片方式（多个文件、多段
-/// 剪贴板）。核心库对这一层**刻意无感**：
+/// - [`TransportCapabilities::max_message_len`] is the number of bytes **one message** (all
+///   artifacts together) can carry, not the size of a single artifact;
+/// - there is no frame count field, and there must not be one: how many codes are shown and
+///   how large each one is are the channel's business, and every extra field is another
+///   chance for the declaration to disagree with the implementation.
 ///
-/// - [`TransportCapabilities::max_message_len`] 说的是**一条消息**（各制品合起来）能
-///   带过去的字节数，而不是单个制品的字节数；
-/// - 核心库没有「帧数」这个字段，也不该有：切几张、每张多大是通道实现的事，而多一
-///   个字段就多一处「声明与实现不一致」的机会。
-///
-/// 两处的数字必须来自**同一个计算**：声明给这里的那一个，与通道真正拆帧时用的那一个。
-/// 平台侧的多帧二维码通道用 `qualia-transport` 的
-/// `QrProfile::exchange_capacity(max_frames)` 得到它——那里同时也是渲染时用的容量。
+/// Both places must use **one and the same computation**: the value declared here and the
+/// capacity the channel actually uses when splitting frames. The platform-side multi-frame
+/// QR channel obtains it from `QrProfile::exchange_capacity(max_frames)` in
+/// `qualia-transport`, which is also the capacity used for rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportCapabilities {
-    /// 队形。
+    /// Roster.
     pub roster: Roster,
-    /// 单条消息的字节上限；`None` 表示可靠字节流、整份载荷一次过。
+    /// Per-message byte limit; `None` means a reliable byte stream that takes the whole
+    /// payload in one go.
     ///
-    /// 二维码是 `Some`：它的容量随版本变化，且**装不下就是装不下**，没有重试余地。
-    /// 局域网是 `None`：那是字节流，几千条记录的载荷照发。
+    /// QR codes are `Some`: their capacity depends on the version, and a payload that does
+    /// not fit never will. A LAN channel is `None`: it is a byte stream and sends payloads
+    /// with thousands of records just as well.
     ///
-    /// **多帧通道填的是各张码之和**，不是一张码的容量（见类型文档的「一条消息可以
-    /// 横跨多个物理制品」）。
+    /// **A multi-frame channel declares the sum over all codes**, not the capacity of a
+    /// single code (see "One message may span several physical artifacts" above).
     pub max_message_len: Option<usize>,
-    /// 展示二维码时允许的最大版本（1–40）。
+    /// Largest QR version this channel may display (1–40).
     ///
-    /// `None` 表示这条通道不展示二维码。远期的智能手表会填一个很小的值，桌面端可以
-    /// 填 40。**这个值属于平台，不属于数据集**：同一个数据集在手表上装不下、在桌面端
-    /// 绰绰有余，而「装不下」的处置（引导改用局域网）也由平台决定。
+    /// `None` means the channel does not display QR codes. **This value belongs to the
+    /// platform, not to the data set**: the same data set may fail to fit on one platform
+    /// and fit easily on another, and what to do when it does not fit (send the user to a
+    /// LAN transfer) is a platform decision as well.
     pub max_qr_version: Option<u8>,
-    /// 这条通道是否只能使用一次。
+    /// Whether this channel may be used only once.
     ///
-    /// 二维码是 `true`：一张码承载一次交换，复用同一张码等于把重放防护之外的一条歧路
-    /// 打开。局域网是 `false`。
+    /// QR codes are `true`: one code carries one exchange, and reusing the same code opens
+    /// a path around replay protection. A LAN channel is `false`.
     pub single_use: bool,
-    /// 这条通道能否承载**整份**载荷（D9 的「全量提供」模式）。
+    /// Whether this channel can carry the **whole** payload (the full-provision mode).
     ///
-    /// 为 `false` 时只能用「建链」模式：通道本身只用来交换地址/密钥，载荷另外走一条
-    /// 字节流。
+    /// When `false`, only link establishment is possible: the channel itself is used to
+    /// exchange addresses/keys, and the payload travels over a separate byte stream.
     pub can_carry_payload: bool,
 }
 
 impl TransportCapabilities {
-    /// 一条**位流**通道（局域网、热点、将来的 Quick Share）。
+    /// A **byte-stream** channel (LAN, hotspot, Quick Share).
     ///
-    /// 载荷整份走这条通道，没有单条上限，可以反复使用。
+    /// The whole payload travels over this channel; there is no per-message limit and the
+    /// channel can be used repeatedly.
     #[must_use]
     pub const fn stream(roster: Roster) -> Self {
         Self {
@@ -164,20 +175,24 @@ impl TransportCapabilities {
         }
     }
 
-    /// 一条**定长**通道（二维码）。
+    /// A **fixed-size** channel (QR codes).
     ///
-    /// `max_message_len` 是这条通道**一条消息**能带的字节数：单张码时就是那张码的
-    /// 容量（由平台侧按纠错级别算好），多张码时是[各张之和](TransportCapabilities)。
-    /// 这里不接受「版本号」作为输入，因为「40 版能装多少字节」取决于纠错级别与编码
-    /// 模式，而那是平台库的事——核心库替它算，就是把一个易变的表抄进来。
+    /// `max_message_len` is the number of bytes this channel can carry in **one message**:
+    /// the capacity of a single code when there is only one (computed on the platform side
+    /// from the error-correction level), and the
+    /// [sum over all codes](TransportCapabilities) when there are several. It takes no
+    /// version number as input: how many bytes version 40 holds depends on the
+    /// error-correction level and the encoding mode, which is the platform library's
+    /// business.
     ///
-    /// **多帧的通道请把这个数字取自同一个计算。** 平台侧拆帧时用的容量与声明在这里的
-    /// 上限必须一致，否则核心库会批准一份这份载荷渲染不出来的分享。多帧二维码用
-    /// `qualia-transport` 的 `QrProfile::exchange_capacity(max_frames)`。
+    /// **Multi-frame channels must take this number from the same computation** that splits
+    /// frames: the declared limit and the capacity the channel actually uses must agree,
+    /// otherwise the core library approves a share that the channel cannot render.
+    /// Multi-frame QR codes use `QrProfile::exchange_capacity(max_frames)` from
+    /// `qualia-transport`.
     #[must_use]
     pub const fn qr(max_qr_version: u8, max_message_len: usize) -> Self {
         Self {
-            // 二维码天然是两方通道：一张码只会被一台设备扫。
             roster: Roster::TwoParty,
             max_message_len: Some(max_message_len),
             max_qr_version: Some(max_qr_version),
@@ -186,16 +201,18 @@ impl TransportCapabilities {
         }
     }
 
-    /// 这条通道能否装下一份 `len` 字节的载荷。
+    /// Whether this channel can carry a payload of `len` bytes.
     ///
-    /// `len` 是**一条消息**的字节数；多帧通道上它对应的是各帧之和，而不是某一帧。
-    /// 这是「装不装得下」的**唯一**判据：规划与发送都必须走它，否则会出现「规划说
-    /// 装得下、发送却报错」——用户那时已经举着手机在扫了。
+    /// `len` is the size of **one message**; on a multi-frame channel it is the sum over
+    /// all frames, not the size of a single frame. This is the **only** test for "does it
+    /// fit": planning and sending must both go through it, otherwise a share can be planned
+    /// as fitting and then fail to send.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 装不下时返回 [`Error::TransportMessageTooLarge`]，带上实际需要的字节数——调用
-    /// 方据此才能告诉用户「差多少」，而不是一个「太大了」。
+    /// Returns [`Error::TransportMessageTooLarge`] carrying the number of bytes actually
+    /// needed, so that the caller can tell the user how much is missing rather than just
+    /// "too large".
     pub fn check_fits(&self, len: usize) -> Result<()> {
         match self.max_message_len {
             Some(limit) if len > limit => {
@@ -205,84 +222,91 @@ impl TransportCapabilities {
         }
     }
 
-    /// 是否必须等发起方下令才能开始。
+    /// Whether the initiator's start signal must be awaited before transferring.
     #[must_use]
     pub const fn needs_start_signal(&self) -> bool {
         self.roster.needs_start_signal()
     }
 }
 
-/// 一条能搬运同步载荷的通道。
+/// A channel that can move sync payloads.
 ///
-/// # 实现契约
+/// # Implementation contract
 ///
-/// 1. **`receive` 必须如实报告发送方**，不能只交回字节。载荷里的 `sender` 是自报的，
-///    因此它只能作为**交叉校验**用；「是谁送来的」这件事只有通道知道。在广播型通道上
-///    （局域网组播）任何设备都能把别人发过的载荷原样重放，于是「载荷说自己是 B」与
-///    「实际是 C 发来的」可以同时成立。核心库把这个比对做成硬检查
-///    （[`Error::SyncSenderMismatch`]），因此实现方谎报发送方**不能**换来任何好处，
-///    只会让同步失败。
-/// 2. **`send` 必须尊重 [`Recipient`]**。`Recipient::One` 不得退化成广播。
-/// 3. **`receive` 不得无限阻塞**。它应当在通道当前没有消息时返回
-///    [`Error::SyncNoSessionFound`]，由调用方决定要不要再等。核心库没有时钟，因此
-///    「等多久」只能由实现方与调用方共同决定。
-/// 4. **`single_use` 的通道第二次用必须返回 [`Error::TransportAlreadyUsed`]**。
+/// 1. **`receive` must report the sender truthfully**, not just hand back bytes. The
+///    `sender` inside the payload is self-reported and can therefore only serve as a
+///    **cross-check**; only the channel knows who actually sent the message. On a broadcast
+///    channel (LAN multicast) any device can replay a payload someone else sent unchanged,
+///    so "the payload says it is from B" and "C actually sent it" can hold at the same time.
+///    The core library turns that comparison into a hard check
+///    ([`Error::SyncSenderMismatch`]), so misreporting the sender gains an implementation
+///    nothing and only makes the sync fail.
+/// 2. **`send` must respect [`Recipient`]**: `Recipient::One` must not degrade into a
+///    broadcast.
+/// 3. **`receive` must not block indefinitely**. When the channel has no message it returns
+///    [`Error::SyncNoSessionFound`] and the caller decides whether to wait longer. The core
+///    library has no clock, so how long to wait is up to the implementation and the caller
+///    together.
+/// 4. **A `single_use` channel must return [`Error::TransportAlreadyUsed`] on its second
+///    use**.
 ///
-/// # 为什么签名里没有 `&mut self`
-///
-/// 平台侧的通道实现通常需要在内部维护 socket、缓冲区、状态机，而 `send`/`receive`
-/// 在语义上是「取一条消息」「放一条消息」。用 `&self` 把内部可变性的选择留给实现方
-/// （`Mutex` / 原子 / 无锁队列），比在 trait 上逼它选一个更合适。这也让实现方能在
-/// 多个线程上同时收发——局域网通道必然要这么做。
+/// Platform-side implementations typically keep sockets, buffers and state machines
+/// internally, while `send`/`receive` semantically just put and take one message. `&self`
+/// leaves the choice of interior mutability (`Mutex`, atomics, a lock-free queue) to the
+/// implementation and lets it send and receive on several threads at once, which LAN
+/// channels have to do.
 pub trait Transport {
-    /// 这条通道能做什么。
+    /// What this channel can do.
     fn capabilities(&self) -> TransportCapabilities;
 
-    /// 本设备的标识。
+    /// This device's identifier.
     ///
-    /// 载荷里的 `sender` 由它填写，因此收发两侧看到的是同一个值。
+    /// It fills in the `sender` of outgoing payloads, so both sides of an exchange see the
+    /// same value.
     fn local_device(&self) -> DeviceId;
 
-    /// 送出一条消息。
+    /// Sends one message.
     fn send(&self, to: Recipient, message: &[u8]) -> Result<()>;
 
-    /// 收一条消息，交回**字节**与**通道声称的发送方**。
+    /// Receives one message and hands back the **bytes** and the **sender the channel
+    /// claims**.
     ///
-    /// 当前没有消息时返回 [`Error::SyncNoSessionFound`]。
+    /// Returns [`Error::SyncNoSessionFound`] when no message is currently available.
     fn receive(&self) -> Result<(DeviceId, Vec<u8>)>;
 
-    /// 本次会话里的全部对端。
+    /// Every peer in the current session.
     ///
-    /// 两方通道上是零个或一个元素；多方通道上可能有多个。`Recipient::All` 的语义由
-    /// 它定义。刻意返回 `Vec` 而不是迭代器：调用方多半要先数一下有几个（决定要不要
-    /// 等下令），而迭代器会让那件事变成一次隐式的两次遍历。
+    /// Zero or one element on a two-party channel, possibly several on a multi-party one.
+    /// This defines the meaning of `Recipient::All`. It returns a `Vec` rather than an
+    /// iterator because callers usually need the count first (to decide whether to wait for
+    /// the start signal), and an iterator would turn that into an implicit second pass.
     fn peers(&self) -> Result<Vec<DeviceId>>;
 }
 
-/// 一次同步的结果。
+/// The result of one sync.
 #[derive(Debug)]
 pub struct SyncOutcome {
-    /// 刚处理完的那份载荷的标识。
+    /// Identifier of the payload just processed.
     ///
-    /// 调用方应当把它记下来（或交给 [`SeenSyncIds`]），下次收到同一个标识时
-    /// [`SyncSession::receive`] 会直接拒绝。
+    /// The caller should record it (or hand it to [`SeenSyncIds`]); the next time the same
+    /// identifier arrives, [`SyncSession::receive`] rejects it outright.
     pub sync_id: SyncId,
-    /// 合并结果：加了几条、删了几条、几条需要裁决。
+    /// Merge result: how many records were added, deleted, or need adjudication.
     pub merge: sync::MergeOutcome,
 }
 
 impl SyncOutcome {
-    /// 这次同步是否**什么也没改**。
+    /// Whether this sync changed **nothing at all**.
     ///
-    /// 与「合并报错」不是一回事：对端没有任何本机没有的改动是**正常**结果，调用方
-    /// 应当告诉用户「已是最新」。把它做成一个方法而不是让调用方自己拼条件，是因为
-    /// 拼错的方向是「明明没变却说变了」，而那会让用户以为同步很忙。
+    /// This is not the same as a failed merge: a peer holding no changes the local vault
+    /// lacks is a normal outcome. The condition is exposed as a method rather than left to
+    /// the caller so that it cannot be assembled wrongly.
     #[must_use]
     pub fn made_no_change(&self) -> bool {
         self.merge.made_no_change()
     }
 
-    /// 这次同步是否留下了需要用户裁决的冲突。
+    /// Whether this sync left conflicts that the user has to adjudicate.
     #[must_use]
     pub fn needs_adjudication(&self) -> bool {
         self.merge.needs_adjudication()
@@ -303,40 +327,40 @@ impl fmt::Display for SyncOutcome {
     }
 }
 
-/// 在一条通道上分享当前状态时该走哪条路（D9 的「两种模式」）。
+/// Which route to take when sharing the current state over a channel.
 ///
-/// # 为什么需要一个「先问一问」的步骤
+/// # The answer is needed before anything is displayed
 ///
-/// 二维码这条路上，「装不装得下」必须在**展示之前**就有答案：用户已经举着手机在扫了，
-/// 这时候才发现装不下，是最坏的时机。而 [`SyncSession::send`] 把「封装」与「发送」
-/// 一步做完，调用方没有机会先看一眼大小——等它报错时，码往往已经显示出来了。
+/// Whether the payload fits has to be known before a code is shown to be scanned, and
+/// [`SyncSession::send`] seals and sends in one step, leaving the caller no chance to look
+/// at the size first. This planning step therefore performs exactly the same sealing as
+/// sending and only splits the outcome into two routes.
 ///
-/// 于是有了这个规划步骤：它做与发送**完全相同**的封装，只把结果分成两条路。
+/// # "Does not fit" is another route, not a failure
 ///
-/// # 「装不下」不是失败，是**另一条路**
-///
-/// 装不下时该做的不是报错收场，而是先发一个**请求**（[`PayloadKind::Request`]，它没有
-/// 记录，因此比任何全量状态都小得多），把大载荷留给一条字节流通道——局域网，或者
-/// 用户改天再同步。把它表达成一个枚举而不是一个错误，是为了让「换条路」在类型上
-/// 就看得出来，而不是靠调用方去分辨错误的种类。
+/// When the payload does not fit, the answer is not an error: a **request**
+/// ([`PayloadKind::Request`], which carries no records and is far smaller than any full
+/// state) goes out first, and the large payload is left to a byte-stream channel (a LAN
+/// transfer) or to a later sync. It is an enum rather than an error so that the change of
+/// route is visible in the type instead of having to be read out of an error kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SharePlan {
-    /// 整份载荷装得下这条通道，直接发。
+    /// The whole payload fits this channel; send it directly.
     FullPayload {
-        /// 封装后的字节数。
+        /// Size in bytes after sealing.
         len: usize,
     },
-    /// 装不下：先发一个请求，再把载荷走别处送过去。
+    /// Does not fit: send a request first and move the payload over another channel.
     LinkEstablishment {
-        /// 载荷实际需要的字节数。
+        /// Number of bytes the payload actually needs.
         needed: usize,
-        /// 这条通道能装下的最大字节数。
+        /// Largest number of bytes this channel can carry.
         limit: usize,
     },
 }
 
 impl SharePlan {
-    /// 是否必须先建立一条字节流通道。
+    /// Whether a byte-stream channel must be established first.
     #[must_use]
     pub const fn needs_link(self) -> bool {
         matches!(self, Self::LinkEstablishment { .. })
@@ -354,42 +378,44 @@ impl fmt::Display for SharePlan {
     }
 }
 
-/// 一次同步会话。
+/// One synchronization session.
 ///
-/// # 它不持有传输通道
+/// # It does not own the transport
 ///
-/// 每个方法都把通道当作参数收。原因是生命周期：真实通道（局域网 socket）的存活时间
-/// 由平台的网络栈决定，而一次同步可能跨越「用户还没扫完码」这样长的时间；把通道钉在
-/// 会话结构里会逼着会话与通道同生共死，而那正是最容易写出「用户取消后 socket 还开着」
-/// 的地方。
+/// Every method takes the transport as a parameter. Real channels (a LAN socket) live as
+/// long as the platform's network stack keeps them, and one sync can span as much time as
+/// the user needs to finish scanning, so the session must not be tied to the channel's
+/// lifetime.
 ///
-/// # 它借用 `seen` 而不是拥有它
+/// # It borrows `seen` instead of owning it
 ///
-/// 重放日志必须**跨越多次会话**存活（否则重启一次应用就能重放所有旧载荷），因此它
-/// 的所有权在调用方。会话只借用它，并在**成功解密并合并之后**才把标识记进去。
+/// The replay log has to survive **across sessions** (otherwise restarting the app would
+/// make every old payload replayable), so the caller owns it. The session only borrows it
+/// and records an identifier **after** the payload was successfully decrypted and merged.
 pub struct SyncSession<'a> {
-    /// 本设备的主密钥，用来封/拆载荷。
+    /// This device's master key, used to seal and open payloads.
     master: &'a MasterKey,
-    /// 本设备的保险库，合并的目标。
+    /// This device's vault, the target of the merge.
     vault: &'a mut Vault,
-    /// 跨会话存活的重放日志。
+    /// Replay log that survives across sessions.
     seen: &'a mut SeenSyncIds,
-    /// 只接受来自这些设备的载荷。
+    /// Accept payloads only from these devices.
     ///
-    /// 空表示「接受任何对端」——那是**建链之后**的状态：通道已经通过带外（二维码）
-    /// 或配对确认过对方是谁。相反，局域网组播大厅里的载荷必须来自名单之内，否则
-    /// 任何同一网段的设备都能往你的保险库里灌记录。
+    /// Empty means "accept any peer", which is the state **after** a link has been
+    /// established: the channel has confirmed the peer out-of-band (QR code) or through
+    /// pairing. Payloads arriving in a LAN multicast hall must come from the list, or any
+    /// device on the same subnet could write records into the vault.
     allowed_senders: Vec<DeviceId>,
 }
 
 impl<'a> SyncSession<'a> {
-    /// 建立一个只接受名单内设备的会话。
+    /// Creates a session that accepts only the listed devices.
     ///
-    /// # 为什么默认是「只信名单」
-    ///
-    /// 载荷本身是被主密钥认证的，因此名单**不是**机密性的防线——一个没有主密钥的
-    /// 攻击者本来就造不出能通过认证的记录。名单防的是另一件事：把**别人签过名的**
-    /// 载荷原样重放，从而让用户以为自己与 B 同步过。在局域网组播上这件事零成本。
+    /// The payload itself is authenticated with the master key, so the list is **not** a
+    /// confidentiality barrier: an attacker without the master key cannot produce a record
+    /// that authenticates. The list guards against something else, namely replaying a
+    /// payload **someone else signed** unchanged so that the user believes they synced with
+    /// that peer. On LAN multicast this costs an attacker nothing.
     #[must_use]
     pub fn restricted(
         master: &'a MasterKey,
@@ -405,9 +431,10 @@ impl<'a> SyncSession<'a> {
         }
     }
 
-    /// 建立一个接受任何对端的会话。
+    /// Creates a session that accepts any peer.
     ///
-    /// 只应当在通道**已经**确认过对方身份之后使用（带外二维码、配对完成的连接）。
+    /// Use it only after the channel has **already** confirmed the peer's identity (an
+    /// out-of-band QR code, a completed pairing).
     #[must_use]
     pub fn open(master: &'a MasterKey, vault: &'a mut Vault, seen: &'a mut SeenSyncIds) -> Self {
         Self {
@@ -418,26 +445,26 @@ impl<'a> SyncSession<'a> {
         }
     }
 
-    /// 把本机当前的保险库封成一份载荷并发出去。
+    /// Seals the local vault into a payload and sends it.
     ///
-    /// # 它**不**把这份载荷记进重放日志
+    /// # It does **not** record this payload in the replay log
     ///
-    /// 日志只记**收到**的载荷。把自己的发出去的也记进去是很容易犯的错，而且它会造成
-    /// 一个奇怪的故障：一旦对端把这份载荷回传（或用户在两台设备之间来回同步），本机
-    /// 会因为「这个标识我见过」而拒绝一份**自己刚发出去的**载荷。日志的语义是
-    /// 「已经处理过的入站载荷」，不是「见过的载荷」。
+    /// The log holds **received** payloads only; its meaning is "inbound payloads already
+    /// processed", not "payloads seen". Recording an outgoing payload would make this device
+    /// reject its own payload when a peer sends it back or when the user syncs back and
+    /// forth between two devices.
     ///
-    /// # 载荷种类由调用方决定
+    /// # The payload kind is the caller's choice
     ///
-    /// `kind` 决定这份载荷是「我的全量状态」还是「请把你的发给我」。它不在这里写死，
-    /// 因为「要不要顺便把状态也带过去」是**协议层**的选择：局域网上一轮就够（状态
-    /// 交换），而二维码那条路上往往先发一个小请求（塞得进码里），再让对方把大数据走
-    /// 局域网发回来。
+    /// `kind` selects "my full state" or "send me yours". It is not fixed here because
+    /// whether the state travels along is a protocol-level decision: one round suffices on
+    /// a LAN (state exchange), whereas over QR codes a small request fits into the code and
+    /// the large payload comes back over a byte-stream channel.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 打包失败（见 [`Payload::from_vault`]）、通道装不下
-    /// （[`Error::TransportMessageTooLarge`]）、或通道本身失败。
+    /// Sealing failures (see [`Payload::from_vault`]), a payload that does not fit the
+    /// channel ([`Error::TransportMessageTooLarge`]), or any failure of the channel itself.
     pub fn send(
         &self,
         transport: &dyn Transport,
@@ -452,36 +479,35 @@ impl<'a> SyncSession<'a> {
         };
         let sealed = payload.seal(self.master)?;
 
-        // 先问通道装不装得下，再发。顺序不能反：装不下时发送本身可能就是有意义的动作
-        // （二维码已经把码显示出来了），而那时用户已经在扫码了。
         transport.capabilities().check_fits(sealed.len())?;
         transport.send(to, &sealed)?;
         Ok(payload.sync_id)
     }
 
-    /// 规划这次分享走哪条路——**在把码显示出来之前**就要知道答案。
+    /// Plans which route this share takes; the answer is known **before** anything is
+    /// displayed.
     ///
-    /// # 它不发送任何东西
+    /// # It sends nothing
     ///
-    /// 只做封装与比较。因此调用方可以在「用户还没确认」的时候先问一句，再决定要不要
-    /// 把码显示出来。
+    /// It only seals and compares, so the caller can ask first, while the user has not
+    /// confirmed yet, and then decide whether to display a code.
     ///
-    /// # 它规划的是「把我的全量状态发过去」
+    /// # It plans "send my full state"
     ///
-    /// 请求（[`PayloadKind::Request`]）没有记录，因此总是很小，不需要规划。真正需要
-    /// 提前知道的是全量状态装不装得下。
+    /// A request ([`PayloadKind::Request`]) carries no records and is always small, so it
+    /// needs no planning. What has to be known in advance is whether the full state fits.
     ///
-    /// # 代价是一次完整的封装
+    /// # It costs one full sealing pass
     ///
-    /// 逐条加密 + 压缩 + 外层 AEAD。M4 的性能实测里那一趟是毫秒级；若调用方随后真的
-    /// 走「全量提供」，它会再封装一次。**刻意不做缓存**：缓存意味着要在会话里保存一份
-    /// 明文状态的副本（或者一份密文与它的参数），而那份副本的失效条件（保险库改了、
-    /// 主密钥换了）比它省下的几毫秒贵得多。
+    /// Per-record encryption, compression and the outer AEAD, on the order of milliseconds.
+    /// The result is not cached: a cache would keep a copy of the plaintext state (or of the
+    /// ciphertext and its parameters) inside the session, and that copy could go stale when
+    /// the vault or the master key changes.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 与 [`SyncSession::send`] 的封装那一步完全相同，见 [`Payload::from_vault`] 与
-    /// [`Payload::seal`]。
+    /// Exactly the sealing step of [`SyncSession::send`], see [`Payload::from_vault`] and
+    /// [`Payload::seal`].
     pub fn plan_share(&self, transport: &dyn Transport) -> Result<SharePlan> {
         let payload = Payload::from_vault(self.master, transport.local_device(), self.vault)?;
         let sealed = payload.seal(self.master)?;
@@ -494,52 +520,48 @@ impl<'a> SyncSession<'a> {
         })
     }
 
-    /// 收一条消息，把里面的记录并进本地保险库。
+    /// Receives one message and merges its records into the local vault.
     ///
-    /// # 顺序（每一步都不能换位置）
+    /// # Order (no step may move)
     ///
-    /// 1. **对端在名单内吗**——不在就直接丢。这一步挡的是原样重放别人载荷的第三方。
-    /// 2. **这条载荷我处理过吗**——处理过就拒绝，且**不**重复记账。
-    /// 3. **解密封装**——失败就拒绝。这一步之后 `sender` 才是可信的（它在 AAD 里）。
-    /// 4. **载荷自报的发送方与通道声称的一致吗**——不一致拒绝。见
-    ///    [`Error::SyncSenderMismatch`]。
-    /// 5. **逐条解密并合并**——这一步才动保险库。
-    /// 6. **记账**——只有前面全部成功才把标识记进日志。
+    /// 1. **Is the peer on the list** — if not, drop the message. This blocks a third party
+    ///    replaying someone else's payload unchanged.
+    /// 2. **Has this payload been processed** — if so, reject it and do **not** record it
+    ///    again.
+    /// 3. **Open the sealed payload** — on failure, reject. Only after this step is
+    ///    `sender` trustworthy (it is part of the AAD).
+    /// 4. **Does the payload's self-reported sender match the channel's claim** — if not,
+    ///    reject. See [`Error::SyncSenderMismatch`].
+    /// 5. **Decrypt and merge record by record** — this is the step that touches the vault.
+    /// 6. **Record the identifier** — only if every step above succeeded.
     ///
-    /// 第 6 步放在最后是刻意的：若在解密之前记账，一个攻击者只要发一份**垃圾**载荷
-    /// 并声称标识是 X，就能让真正的 X 永远被拒绝——一条零成本的拒绝服务。
+    /// Step 6 comes last because recording before decryption would let an attacker send a
+    /// **garbage** payload claiming identifier X and thereby have the real X rejected
+    /// forever.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 任一环节失败都返回对应的错误，且**不改变保险库与日志**。唯一的例外是合并本身
-    /// 中途失败（复制密钥材料失败），那时已合并的部分会留下——原子性要跨两个存储，
-    /// 而本库刻意不做跨存储事务。
+    /// Any failing step returns its own error and leaves **both the vault and the log
+    /// unchanged**. The one exception is a merge that fails midway (copying key material):
+    /// the records merged so far stay, because atomicity would have to span two stores.
     pub fn receive(&mut self, transport: &dyn Transport) -> Result<SyncOutcome> {
         let (claimed_sender, message) = transport.receive()?;
 
-        // ① 对端在名单内吗。
         if !self.allowed_senders.is_empty() && !self.allowed_senders.contains(&claimed_sender) {
             return Err(Error::SyncSenderMismatch);
         }
 
-        // ② 这条载荷处理过吗。`peek` 只读明文头，因此这一步不花任何解密代价——重放
-        //    防护必须在动保险库之前生效。
         let header = Payload::peek(&message)?;
         if self.seen.contains(&header.sync_id) {
             return Err(Error::SyncAlreadyApplied);
         }
 
-        // ③ 拆封。失败时保险库与日志都没有被碰过。
         let payload = Payload::open(self.master, &message)?;
 
-        // ④ 自报发送方 vs 通道声称的发送方。`payload.sender` 已经在 AAD 里，因此它
-        //    只有可能等于真实发送方（诚实的对端）或等于一个被原样重放的载荷的原作者
-        //    （不诚实的第三方）。
         if payload.sender != claimed_sender {
             return Err(Error::SyncSenderMismatch);
         }
 
-        // ⑤ 逐条解密并合并。
         let opened = payload.open_records(self.master)?;
         let records: Vec<MergedRecord> = opened
             .into_iter()
@@ -551,7 +573,6 @@ impl<'a> SyncSession<'a> {
         }
         let merge = sync::merge_into(self.vault, &set)?;
 
-        // ⑥ 记账。
         self.seen.record(payload.sync_id)?;
 
         Ok(SyncOutcome {
@@ -561,15 +582,15 @@ impl<'a> SyncSession<'a> {
     }
 }
 
-/// # 「通道暂时没消息」与「载荷被拒绝」必须分开
+/// # "The channel has no message" and "the payload was rejected" must stay distinct
 ///
-/// [`SyncSession`] 刻意**不**提供 `try_receive` 之类「失败也继续」的便捷方法。把两种
-/// 情况混在一个返回值里，是让重放防护出现缺口的最短路径——调用方会顺手写
-/// `let _ = session.receive(...)`，于是 [`Error::SyncAlreadyApplied`] 被丢掉，重放
-/// 变成静默接受。
+/// [`SyncSession`] deliberately offers no `try_receive`-style convenience that continues on
+/// failure: mixing the two cases into one return value is the shortest path to a hole in
+/// replay protection, since the caller may write `let _ = session.receive(...)` and silently
+/// drop [`Error::SyncAlreadyApplied`].
 ///
-/// 调用方要自己区分 [`Error::SyncNoSessionFound`]（继续等）与其它错误（拒绝）。
-/// 这条约束写在类型上而不是文档里：**没有那个方法**，就没有那个误用。
+/// Callers distinguish [`Error::SyncNoSessionFound`] (keep waiting) from every other error
+/// (reject).
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,22 +598,21 @@ mod tests {
     use crate::sync::{RecordSet, merge_into};
     use crate::vault::{Entry, EntryId, Timestamp, Vault as VaultAlias};
 
-    /// 一条纯内存通道，用于在没有网络的情况下验证协议。
+    /// An in-memory channel used to exercise the protocol without a network.
     ///
-    /// # 它为什么必须是「诚实但愚蠢」的
-    ///
-    /// 它只做搬运，不做任何协议判断——所有判断都在 [`SyncSession`] 里。一个会在测试
-    /// 里「帮忙」的通道（比如自动去重）会让协议的真实缺陷被它掩盖掉。
+    /// It only moves bytes and makes no protocol decisions; every decision lives in
+    /// [`SyncSession`]. A channel that "helps" (by de-duplicating, say) would mask real
+    /// defects in the protocol.
     struct MemoryTransport {
-        /// 本设备的标识。
+        /// This device's identifier.
         me: DeviceId,
-        /// 出站队列：`(收件人, 发送方, 字节)`。
+        /// Outbound queue: `(recipient, sender, bytes)`.
         outbox: std::sync::Mutex<Vec<(Recipient, DeviceId, Vec<u8>)>>,
-        /// 入站队列：`(通道声称的发送方, 字节)`。
+        /// Inbound queue: `(sender claimed by the channel, bytes)`.
         inbox: std::sync::Mutex<Vec<(DeviceId, Vec<u8>)>>,
-        /// 这条通道声称自己有什么能力。
+        /// Capabilities this channel claims.
         caps: TransportCapabilities,
-        /// 这条通道声称的对端。
+        /// Peers this channel claims.
         peers: Vec<DeviceId>,
     }
 
@@ -612,17 +632,15 @@ mod tests {
             self
         }
 
-        /// 把这条通道的出站队列搬到另一条通道的入站队列。
+        /// Moves this channel's outbound queue into another channel's inbound queue.
         ///
-        /// # 出站队列**不**被清空
+        /// # The outbound queue is **not** cleared
         ///
-        /// 一次广播要送到 N 个对端，因此投递必须可以被调用 N 次。第一版这里写的是
-        /// `drain(..)`，于是「广播给 B 和 C」实际只送到了 B——而失败现象是
-        /// 「C 说没人跟它同步」，一个与「出站队列只被读一次」毫无关系的现象。
-        /// 想开始新一轮的调用方请显式 [`MemoryTransport::clear_outbox`]。
+        /// One broadcast addresses N peers, so delivery must be callable N times; a caller
+        /// that wants a fresh round calls [`MemoryTransport::clear_outbox`] explicitly.
         ///
-        /// `honest` 为 `false` 时改掉「通道声称的发送方」——用来模拟一个在广播型通道上
-        /// 原样重放别人载荷的第三方。
+        /// With `honest` set to `false` the claimed sender is replaced, which models a third
+        /// party replaying someone else's payload unchanged on a broadcast channel.
         fn deliver_to(&self, target: &MemoryTransport, honest: bool) {
             let outbox = self.outbox.lock().expect("锁未中毒");
             let mut inbox = target.inbox.lock().expect("锁未中毒");
@@ -639,16 +657,16 @@ mod tests {
             }
         }
 
-        /// 丢弃出站队列里的全部消息。
+        /// Discards every message in the outbound queue.
         ///
-        /// 一次同步「轮次」的边界：调用方在每一轮开始时清一次，避免上一轮的载荷被
-        /// 重复投递——那会让接收方报 [`Error::SyncAlreadyApplied`]，看起来像是重放
-        /// 防护误伤。
+        /// This is the boundary between sync rounds: clearing it at the start of each round
+        /// keeps the previous round's payload from being delivered twice, which the receiver
+        /// would report as [`Error::SyncAlreadyApplied`].
         fn clear_outbox(&self) {
             self.outbox.lock().expect("锁未中毒").clear();
         }
 
-        /// 直接往入站队列塞一条消息（模拟攻击者）。
+        /// Pushes a message straight into the inbound queue (models an attacker).
         fn inject(&self, claimed_sender: DeviceId, bytes: Vec<u8>) {
             self.inbox
                 .lock()
@@ -667,8 +685,6 @@ mod tests {
         }
 
         fn send(&self, to: Recipient, message: &[u8]) -> Result<()> {
-            // 契约 2：`Recipient::One` 不得退化成广播。这里如实记录收件人，由投递
-            // 那一步去执行——一个「反正都会送到」的实现会让这条契约在测试里失效。
             self.outbox
                 .lock()
                 .expect("锁未中毒")
@@ -711,7 +727,7 @@ mod tests {
         .expect("字段合法")
     }
 
-    /// 两方通道的完整往返：A 的条目出现在 B 的保险库里。
+    /// A full two-party round trip: A's entry shows up in B's vault.
     #[test]
     fn a_two_party_exchange_moves_entries() {
         let (id_a, master, mut vault_a) = a_device(1);
@@ -727,18 +743,13 @@ mod tests {
         let mut seen_a = SeenSyncIds::new();
         let mut seen_b = SeenSyncIds::new();
 
-        // A 发出。
         let session_a = SyncSession::open(&master, &mut vault_a, &mut seen_a);
         session_a
             .send(&ta, Recipient::One(id_b), PayloadKind::Vault)
             .expect("发送");
 
-        // 通道搬运。
         ta.deliver_to(&tb, true);
 
-        // B 收到并合并。会话借用 `vault_b` 与 `seen_b`，因此必须把它放进一个块里——
-        // 否则后面的断言读到的是被借走的值。这不是测试的麻烦，而是 API 刻意的形状：
-        // 会话存活期间保险库就是它的。
         let outcome = {
             let mut session_b = SyncSession::open(&master, &mut vault_b, &mut seen_b);
             session_b.receive(&tb).expect("接收")
@@ -749,10 +760,8 @@ mod tests {
         assert!(!outcome.needs_adjudication(), "内容相同不该报冲突");
         assert_eq!(seen_b.len(), 1, "收到之后应当记一笔");
 
-        // A 的日志**不**应当因为自己发出去过而多一笔。
         assert_eq!(seen_a.len(), 0, "发出载荷不该记进重放日志");
 
-        // 再来一次：同一个标识必须被拒绝。
         ta.deliver_to(&tb, true);
         let again = {
             let mut session_b = SyncSession::open(&master, &mut vault_b, &mut seen_b);
@@ -764,10 +773,10 @@ mod tests {
         );
     }
 
-    /// **重放：第三方把 B 发过的载荷原样转发给 C。**
+    /// **Replay: a third party forwards B's payload to C unchanged.**
     ///
-    /// 载荷在密码学上完全有效——它确实是 B 签发的。挡不住它的部署会让 C 以为自己
-    /// 与 B 同步过。名单检查是唯一能挡住它的东西。
+    /// The payload is cryptographically valid; B really did sign it. The sender list is
+    /// what rejects it.
     #[test]
     fn a_replayed_payload_from_a_third_party_is_rejected() {
         let (id_a, master, mut vault_a) = a_device(1);
@@ -779,8 +788,6 @@ mod tests {
 
         let caps = TransportCapabilities::stream(Roster::MultiParty);
 
-        // B 广播给自己的两个对端。C 只在名单里放 A，**不放 B**——模拟「C 已经与 A
-        // 建链，而攻击者 A 把 B 的载荷转给它」。
         let tb = MemoryTransport::new(id_b, caps).with_peers(vec![id_a, id_c]);
         let ta = MemoryTransport::new(id_a, caps).with_peers(vec![id_b, id_c]);
         let tc = MemoryTransport::new(id_c, caps).with_peers(vec![id_a]);
@@ -791,8 +798,6 @@ mod tests {
             .send(&tb, Recipient::All, PayloadKind::Vault)
             .expect("发送");
 
-        // B 发出的那份字节。它在 `tb` 的**出站**队列里（是 B 发出去的），不在 `ta`
-        // 的入站里——第一版读错了队列。
         let b_payload = tb
             .outbox
             .lock()
@@ -801,7 +806,6 @@ mod tests {
             .map(|(_, _, bytes)| bytes.clone())
             .expect("B 的出站里应当有那份载荷");
 
-        // 送到 A（诚实），A 正常收下。
         tb.deliver_to(&ta, true);
         let mut seen_a = SeenSyncIds::new();
         let outcome_a = {
@@ -810,13 +814,9 @@ mod tests {
         };
         assert_eq!(outcome_a.merge.added, 1, "A 应当收下 B 的那条");
 
-        // 现在 A 把**同一份字节**转给 C。A 是诚实的通道，因此通道会如实说「发送方是
-        // A」——而载荷里自报的是 B。这个不一致正是要被挡住的。
         ta.send(Recipient::One(id_c), &b_payload).expect("转发");
         ta.deliver_to(&tc, true);
 
-        // C 会拿到这份载荷，且通道说发送方是 A。它必须被拒绝——不是因为解密失败
-        // （解密会成功，它确实是 B 用真主密钥签的），而是因为载荷自报的发送方是 B。
         let mut seen_c = SeenSyncIds::new();
         let mut session_c = SyncSession::restricted(&master, &mut vault_c, &mut seen_c, vec![id_a]);
         let result = session_c.receive(&tc);
@@ -828,7 +828,7 @@ mod tests {
         assert_eq!(seen_c.len(), 0, "被拒绝的载荷不得记账");
     }
 
-    /// 名单之外的对端发来的载荷直接被丢。
+    /// A payload from a peer outside the list is dropped.
     #[test]
     fn a_payload_from_an_unlisted_peer_is_rejected() {
         let (id_a, master, _) = a_device(1);
@@ -848,7 +848,6 @@ mod tests {
             .expect("发送");
         tb.deliver_to(&tc, true);
 
-        // C 的名单里只有 A。B 不在名单内。
         let mut seen_c = SeenSyncIds::new();
         let result = {
             let mut session_c =
@@ -862,17 +861,16 @@ mod tests {
         assert_eq!(vault_c.len(), 0);
     }
 
-    /// **垃圾载荷不得把它的标识记进日志。**
+    /// **A garbage payload must not record its identifier in the log.**
     ///
-    /// 若在解密之前记账，攻击者只要发一份垃圾并声称标识是 X，就能让真正的 X 永远被
-    /// 拒绝。这条测试是那条拒绝服务的回归保护。
+    /// Recording before decryption would let an attacker send garbage claiming identifier
+    /// X and have the real X rejected forever.
     #[test]
     fn a_garbage_payload_does_not_poison_the_seen_log() {
         let (id_a, master, mut vault_a) = a_device(1);
         let (id_b, _, _) = a_device(2);
         let caps = TransportCapabilities::stream(Roster::TwoParty);
 
-        // 先造一份**合法**载荷，记下它的标识。
         let mut source_vault = Vault::new();
         source_vault
             .insert(sample_entry("条目", 1_700_000_000))
@@ -881,7 +879,6 @@ mod tests {
         let sealed = payload.seal(&master).expect("封装");
         let good_id = payload.sync_id;
 
-        // 把密文里的一位改坏（保留头部，因此 `peek` 仍能读出标识）。
         let mut broken = sealed.clone();
         let last = broken.len() - 1;
         broken[last] ^= 0xFF;
@@ -901,7 +898,6 @@ mod tests {
             "垃圾载荷把合法载荷的标识污染了——真正的载荷将永远被拒绝"
         );
 
-        // 真正的载荷随后必须仍然被接受。
         ta.inject(id_b, sealed);
         let outcome = {
             let mut session_a = SyncSession::open(&master, &mut vault_a, &mut seen_a);
@@ -911,7 +907,7 @@ mod tests {
         assert_eq!(seen_a.len(), 1);
     }
 
-    /// 通道装不下时必须在发送**之前**就报出来，且带上实际需要的字节数。
+    /// A payload that does not fit is reported **before** sending, with the bytes needed.
     #[test]
     fn a_payload_larger_than_the_channel_is_reported_before_sending() {
         let (id_a, master, mut vault_a) = a_device(1);
@@ -922,7 +918,6 @@ mod tests {
                 .expect("随机源可用");
         }
 
-        // 一条只装得下 64 字节的「二维码」。
         let caps = TransportCapabilities::qr(4, 64);
         let ta = MemoryTransport::new(id_a, caps).with_peers(vec![id_b]);
 
@@ -938,25 +933,23 @@ mod tests {
             other => panic!("应当报「装不下」，实际 {other:?}"),
         }
 
-        // 报错时**不得**已经发出去。
         assert!(
             ta.outbox.lock().expect("锁未中毒").is_empty(),
             "装不下时不该已经往通道里写了东西"
         );
     }
 
-    /// 两方通道不需要下令，多方通道需要。
+    /// Two-party channels need no start signal; multi-party channels do.
     #[test]
     fn only_multi_party_channels_need_a_start_signal() {
         assert!(!TransportCapabilities::stream(Roster::TwoParty).needs_start_signal());
         assert!(TransportCapabilities::stream(Roster::MultiParty).needs_start_signal());
-        // 二维码天然是两方。
         assert!(!TransportCapabilities::qr(40, 2900).needs_start_signal());
         assert!(TransportCapabilities::qr(40, 2900).single_use);
         assert!(!TransportCapabilities::stream(Roster::TwoParty).single_use);
     }
 
-    /// 多方会话：A 广播之后 B 与 C 都拿到了同样的内容。
+    /// Multi-party session: after A broadcasts, B and C both receive the same content.
     #[test]
     fn a_multi_party_broadcast_reaches_every_peer() {
         let (id_a, master, mut vault_a) = a_device(1);
@@ -995,10 +988,10 @@ mod tests {
         assert_eq!(vault_c.len(), 1);
     }
 
-    /// `Recipient::One` 必须真的只送到一个对端。
+    /// `Recipient::One` must really reach exactly one peer.
     ///
-    /// 这条契约靠实现方遵守，因此必须有一条测试盯着它——一个「反正都会送到」的实现
-    /// 会让一次定向发送变成广播，而用户看不到任何异常。
+    /// The contract is upheld by implementations, so a test has to watch it: an
+    /// implementation that delivers to everyone would turn a targeted send into a broadcast.
     #[test]
     fn a_targeted_send_does_not_reach_other_peers() {
         let (id_a, master, mut vault_a) = a_device(1);
@@ -1030,7 +1023,7 @@ mod tests {
         let _ = &mut vault_c;
     }
 
-    /// 「已是最新」是一种正常结果，不是错误。
+    /// "Already up to date" is a normal outcome, not an error.
     #[test]
     fn syncing_with_nothing_new_reports_no_change() {
         let (id_a, master, mut vault_a) = a_device(1);
@@ -1043,7 +1036,6 @@ mod tests {
         let ta = MemoryTransport::new(id_a, caps).with_peers(vec![id_b]);
         let tb = MemoryTransport::new(id_b, caps).with_peers(vec![id_a]);
 
-        // 第一轮：B 学到 A 的条目。
         let mut seen_a = SeenSyncIds::new();
         SyncSession::open(&master, &mut vault_a, &mut seen_a)
             .send(&ta, Recipient::One(id_b), PayloadKind::Vault)
@@ -1056,9 +1048,6 @@ mod tests {
         assert_eq!(first.merge.added, 1);
         assert!(!first.made_no_change(), "第一轮确实改了东西");
 
-        // 第二轮：A 再发一次（内容完全相同，但载荷标识是新的）。
-        // 先把上一轮的载荷从出站队列里清掉，否则它会被再投递一次，而接收方会按重放
-        // 拒绝——那看起来像重放防护误伤，其实是投递层重复送了同一份载荷。
         ta.clear_outbox();
         SyncSession::open(&master, &mut vault_a, &mut seen_a)
             .send(&ta, Recipient::One(id_b), PayloadKind::Vault)
@@ -1075,10 +1064,10 @@ mod tests {
         assert!(!second.needs_adjudication());
     }
 
-    /// 三台设备两轮同步之后内容一致。
+    /// Three devices converge after two sync rounds.
     ///
-    /// 这是把 [`SyncSession`] 与 `merge` 一起用起来时的端到端性质，也是「多种传输方式
-    /// 共用一套协议」的验收点：同样的字节序列，无论走哪条通道，收敛结果必须一样。
+    /// The same byte sequence must converge to the same result no matter which channel
+    /// carries it, which is what "three transports, one protocol" means.
     #[test]
     fn three_devices_converge_over_the_session() {
         let (id_a, master, mut vault_a) = a_device(1);
@@ -1105,7 +1094,6 @@ mod tests {
         let mut seen_c = SeenSyncIds::new();
 
         for _ in 0..2 {
-            // 每台设备各广播一次自己的当前状态。先把上一轮的残留清掉。
             ta.clear_outbox();
             tb.clear_outbox();
             tc.clear_outbox();
@@ -1119,7 +1107,6 @@ mod tests {
                 .send(&tc, Recipient::All, PayloadKind::Vault)
                 .expect("C 广播");
 
-            // 全部投递，再让各自处理收到的全部消息。
             ta.deliver_to(&tb, true);
             ta.deliver_to(&tc, true);
             tb.deliver_to(&ta, true);
@@ -1142,7 +1129,6 @@ mod tests {
                     };
                     match result {
                         Ok(_) => {}
-                        // 队列空了，换下一台。
                         Err(Error::SyncNoSessionFound) => break,
                         Err(other) => panic!("不该出现的错误：{other:?}"),
                     }
@@ -1155,12 +1141,11 @@ mod tests {
         assert_eq!(vault_c.len(), 3, "C 应当有三条");
     }
 
-    /// **规划与发送必须一致。**
+    /// **Planning and sending must agree.**
     ///
-    /// 规划的全部价值就在于「展示之前给出的答案」是对的。若规划说装得下、发送却报
-    /// 「装不下」，用户看到的是一张扫不出任何东西的码；若规划说装不下、发送却成功，
-    /// 我们就把一条本可以走二维码的同步推去了局域网。两条都靠这条测试挡住：
-    /// 判据只能是同一个 [`TransportCapabilities::check_fits`]。
+    /// The whole point of planning is that the answer given before anything is displayed is
+    /// correct, in both directions: planning and sending must use the same
+    /// [`TransportCapabilities::check_fits`] test.
     #[test]
     fn planning_and_sending_agree() {
         let (id_a, master, mut vault_a) = a_device(1);
@@ -1169,14 +1154,12 @@ mod tests {
             .insert(sample_entry("条目", 1_700_000_000))
             .expect("随机源可用");
 
-        // 一条宽裕的字节流通道，与一条只装得下 8 字节的「二维码」。
         let roomy = MemoryTransport::new(id_a, TransportCapabilities::stream(Roster::TwoParty));
         let tiny = MemoryTransport::new(id_a, TransportCapabilities::qr(1, 8));
 
         let mut seen = SeenSyncIds::new();
         let session = SyncSession::open(&master, &mut vault_a, &mut seen);
 
-        // ① 宽裕通道：规划说整份能发。
         let len = match session.plan_share(&roomy).expect("规划") {
             SharePlan::FullPayload { len } => len,
             other => panic!("宽裕通道不该要求建链：{other}"),
@@ -1186,7 +1169,6 @@ mod tests {
             .send(&roomy, Recipient::One(id_b), PayloadKind::Vault)
             .expect("规划说装得下，发送就必须成功");
 
-        // ② 极小的通道：规划说装不下，且两个数字都要对得上。
         let plan = session.plan_share(&tiny).expect("规划");
         match plan {
             SharePlan::LinkEstablishment { needed, limit } => {
@@ -1206,12 +1188,12 @@ mod tests {
         );
     }
 
-    /// **核心库不认识「帧」：分享的抉择只看声明出来的字节上限。**
+    /// **The core library does not know about frames: the share decision depends only on
+    /// the declared byte limit.**
     ///
-    /// 一条「多帧二维码」通道在这里与「同上限的字节流通道」完全同形。这条测试把那个
-    /// 设计判断钉住——若将来有人往 [`TransportCapabilities`] 里加一个「帧数」并让
-    /// [`TransportCapabilities::check_fits`] 用它，两个答复就会分叉，而分叉的症状是
-    /// 「核心库说装得下、通道却渲染不出来」。
+    /// A multi-frame QR channel is indistinguishable here from a byte-stream channel that
+    /// declares the same limit. Adding a frame count to [`TransportCapabilities`] and using
+    /// it in [`TransportCapabilities::check_fits`] would make the two answers diverge.
     #[test]
     fn the_share_plan_depends_only_on_the_declared_byte_limit() {
         let (id_a, master, mut vault_a) = a_device(1);
@@ -1219,8 +1201,6 @@ mod tests {
             .insert(sample_entry("条目", 1_700_000_000))
             .expect("随机源可用");
 
-        // 同一套字节上限的两种通道：一条自称多帧二维码（4 张 × 1024 字节），一条是
-        // 结构体字面量写出来的「同上限的字节流」。两者除字节上限之外处处不同。
         let framed = MemoryTransport::new(id_a, TransportCapabilities::qr(40, 4096));
         let equivalent = MemoryTransport::new(
             id_a,
@@ -1232,7 +1212,6 @@ mod tests {
                 can_carry_payload: true,
             },
         );
-        // 同上限的「极小通道」，用来看装不下那一侧的答复是否也只由数字决定。
         let tiny_framed = MemoryTransport::new(id_a, TransportCapabilities::qr(1, 8));
         let tiny_equivalent = MemoryTransport::new(
             id_a,
@@ -1247,7 +1226,6 @@ mod tests {
 
         let mut seen = SeenSyncIds::new();
         let session = SyncSession::open(&master, &mut vault_a, &mut seen);
-        // 两组通道各比一次：宽裕的那一对走「整份发」，极小的那一对走「建链」。
         for (left, right, what) in [
             (&framed, &equivalent, "宽裕"),
             (&tiny_framed, &tiny_equivalent, "极小"),
@@ -1261,10 +1239,11 @@ mod tests {
         }
     }
 
-    /// 字节流通道没有上限，「建链」这条路对它永远用不上。
+    /// A byte-stream channel has no limit, so link establishment never applies to it.
     ///
-    /// 这条性质值得单独钉住：若 [`SharePlan`] 对字节流也报「装不下」，二维码那条路上
-    /// 的引导文案就会在局域网上也出现，把用户推向一个不存在的「另一条路」。
+    /// If [`SharePlan`] reported "does not fit" for a byte stream, the QR-code guidance
+    /// would show up on a LAN transfer and point the user at a route that does not exist
+    /// there.
     #[test]
     fn a_stream_channel_never_needs_a_link() {
         let (id_a, master, mut vault_a) = a_device(1);
@@ -1287,11 +1266,11 @@ mod tests {
         assert!(!plan.needs_link(), "字节流通道不该要求建链：{plan}");
     }
 
-    /// **「建链」的第一步必须真的走得通。**
+    /// **The first step of link establishment must actually work.**
     ///
-    /// 装不下全量状态时，我们告诉用户「先发个请求，数据走别处」。这条测试钉住那句话
-    /// 的前半截：**同一条装不下全量状态的通道，必须装得下请求**。否则引导文案指向的
-    /// 是一条同样走不通的路，而用户会以为是网络问题。
+    /// When the full state does not fit, the user is told to send a request first and move
+    /// the data another way: **a channel that cannot carry the full state must still carry
+    /// the request**.
     #[test]
     fn a_request_fits_where_the_full_state_does_not() {
         let (id_a, master, mut vault_a) = a_device(1);
@@ -1302,7 +1281,6 @@ mod tests {
                 .expect("随机源可用");
         }
 
-        // 一条小得多的「二维码」：全量状态装不下，请求装得下。
         let transport = MemoryTransport::new(id_a, TransportCapabilities::qr(10, 200));
         let mut seen = SeenSyncIds::new();
         let session = SyncSession::open(&master, &mut vault_a, &mut seen);
@@ -1315,13 +1293,12 @@ mod tests {
             .expect("请求必须装得下——否则「建链」这条路的第一步就不成立");
     }
 
-    /// 冲突会被如实报出来，而不是被静默选边。
+    /// Conflicts are reported rather than silently resolved to one side.
     #[test]
     fn a_divergent_entry_is_reported_for_adjudication() {
         let (id_a, master, mut vault_a) = a_device(1);
         let (id_b, _, mut vault_b) = a_device(2);
 
-        // 两台设备上同一个标识、不同内容。
         let shared = EntryId::from_bytes([9; EntryId::LEN]);
         vault_a
             .insert_with_id(shared, sample_entry("本机版本", 1_700_000_000))
@@ -1350,7 +1327,6 @@ mod tests {
             "两端内容不同时应当报冲突，实际 {outcome}"
         );
         assert_eq!(outcome.merge.conflicts.len(), 1);
-        // 冲突不改变本地那一版。
         assert_eq!(
             vault_b.get(&shared).expect("条目还在").name,
             "对端版本",
@@ -1358,7 +1334,8 @@ mod tests {
         );
     }
 
-    /// `RecordSet` / `merge_into` 在会话之外也能直接用（供端侧做裁决预览）。
+    /// `RecordSet` / `merge_into` are usable without a session (for adjudication previews
+    /// on the device side).
     #[test]
     fn the_merge_helpers_stay_usable_without_a_transport() {
         let (_, master, mut vault) = a_device(1);

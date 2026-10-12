@@ -13,99 +13,102 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! 已处理过的同步载荷标识的日志。
+//! Log of already-processed sync payload identifiers.
 //!
-//! # 它挡住的不是「数据被改坏」
+//! # What it stops is not "data being corrupted"
 //!
-//! 合并是**幂等**的：同一份载荷合并两次，结果与合并一次相同。因此重放一份旧载荷
-//! **不会破坏正确性**。它挡住的是另外两件事：
+//! Merging is **idempotent**: merging the same payload twice gives the same result as merging it
+//! once. Replaying an old payload therefore **does not break correctness**. What this log stops is
+//! two other things:
 //!
-//! 1. **白做一次完整的解密与合并。** 一份载荷要先过外层 AEAD、再解压、再逐条解密、
-//!    再走合并。局域网里一台设备反复广播同一份载荷，接收方就会反复做这些事——这是
-//!    一个不需要任何密码学突破的拒绝服务面。
-//! 2. **界面上的「上次同步时间」变成攻击者可任意推动的值。** 用户看到「刚刚同步过」，
-//!    而实际上什么都没发生。
+//! 1. **A full decryption and merge done for nothing.** A payload has to pass the outer AEAD, be
+//!    decompressed, have every record decrypted and then be merged. A device on the LAN that keeps
+//!    broadcasting the same payload makes the receiver repeat all of that — a denial-of-service
+//!    surface that needs no cryptographic break.
+//! 2. **"Last synced at" in the UI becoming a value an attacker can push around.** The user sees
+//!    "synced just now" while nothing happened at all.
 //!
-//! # 为什么是「拒绝」而不是「静默跳过」
+//! A duplicate payload returns [`crate::Error::SyncAlreadyApplied`]: the caller does **not**
+//! update the sync time, and can still report that this data was already synced.
 //!
-//! 静默成功会让调用方以为「刚刚完成了一次同步」，于是去更新那个时间戳——那正是上面
-//! 第 2 条要防的。因此重复载荷返回 [`crate::Error::SyncAlreadyApplied`]，调用方据此
-//! **不更新**同步时间，但仍可以告诉用户「这次的数据之前已经同步过了」。
+//! # Bounded, and failing explicitly when full
 //!
-//! # 有界，且满了要显式失败
-//!
-//! 日志不能无限增长。到上限时返回 [`crate::Error::SyncIdLogFull`]，而**不是**静默
-//! 丢弃最旧的那条：丢弃会让一份很旧的载荷重新变得可接受，而那正是本模块要防的。
-//! 上限取 [`MAX_SEEN_SYNC_IDS`]，由调用方决定满了之后怎么办（提示用户、或者放弃
-//! 重放防护并清空——那是上层策略，不是本模块能替用户做的决定）。
+//! The log must not grow without bound. At the limit it returns [`crate::Error::SyncIdLogFull`]
+//! rather than silently dropping the oldest entry: dropping would make a very old payload
+//! acceptable again, which is precisely what this module guards against. The limit is
+//! [`MAX_SEEN_SYNC_IDS`]; what to do once it is full is the caller's decision (warn the user, or
+//! give up replay protection and clear — that is a higher-level policy, not a decision this module
+//! can make for the user).
 
 use std::collections::VecDeque;
 
 use crate::sync::SyncId;
 use crate::{Error, Result};
 
-/// 日志的条目数上限。
+/// Maximum number of entries in the log.
 ///
-/// 每条 32 字节，因此 4096 条约 128 KiB 内存。这个量级对桌面端与移动端都可以忽略，
-/// 而 4096 次同步在真实使用下要很久才能填满（同步是用户手动触发的动作）。
+/// Each identifier is 32 bytes, so 4096 entries take about 128 KiB. That is negligible on desktop
+/// and mobile, and 4096 syncs take a long time to accumulate in real use (syncing is a
+/// user-triggered action).
 ///
-/// 与 [`crate::vault::MAX_RECORDS`] 那种「防御恶意输入」的上限不同，这个上限**不是**
-/// 安全边界：载荷标识是随机的，攻击者无法通过「故意发送新标识」来让日志被有用的旧
-/// 标识挤出去——被他挤掉的只会是他自己发过的那些。
+/// Unlike a limit such as [`crate::vault::MAX_RECORDS`], which defends against malicious input,
+/// this limit is **not** a security boundary: payload identifiers are random, so an attacker cannot
+/// push useful old identifiers out of the log by deliberately sending new ones — the entries pushed
+/// out would only be its own.
 pub const MAX_SEEN_SYNC_IDS: usize = 4096;
 
-/// 记住已处理的载荷标识。
+/// Remembers which payload identifiers have been processed.
 ///
-/// # 容量满了之后的行为是显式的
+/// # Behaviour when full is explicit
 ///
-/// [`SeenSyncIds::record`] 在已满时返回 [`Error::SyncIdLogFull`]，**不会**自动淘汰。
-/// 需要继续工作时由调用方显式调用 [`SeenSyncIds::clear`]——那是一个「我愿意放弃重放
-/// 防护」的决定，不该由库替用户做。
+/// [`SeenSyncIds::record`] returns [`Error::SyncIdLogFull`] when the log is full and does **not**
+/// evict automatically. To keep going, the caller explicitly calls [`SeenSyncIds::clear`] — a
+/// decision to give up replay protection, which the library must not make for the user.
 ///
-/// # 为什么用 `VecDeque` 而不是 `HashSet`
+/// # Container
 ///
-/// 需要「先进先出」这个顺序来支持将来的淘汰策略，而 `VecDeque` 在 4096 这个规模上
-/// 的线性查找（每条 32 字节的比较）比 `HashSet` 的哈希开销还便宜，且不引入哈希的
-/// 碰撞处理路径——碰撞在这里的后果是「一份新载荷被误判成重复」，那是一个静默的
-/// 功能故障，而线性查找不可能产生它。
+/// Identifiers are held in a `VecDeque` in processing order, oldest first, and lookups scan it
+/// linearly (32 bytes per comparison). There is no hash collision path, so a new payload can never
+/// be misjudged as already seen because of one.
 #[derive(Debug, Clone, Default)]
 pub struct SeenSyncIds {
-    /// 按处理顺序存放的载荷标识，最旧的在前。
+    /// Payload identifiers in processing order, oldest first.
     seen: VecDeque<SyncId>,
 }
 
 impl SeenSyncIds {
-    /// 一个空的日志。
+    /// An empty log.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 已经记住多少条。
+    /// How many identifiers are remembered.
     #[must_use]
     pub fn len(&self) -> usize {
         self.seen.len()
     }
 
-    /// 是否一条都没记住。
+    /// Whether nothing has been remembered yet.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.seen.is_empty()
     }
 
-    /// 这份载荷是否已经处理过。
+    /// Whether this payload has already been processed.
     #[must_use]
     pub fn contains(&self, sync_id: &SyncId) -> bool {
         self.seen.contains(sync_id)
     }
 
-    /// 记下一份载荷标识。
+    /// Remembers a payload identifier.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 日志已满时返回 [`Error::SyncIdLogFull`]。**这个调用不会因为标识重复而失败**
-    /// ——重复由调用方先用 [`SeenSyncIds::contains`] 判断，因为「重复」与「满了」需要
-    /// 完全不同的界面动作。
+    /// Returns [`Error::SyncIdLogFull`] when the log is full. **This call does not fail on a
+    /// duplicate identifier** — duplicates are detected by the caller through
+    /// [`SeenSyncIds::contains`] first, because "duplicate" and "full" call for completely
+    /// different UI actions.
     pub fn record(&mut self, sync_id: SyncId) -> Result<()> {
         if self.seen.len() >= MAX_SEEN_SYNC_IDS {
             return Err(Error::SyncIdLogFull {
@@ -116,15 +119,17 @@ impl SeenSyncIds {
         Ok(())
     }
 
-    /// 检查并记录，一步完成。
+    /// Checks and records in one step.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// - [`Error::SyncAlreadyApplied`]：这份载荷处理过了。**注意此时不会重复记录。**
-    /// - [`Error::SyncIdLogFull`]：日志满了，且这份载荷是新的。
+    /// - [`Error::SyncAlreadyApplied`]: this payload has been processed. **Nothing is recorded
+    ///   again in that case.**
+    /// - [`Error::SyncIdLogFull`]: the log is full and this payload is new.
     ///
-    /// 两件事合成一个调用，是因为调用方几乎总是要连着做——分开写容易出现「检查了但
-    /// 忘了记」这种漏掉重放防护的写法，而那个错误在功能上完全看不出来。
+    /// The two steps are one call because callers almost always need them together — splitting
+    /// them invites the "checked but forgot to record" mistake, which drops replay protection and
+    /// is invisible in normal operation.
     pub fn check_and_record(&mut self, sync_id: SyncId) -> Result<()> {
         if self.contains(&sync_id) {
             return Err(Error::SyncAlreadyApplied);
@@ -132,15 +137,16 @@ impl SeenSyncIds {
         self.record(sync_id)
     }
 
-    /// 清空日志。
+    /// Clears the log.
     ///
-    /// **这会放弃对旧载荷的重放防护**：清空之后，一份曾经处理过的载荷又会变得可以
-    /// 接受。只在日志满了、且用户选择继续同步时调用。
+    /// **This gives up replay protection for old payloads**: after clearing, a payload that was
+    /// once processed becomes acceptable again. Call it only when the log is full and the user
+    /// chose to keep syncing.
     pub fn clear(&mut self) {
         self.seen.clear();
     }
 
-    /// 按时间顺序遍历已记录的标识（最旧的在前）。
+    /// Iterates the remembered identifiers in chronological order (oldest first).
     pub fn iter(&self) -> impl Iterator<Item = &SyncId> {
         self.seen.iter()
     }
@@ -174,8 +180,6 @@ mod tests {
             matches!(err, Err(Error::SyncAlreadyApplied)),
             "实际 {err:?}"
         );
-        // 重复检查**不得**把日志撑大，否则一个反复重放的对端能靠重放把日志填满，
-        // 从而让所有**新**载荷都被拒——那是一个不用密码学突破的拒绝服务。
         assert_eq!(log.len(), 1, "重复的标识不得被重复记录");
     }
 
@@ -191,15 +195,15 @@ mod tests {
         }
     }
 
-    /// 满了必须**显式失败**，不得静默丢弃最旧的那条。
+    /// A full log must **fail explicitly**, never silently drop the oldest entry.
     ///
-    /// 静默丢弃会让一份很旧的载荷重新变得可接受，而那正是重放防护要挡的。这个测试
-    /// 钉住的是一条安全性质，不是容量行为。
+    /// A silent drop would make a very old payload acceptable again, which is exactly what replay
+    /// protection must prevent. What this test pins down is a security property, not a capacity
+    /// behaviour.
     #[test]
     fn a_full_log_fails_instead_of_evicting() {
         let mut log = SeenSyncIds::new();
         for i in 0..MAX_SEEN_SYNC_IDS {
-            // 用能唯一区分的标识，避免把「重复」与「满了」混起来。
             let mut sync_id = [0_u8; crate::sync::SYNC_ID_LEN];
             sync_id[..8].copy_from_slice(&(i as u64).to_be_bytes());
             log.record(sync_id).expect("未满时应当接受");
@@ -214,7 +218,6 @@ mod tests {
             "实际 {err:?}"
         );
 
-        // 最旧的那条必须还在：没有被淘汰。
         let mut oldest = [0_u8; crate::sync::SYNC_ID_LEN];
         oldest[..8].copy_from_slice(&0_u64.to_be_bytes());
         assert!(log.contains(&oldest), "最旧的标识被淘汰了");
@@ -226,7 +229,6 @@ mod tests {
         log.check_and_record(id(1)).expect("第一次应当接受");
         log.clear();
         assert!(log.is_empty());
-        // 清空之后旧标识重新可接受——这是调用方的明确决定，不是意外。
         log.check_and_record(id(1)).expect("清空后应当重新接受");
     }
 

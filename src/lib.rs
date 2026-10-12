@@ -13,41 +13,44 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! Qualia2FA 核心库。
+//! The Qualia2FA core library.
 //!
-//! 本 crate 承载 Qualia2FA 的双因素认证（2FA）核心逻辑，刻意不包含任何界面或
-//! 命令行入口，以便 GUI、CLI、移动端等前端各自作为独立 crate 依赖本库。
+//! This crate carries the two-factor authentication (2FA) core logic of Qualia2FA and
+//! deliberately contains no user interface or command-line entry point, so that front
+//! ends such as a GUI, a CLI, or a mobile application can each depend on this library
+//! as a separate crate.
 //!
-//! # 纯度约定
+//! # Purity contract
 //!
-//! 本库是**无 I/O、无时钟**的纯逻辑库：
+//! This library is a pure logic library with **no I/O and no clock**:
 //!
-//! - 不访问文件系统、网络、环境变量，不读取系统时钟。
-//! - 当前时间由调用方以 `u64` Unix 秒传入。
-//! - 随机数只用 [`getrandom`]，不经过任何用户态 PRNG。
-//! - [`#![forbid(unsafe_code)]`](self) —— 整个 crate 不含 `unsafe`。
+//! - It does not access the file system, the network, or environment variables, and it
+//!   does not read the system clock.
+//! - The current time is passed in by the caller as `u64` Unix seconds.
+//! - Randomness comes only from [`getrandom`], never through a user-space PRNG.
+//! - [`#![forbid(unsafe_code)]`](self) — the whole crate contains no `unsafe`.
 //!
-//! # 现状
+//! # Status
 //!
-//! 已完成工程地基与 M1 的 Base32 层；HOTP / TOTP 计算、`otpauth://` 解析、
-//! 保险库（vault）管理、设备配对与同步正在推进。
+//! The Base32 layer is implemented. HOTP / TOTP computation, `otpauth://` parsing,
+//! vault management, and device pairing and sync are in progress.
 //!
-//! # 用法
+//! # Usage
 //!
 //! ```
-//! // 版本号
+//! // Version number.
 //! assert_eq!(qualia2fa_core::VERSION, env!("CARGO_PKG_VERSION"));
 //!
-//! // Base32 解码（RFC 4648），容忍小写、缺失填充与空白
+//! // Base32 decoding (RFC 4648); tolerates lowercase, missing padding, and whitespace.
 //! use qualia2fa_core::{base32, ExposeSecret};
 //! let seed = base32::decode("MZXW6YTBOI======").expect("合法 Base32");
 //! assert_eq!(seed.expose_secret(), b"foobar");
 //! ```
 //!
-//! # 许可
+//! # License
 //!
-//! 以 GNU Lesser General Public License v3.0 or later（`LGPL-3.0-or-later`）授权，
-//! 详见仓库根目录的 `COPYING.LESSER` 与 `LICENSE`。
+//! Licensed under the GNU Lesser General Public License v3.0 or later
+//! (`LGPL-3.0-or-later`); see `COPYING.LESSER` and `LICENSE` in the repository root.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -69,44 +72,49 @@ pub mod vault;
 pub use auth::{Responder, Verified, Verifier};
 pub use error::{Error, Result};
 
-/// 注册与登录编排的公开类型。
+/// Public types of the registration and login orchestration.
 ///
-/// 只导出**用户旅程**这一层的类型与两个注入点。刻意不导出任何按步骤拆开的中间
-/// 类型：调用方按顺序自己调 `vault`/`pairing`/`device` 是合法的，但那样做就绕开了
-/// 本模块保证的顺序（见 [`flow`] 的模块文档），因此不在公开面上鼓励。
+/// Only the **user journey** layer and the two injection points are exported. No
+/// intermediate type split into steps is exported: a caller may legally drive
+/// `vault`/`pairing`/`device` in order by itself, but doing so bypasses the ordering
+/// this module guarantees (see the module documentation of [`flow`]), so the public
+/// surface does not encourage it.
 pub use flow::{DeviceKeys, Joiner, Login, Registered, SecureStore};
 
-/// 设备身份的公开类型。
+/// Public types of device identity.
 ///
-/// # 它们为什么是**再导出**而不是本 crate 定义的
+/// Device identity lives in [`qualia_dik`] — an independent, reusable crate that any
+/// project needing "a pair of P-256 identity keys in platform hardware" can use
+/// without accepting this crate's vault format or sync protocol. They are re-exported
+/// here so that downstream code does not have to depend on both crates.
 ///
-/// 设备身份住在 [`qualia_dik`] 里——那是一个独立可复用的 crate，任何需要「平台硬件
-/// 里的一对 P-256 身份密钥」的项目都能用它，不需要接受本 crate 的保险库格式或同步
-/// 协议。这里再导出是为了让下游不必同时依赖两个 crate。
-///
-/// `DevicePublicKey` 与 `DeviceSignature` **不是秘密**——它们本来就要印在二维码
-/// 上、写进日志、在设备之间传播，所以在这里与秘密类型分开导出，让「哪些类型
-/// 可以随便打印」在导入列表里就看得出来。
+/// `DevicePublicKey` and `DeviceSignature` are **not secret** — they are meant to be
+/// printed on QR codes, written to logs, and propagated between devices — so they are
+/// exported separately from the secret types, which makes it visible in an import
+/// list which types may be printed freely.
 pub use qualia_dik::{DeviceId, DevicePublicKey, DeviceSignature};
 
-/// 配对协议的公开类型。
+/// Public types of the pairing protocol.
 ///
-/// 只导出「两端各自需要的东西」：二维码载荷、两个方向的会话、以及结果。内部的
-/// 会话密钥、确认标签计算等一律不导出——它们是协议不变量的一部分，不该被上层
-/// 组合出别的用法。
+/// Only "what each side needs" is exported: the QR payload, the sessions in both
+/// directions, and the result. Internal session keys and confirmation-tag computation
+/// are not exported — they are part of the protocol invariants and must not be
+/// recombined by upper layers into other uses.
 pub use pairing::{Adoption, JoinerSession, NonceLog, PendingSession, QrPayload};
 
-/// 恢复密钥的公开类型。
+/// Public types of the recovery key.
 pub use recovery::{KdfParams, export as export_recovery, import as import_recovery};
 
-/// 传输层的公开类型。
+/// Public types of the transport layer.
 ///
-/// 只有**协议**那一半：能力声明、通道契约、会话，以及它的结果类型。具体通道
-/// （局域网、二维码、热点）在端侧实现 [`Transport`]——它们都要 I/O 与平台 API，
-/// 而本 crate 不碰那些。
+/// Only the **protocol** half: capability declaration, the channel contract, the
+/// session, and its result type. Concrete channels (LAN, QR code, hotspot) implement
+/// [`Transport`] on the device side — they all need I/O and platform APIs, and this
+/// crate touches neither.
 ///
-/// 刻意**不**导出任何「按步骤拆开」的中间类型：调用方要么用 [`SyncSession`]，要么
-/// 自己组合 `sync` 里的零件。前者能保证顺序，后者不能。
+/// Deliberately does **not** export any intermediate type "split into steps": a caller
+/// either uses [`SyncSession`] or assembles the parts in `sync` itself. The former
+/// guarantees the ordering, the latter does not.
 pub use transport::{
     Recipient, Roster, SharePlan, SyncOutcome, SyncSession, Transport, TransportCapabilities,
 };
@@ -115,20 +123,22 @@ pub use secret::{
     ExposeSecret, ExposeSecretMut, SecretBox, SecretBytes, SecretSlice, SecretString,
 };
 
-/// 再导出 OS CSPRNG，供上层（FFI / 端侧）取用**同一份**随机数实现。
+/// Re-exports the OS CSPRNG so that upper layers (FFI / device side) use the **same**
+/// randomness implementation.
 ///
-/// 动机与 `secret.rs` 对 `secrecy` 的再导出相同：本 crate 是唯一声明
-/// `getrandom` 依赖的地方，上层需要随机数时从这里取，而不是各自再声明一次——
-/// 各自声明会让两边的版本要求各自漂移，最终在一个二进制里出现两份不同的
-/// CSPRNG 包装。
+/// This crate is the only place that declares a `getrandom` dependency, so upper layers
+/// take randomness from here instead of declaring it again — separate declarations
+/// would let the two version requirements drift apart and end up with two different
+/// CSPRNG wrappers in one binary.
 ///
-/// 上层的用法是 `qualia2fa_core::getrandom::fill(&mut buf)`。
+/// Upper layers call `qualia2fa_core::getrandom::fill(&mut buf)`.
 ///
-/// 注意：需要随机字节时应优先调用本库已有的高层 API；直接调这里是给
-/// 「生成新种子」这类上层必须自己决定长度与用途的场景留的口子。
+/// Note: prefer the high-level APIs this library already provides when random bytes are
+/// needed; calling this directly is the opening left for cases such as "generate a new
+/// seed", where the upper layer must decide length and purpose itself.
 pub use getrandom;
 
-/// 本库的版本号，取自 `Cargo.toml` 的 `package.version`。
+/// Version of this library, taken from `package.version` in `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]

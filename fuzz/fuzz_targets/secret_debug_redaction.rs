@@ -1,39 +1,51 @@
 #![no_main]
 
-//! fuzz 目标：`secrecy` 包装的秘密类型在**任意输入**下的脱敏与透明性契约。
+//! Fuzz target: the redaction and transparency contract of the secret types
+//! wrapped by `secrecy`, under arbitrary input.
 //!
-//! 本目标检查三条必须永远成立的性质：
+//! # Input surface
 //!
-//! 1. **不 panic**：任意字节输入都不得让构造、借用或格式化 panic。
-//! 2. **透明性**：构造 → `expose_secret` 必须原样返回，不得截断、填充或改写。
-//! 3. **不泄露**：`Debug` 输出只含类型名与脱敏标记，绝不出现明文内容。
+//! The bytes are the arbitrary string produced by the fuzzer, and whoever supplies
+//! them controls them entirely. Properties 1 and 2 are checked on those bytes;
+//! property 3 is checked with a fixed sentinel instead, because a substring
+//! comparison for "does the `Debug` output contain the plaintext" is unreliable
+//! with arbitrary input: the `Debug` output itself contains fixed literals such as
+//! `[REDACTED]`, and short inputs collide with them by accident, producing false
+//! positives.
 //!
-//! 性质 3 的检查方式经过一次修正，值得记录：**用 fuzz 的任意输入去做
-//! 「Debug 里是否含明文」的子串比对是不可靠的**——`Debug` 输出本身含有
-//! `[REDACTED]` 这类固定字面量，短输入会与它们的子串偶然碰撞，产生假阳性。
-//! 因此性质 3 改用**固定哨兵值**做精确检查；任意输入只用于性质 1 与 2。
+//! # Properties covered
 //!
-//! 该目标同时是对上游 `secrecy` 的**回归防线**。若将来升级 `secrecy` 后其脱敏
-//! 行为退化，哨兵检查会立刻失败。
+//! 1. **No panics**: no byte input may make construction, borrowing or formatting
+//!    panic.
+//! 2. **Transparency**: construction → `expose_secret` must return the input
+//!    unchanged, without truncation, padding or rewriting.
+//! 3. **No leakage**: the `Debug` output contains only the type name and the
+//!    redaction marker, never the plaintext.
 //!
-//! TODO(M1)：待 `otpauth://` URI 解析器与 Base32 解码实现后，**新增**
-//! `uri_parse` 与 `base32_decode` 两个目标——那才是真正攻击者可控的输入面。
-//! 本目标保留，因为它是秘密处理路径唯一的自动化防线。
+//! This target is also a regression guard on the upstream `secrecy` crate: if a
+//! future upgrade degrades its redaction behavior, the sentinel checks fail
+//! immediately. It is the only automated guard over the secret-handling path.
+//!
+//! Preconditions: no feature flags, and no valid skeleton has to be built — the
+//! target consumes arbitrary bytes directly.
 
 use libfuzzer_sys::fuzz_target;
 use qualia2fa_core::{ExposeSecret, SecretBytes, SecretString};
 
-/// 哨兵：一段在任何编码下都不可能与 `Debug` 的类型名或脱敏标记碰撞的字节。
+/// Sentinel: bytes that cannot collide with the type name or the redaction marker
+/// of `Debug` under any encoding.
 ///
-/// 刻意选非 ASCII 的大值字节，使十六进制（`f0f1f2f3f4f5f6f7`）、十进制
-/// （`240241242...`）以及 UTF-8 文本形态都不会偶然出现在输出里。
+/// The non-ASCII, large-value bytes are deliberate, so that neither the hexadecimal
+/// form (`f0f1f2f3f4f5f6f7`), the decimal form (`240241242...`) nor the UTF-8 text
+/// form appears in the output by accident.
 const SENTINEL_BYTES: [u8; 8] = [0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7];
 
-/// 哨兵文本：含非 ASCII 字符，确保不会被类型名或标记意外包含。
+/// Sentinel text: contains non-ASCII characters, so that neither a type name nor a
+/// marker can contain it by accident.
 const SENTINEL_TEXT: &str = "\u{4f60}\u{597d}\u{ff0c}\u{4e16}\u{754c}\u{ff01}";
 
 fuzz_target!(|data: &[u8]| {
-    // ── 性质 1 与 2：用任意输入，只验证不 panic 与透明性 ──────────────────
+    // ── Properties 1 and 2: arbitrary input, no-panic and transparency only ──
     let secret: SecretBytes = data.to_vec().into();
     assert_eq!(
         secret.expose_secret(),
@@ -48,14 +60,13 @@ fuzz_target!(|data: &[u8]| {
         "Clone 改变了内容"
     );
 
-    // 格式化任意内容都不得 panic。
     let arbitrary_debug = format!("{secret:?}");
     assert!(
         arbitrary_debug.to_lowercase().contains("redacted"),
         "Debug 输出未标注脱敏：{arbitrary_debug}"
     );
 
-    // ── 性质 3：用固定哨兵做精确泄露检查 ────────────────────────────────
+    // ── Property 3: exact leak check with a fixed sentinel ──────────────────
     let sentinel: SecretBytes = SENTINEL_BYTES.to_vec().into();
     let sentinel_debug = format!("{sentinel:?}");
     let sentinel_lower = sentinel_debug.to_lowercase();
@@ -81,7 +92,7 @@ fuzz_target!(|data: &[u8]| {
         "Debug 泄露了哨兵的十进制表示：{sentinel_debug}"
     );
 
-    // ── 文本路径的哨兵检查 ──────────────────────────────────────────────
+    // ── Sentinel check on the text path ─────────────────────────────────────
     let text_secret = SecretString::from(SENTINEL_TEXT);
     let text_debug = format!("{text_secret:?}");
 
@@ -94,7 +105,6 @@ fuzz_target!(|data: &[u8]| {
         "SecretString 的 Debug 泄露了哨兵文本：{text_debug}"
     );
 
-    // 合法 UTF-8 的任意输入仍要覆盖 `SecretString` 的透明性。
     if let Ok(text) = core::str::from_utf8(data) {
         let string_secret = SecretString::from(text);
         assert_eq!(

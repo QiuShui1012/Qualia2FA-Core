@@ -13,32 +13,34 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! M3 的端到端流程：注册、登录、挑战-应答、恢复。
+//! End-to-end flows: registration, login, challenge-response, recovery.
 //!
-//! # 为什么要有这个文件
+//! # Scope
 //!
-//! 各模块的单元测试验证的是「每个函数自己是对的」。但 M3 要交付的是**用户能走通的
-//! 两条路**：
+//! Module unit tests verify that each function is correct on its own. The flows covered here
+//! are the two paths a user actually walks:
 //!
-//! - **注册**：一台没有任何状态的新设备，建立主密钥与本地保险库。
-//! - **登录**：一台新设备从一台已经登录的设备那里拿到主密钥。
+//! - **Registration**: a device with no state establishes a master key and a local vault.
+//! - **Login**: a new device obtains the master key from a device that is already logged in.
 //!
-//! 这两条路各自要跨过若干个模块（保险库 → 配对 → 设备身份 → 挑战-应答 → 恢复），
-//! 而**模块之间**恰恰是单元测试照顾不到的地方。本文件按用户实际会做的事来组织，
-//! 而不是按模块来组织。
+//! Each path crosses several modules (vault → pairing → device identity → challenge-response →
+//! recovery), and the boundaries between modules are exactly what unit tests do not cover. This
+//! file is organized by what the user actually does, not by module.
 //!
-//! # 两条路径：编排 API 与协议细节
+//! # Two layers: orchestration API and protocol details
 //!
-//! 「用户会做什么」的部分走 [`qualia2fa_core::flow`]——那是应用真正应当调用的入口，
-//! 顺序与失败处理都由它保证。剩下的部分直接用 `pairing` / `auth` / `device` 的底层
-//! 接口，因为那几条测试要钉住的是**协议细节**（消息长度、逐字节篡改、重放日志），
-//! 而不是某一条用户旅程。
+//! The "what the user does" part goes through [`qualia2fa_core::flow`], the entry point an
+//! application should actually call, which guarantees ordering and failure handling. The rest
+//! uses the lower-level `pairing` / `auth` / `device` interfaces directly, because those tests
+//! pin down **protocol details** (message lengths, per-byte tampering, the replay log) rather
+//! than a user journey.
 //!
-//! 两者都必要：只测底层会让「按什么顺序调」无人验证；只测编排则无法逐字节地证明
-//! 「翻转任何一位都会被拒绝」。
+//! Both layers are necessary: testing only the lower level leaves "in what order to call"
+//! unverified, while testing only the orchestration cannot prove byte by byte that flipping any
+//! single bit is rejected.
 //!
-//! 顺带覆盖 TODO 里点名要求的那组安全性质：正确配对必须成功，而**伪造公钥 /
-//! 篡改二维码 / 重放**必须全部失败。
+//! The security properties covered here are: a valid pairing must succeed, while a forged
+//! public key, a tampered QR payload, or a replay must all fail.
 
 use std::collections::HashMap;
 
@@ -56,28 +58,30 @@ use qualia2fa_core::vault::Timestamp;
 use qualia2fa_core::vault::{self, MasterKey};
 use qualia2fa_core::{Error, SecretString};
 
-/// 测试用的固定时间戳。
+/// Fixed timestamp used by these tests.
 ///
-/// 本库不持有时钟（时间一律由调用方传入），因此测试也必须自己给一个确定的值。
+/// The library holds no clock (time is always passed in by the caller), so tests must supply a
+/// deterministic value themselves.
 const TEST_NOW: Timestamp = 1_700_000_000;
 
-/// 测试用的设备标签。生产环境每个平台会用自己的命名规则。
+/// Device label used by these tests. Each platform applies its own naming rules in production.
 const LABEL: &str = "qualia2fa-test-device";
 
-/// 一台设备的软件身份。
+/// A device's software identity.
 ///
-/// 生产环境里设备私钥住在平台硬件密钥库里，签名由 `qualia2fa-keystore` 发起。
-/// 这些测试用软件密钥，是因为它们要验证的是**协议**，与私钥存在哪里无关；真实
-/// 硬件路径由 keystore 仓库的真机集成测试覆盖。
+/// In production the device private key lives in the platform hardware keystore and signing is
+/// performed by `qualia-dik`. These tests use software keys because what they verify is
+/// the **protocol**, independent of where the private key lives; the real hardware path is
+/// covered by on-device integration tests in the keystore repository.
 struct Device {
-    /// 签名私钥。
+    /// Signing private key.
     signing: SigningKey,
-    /// SEC1 编码的设备身份公钥。
+    /// SEC1-encoded device identity public key.
     public: [u8; PUBLIC_KEY_LEN],
 }
 
 impl Device {
-    /// 用给定标量造一台设备。
+    /// Creates a device from the given scalar.
     fn new(scalar: u8) -> Self {
         let mut bytes = [0_u8; 32];
         bytes[31] = scalar;
@@ -88,25 +92,29 @@ impl Device {
         Self { signing, public }
     }
 
-    /// 对消息签名（标准 ECDSA 哈希模式，与 `device::verify` 对称）。
+    /// Signs a message (standard ECDSA hashed mode, symmetric with `device::verify`).
+    ///
+    /// The input must be the **message itself**: this side hashes it before signing, and the
+    /// verification side hashes it once more.
     fn sign(&self, message: &[u8]) -> DeviceSignature {
         let signature: Signature = self.signing.sign(message);
         DeviceSignature::from_bytes(&signature.to_bytes()).expect("固定 64 字节")
     }
 }
 
-/// 满足 [`DeviceKeys`] 的软件实现。
+/// Software implementation of [`DeviceKeys`].
 ///
-/// 它对应端侧那层**不含判断**的适配代码：真实实现转发给 `qualia2fa-keystore`，这里
-/// 转发给内存里的软件密钥。两者的形状必须一致——一旦适配层里长出 `if`，就说明有一条
-/// 只在端侧才走的分支，而端侧没有单元测试。
+/// It corresponds to the **condition-free** adaptation layer on the client side: the real
+/// implementation forwards to `qualia-dik`, this one forwards to in-memory software
+/// keys. Both must have the same shape — an `if` growing in the adaptation layer would mean a
+/// branch taken only on the client side, where there are no unit tests.
 struct SoftwareKeys {
-    /// 按 label 记住已经创建过的身份。
+    /// Identities already created, keyed by label.
     keys: HashMap<String, Device>,
 }
 
 impl SoftwareKeys {
-    /// 一台还没有任何设备身份的新设备。
+    /// A new device with no device identity yet.
     fn new() -> Self {
         Self {
             keys: HashMap::new(),
@@ -117,7 +125,6 @@ impl SoftwareKeys {
 impl DeviceKeys for SoftwareKeys {
     fn get_or_create(&mut self, label: &str) -> Result<DevicePublicKey, Error> {
         if !self.keys.contains_key(label) {
-            // 用 label 派生标量而不是随机取值：测试失败时要能复现。
             let scalar = label.bytes().fold(1_u8, u8::wrapping_add).max(1);
             self.keys.insert(label.to_owned(), Device::new(scalar));
         }
@@ -126,27 +133,29 @@ impl DeviceKeys for SoftwareKeys {
     }
 
     fn sign(&mut self, label: &str, message: &[u8]) -> Result<DeviceSignature, Error> {
-        // 传进来的必须是**消息本身**。若这里先哈希再交给 `Signer`，验签侧会把消息
-        // 再哈希一次，失败现象是一个与真实原因相距很远的
-        // `DeviceSignatureInvalid { reason: "签名与公钥或消息不匹配" }`。
         let device = self.keys.get(label).ok_or(Error::DeviceKeyMissing)?;
         Ok(device.sign(message))
     }
 }
 
-/// 满足 [`SecureStore`] 的内存实现，模拟「主密钥住进平台密钥库」。
+/// In-memory implementation of [`SecureStore`], modelling "the master key resides in the
+/// platform keystore".
 ///
-/// `hardware` 可配置：生产环境里它由 keystore 如实上报（TPM 为 `true`、软件 KSP 为
-/// `false`），这里让它可切换以验证它被原样转发给界面。
+/// `hardware` is configurable: in production the keystore reports it faithfully (`true` for a
+/// TPM, `false` for a software KSP), here it is switchable so that forwarding it to the UI
+/// unchanged can be verified.
+///
+/// Keys are copied through their byte representation, because `MasterKey` deliberately does not
+/// implement `Clone`.
 struct MemoryStore {
-    /// 已存的主密钥。
+    /// The stored master key.
     master: Option<MasterKey>,
-    /// 是否声称受硬件保护。
+    /// Whether it claims to be hardware-protected.
     hardware: bool,
 }
 
 impl MemoryStore {
-    /// 一台还没有存过主密钥的设备的存储。
+    /// Storage of a device that has never stored a master key.
     fn new(hardware: bool) -> Self {
         Self {
             master: None,
@@ -157,7 +166,6 @@ impl MemoryStore {
 
 impl SecureStore for MemoryStore {
     fn load_master_key(&self) -> Result<Option<MasterKey>, Error> {
-        // 主密钥不实现 `Clone`（那会静默复制明文），因此这里按字节复制一份新的。
         self.master
             .as_ref()
             .map(|key| MasterKey::from_bytes(flow::master_key_to_bytes(key)))
@@ -179,14 +187,19 @@ impl SecureStore for MemoryStore {
     }
 }
 
-// ── 注册 ─────────────────────────────────────────────────────────────────
+// ── Registration ───────────────────────────────────────────────────────
 
-/// **注册**：一台全新的设备建立起可用的本地保险库。
+/// **Registration**: a brand-new device establishes a usable local vault.
 ///
-/// 走 [`flow::registration`]，也就是应用真正会调的入口。注册的三步里第一步与第二步
-/// 属于本库，第三步（设备身份进平台密钥库）由 `DeviceKeys` 注入。这条测试确认结果
-/// **真的可用**——一个能创建但存不进东西、或存进去读不出来的保险库，在注册那一刻
-/// 看起来是成功的。
+/// Goes through [`flow::registration`], the entry point an application actually calls. Of the
+/// three registration steps, the first two belong to this library and the third (device
+/// identity into the platform keystore) is injected through `DeviceKeys`. This test confirms
+/// the result is **really usable** — a vault that can be created but cannot store anything, or
+/// cannot read back what was stored, looks successful at the moment of registration.
+///
+/// Reopening afterwards goes through the normal path: the master key is taken from the platform
+/// store and the contents from the file. The device identity is self-consistent: a signature it
+/// produces verifies.
 #[test]
 fn registration_produces_a_usable_vault() {
     let mut keys = SoftwareKeys::new();
@@ -199,7 +212,6 @@ fn registration_produces_a_usable_vault() {
         "存储自称硬件保护，必须原样转发"
     );
 
-    // 加一条条目，序列化——这一步模拟应用把库写到磁盘。
     let entry = vault::entry_from_parsed_uri(
         &qualia2fa_core::uri::parse(
             "otpauth://totp/ACME:alice?secret=JBSWY3DPEHPK3PXP&issuer=ACME",
@@ -215,18 +227,17 @@ fn registration_produces_a_usable_vault() {
         .expect("插入条目");
     let bytes = registered.vault().serialize().expect("序列化");
 
-    // 重启之后按正常路径打开：主密钥从平台存储取，内容从文件取。
     let reopened = flow::open_vault(&store, &bytes).expect("重新打开应当成功");
     assert_eq!(reopened.vault().len(), 1, "条目应当在重新打开后还在");
 
-    // 设备身份本身是自洽的：签名能被验签。
     let message = b"registration";
     let public = keys.get_or_create(LABEL).expect("身份应当能用");
     flow::verify_device(&public, message, &keys.sign(LABEL, message).expect("签名"))
         .expect("自己签的名必须能验过");
 }
 
-/// 注册出来的主密钥必须是**新鲜的随机值**，而不是可推导的常量。
+/// The master key produced by registration must be a **fresh random value**, not a derivable
+/// constant.
 #[test]
 fn registration_generates_a_fresh_master_key_each_time() {
     let mut keys_a = SoftwareKeys::new();
@@ -242,18 +253,19 @@ fn registration_generates_a_fresh_master_key_each_time() {
     );
 }
 
-// ── 登录（二维码配对） ────────────────────────────────────────────────────
+// ── Login (QR pairing) ─────────────────────────────────────────────────
 
-/// **登录成功路径**：加入方拿到的主密钥与发起方手里的**逐字节相同**。
+/// **Successful login path**: the master key the joiner receives is **byte for byte identical**
+/// to the one the initiator holds.
 ///
-/// 这是 M3 的核心承诺。只断言「返回了 Ok」是不够的：一个把主密钥换成新随机值的
-/// 实现同样会返回 Ok，而用户会在同步时才发现条目一条都对不上。
+/// Asserting "it returned Ok" is not enough: an implementation that swapped in a new random master
+/// key would also return Ok, and the mismatch would only show up once the user tried to sync.
 ///
-/// 这条测试用 `pairing` 的底层接口而不是 `flow`，因为它要钉住的是**会话绑定**这个
-/// 协议细节：`request` 借 `&self` 而不是消费它，正是为了让同一个会话接着 `open`。
-/// 新建会话会得到新的临时密钥，于是双方算出的会话标识不同，Msg2 的密钥与 AAD 都对
-/// 不上——失败现象是 `PairingAuthenticationFailed`，而密钥、nonce、AAD 看上去
-/// 全都「用对了」。
+/// This test drives the low-level `pairing` API instead of `flow` because what it pins down is a
+/// **protocol detail**, session binding: `request` borrows `&self` rather than consuming it so
+/// that the same session can go on to `open`. A fresh session would carry a new ephemeral key, so
+/// the two sides would derive different session identifiers and Msg2's key and AAD would no
+/// longer match; the failure surfaces as `PairingAuthenticationFailed`.
 #[test]
 fn login_transfers_the_exact_master_key() {
     let master = MasterKey::generate().expect("随机源可用");
@@ -275,14 +287,17 @@ fn login_transfers_the_exact_master_key() {
     );
 }
 
-/// **登录之后新设备真的能用这个主密钥读数据。**
+/// **After login the new device can really read data with that master key.**
 ///
-/// 上一条只比较了字节；这一条走完整的 [`flow`] 编排，并证明拿到的密钥**在功能上**
-/// 是那把钥匙——用老设备加密的保险库，新设备能解开。只比较字节对「把主密钥换成新
-/// 随机值」这类实现是盲的。
+/// The previous test only compared bytes; this one goes through the full [`flow`] orchestration
+/// and proves the key received is **functionally** the right one: the vault the old device
+/// encrypted opens on the new one. Comparing bytes alone is blind to an implementation that swaps
+/// in a new random master key.
+///
+/// The initiator authorizes directly here; the user confirmation the UI performs at that step is
+/// not part of what this test verifies.
 #[test]
 fn login_lets_the_new_device_open_the_old_vault() {
-    // 老设备：注册、写一条、序列化。
     let mut old_keys = SoftwareKeys::new();
     let mut old_store = MemoryStore::new(true);
     let mut old = flow::registration(&mut old_keys, &mut old_store, LABEL).expect("老设备注册");
@@ -297,40 +312,40 @@ fn login_lets_the_new_device_open_the_old_vault() {
     let master = MasterKey::from_bytes(flow::master_key_to_bytes(old.vault().master_key()))
         .expect("长度由构造保证");
 
-    // 老设备显示二维码。
     let mut login = Login::new().expect("发起登录");
     let payload = login.payload().clone();
 
-    // 新设备扫码、发出请求。
     let mut new_keys = SoftwareKeys::new();
     let mut new_store = MemoryStore::new(true);
     let mut joiner = Joiner::new(&payload, LABEL).expect("新设备应当能扫码");
     let request = joiner.request(&mut new_keys).expect("生成请求");
 
-    // 界面上会在这里让用户确认「是本人发起的」；测试里直接授权。
     let reply = login
         .authorize(&request, &master)
         .expect("老设备授权应当成功");
 
-    // 新设备完成登录：主密钥进平台存储。
     let received = joiner
         .complete(&reply, &mut new_keys, &mut new_store)
         .expect("新设备应当能完成登录");
     assert_eq!(received.expose(), master.expose(), "主密钥必须逐字节一致");
 
-    // 而它**真的**能解开老设备写的文件——这才是「登录成功」的含义。
     let reopened = flow::open_vault(&new_store, &file_bytes).expect("新设备应当能解开");
     assert_eq!(reopened.vault().len(), 1, "新设备应当看到那条条目");
 }
 
-/// 两台各自注册的设备必须有不同的主密钥与不同的设备身份。
+/// Two devices that register separately must end up with different master keys and different
+/// device identities.
 ///
-/// 这条看着显然，但它挡住的是「注册时复用了某个全局密钥」这类实现错误——那会让第二
-/// 台设备的保险库与第一台其实是同一个账号，而界面完全看不出来。
+/// A failure here means registration reused some global key, which would make the second device's
+/// vault the same account as the first one.
 ///
-/// 注意两台设备用的是**不同的 label**。这不是为了绕开什么：`SoftwareKeys` 按 label
-/// 确定性派生密钥（好让测试可复现），因此同 label 必然得到同一个身份；而现实里每台
-/// 设备的平台密钥库各自独立生成随机密钥，label 只在一台设备内部有意义。
+/// The two devices use **different labels**: `SoftwareKeys` derives keys deterministically from
+/// the label so that these tests are reproducible, hence the same label always yields the same
+/// identity. In production each device's platform keystore generates its own random key, and a
+/// label is only meaningful inside one device.
+///
+/// A repeated [`DeviceKeys::get_or_create`] call on one device must return the **same** identity;
+/// otherwise the device could not open its own vault after a restart.
 #[test]
 fn two_devices_register_independently() {
     let mut keys_a = SoftwareKeys::new();
@@ -346,16 +361,19 @@ fn two_devices_register_independently() {
         a.vault().master_key().expose(),
         b.vault().master_key().expose()
     );
-    // 同一台设备上重复调用必须拿回**同一个**身份，否则重启后就打不开自己的库了。
     let mut keys = SoftwareKeys::new();
     let first = keys.get_or_create(LABEL).expect("首次");
     let second = keys.get_or_create(LABEL).expect("再次");
     assert_eq!(first.as_sec1_bytes(), second.as_sec1_bytes());
 }
 
-// ── 恢复密钥 ─────────────────────────────────────────────────────────────
+// ── Recovery key ───────────────────────────────────────────────────────
 
-/// **恢复密钥**：口令导出的文件能还原主密钥，并让一台空设备打开老保险库。
+/// **Recovery key**: a passphrase-derived file restores the master key and lets an empty device
+/// open an old vault.
+///
+/// The export uses the minimum KDF parameters (`KdfParams::new(8, 1, 1)`) to keep the test fast;
+/// the production defaults are `KdfParams::recommended`.
 #[test]
 fn recovery_restores_the_master_key_from_a_passphrase() {
     let mut keys = SoftwareKeys::new();
@@ -374,14 +392,12 @@ fn recovery_restores_the_master_key_from_a_passphrase() {
         .expect("插入");
     let file_bytes = registered.vault().serialize().expect("序列化");
 
-    // 用最低 KDF 参数让测试快；真实默认值见 `KdfParams::recommended`。
     let params = KdfParams::new(8, 1, 1).expect("最低参数应当合法");
     let passphrase = SecretString::from("correct horse battery staple");
     let backup =
         flow::export_recovery_key(registered.vault().master_key(), &passphrase, Some(params))
             .expect("导出应当成功");
 
-    // 一台全新的设备只用口令恢复。
     let mut new_store = MemoryStore::new(true);
     let restored =
         flow::import_recovery_key(&backup, &passphrase, &mut new_store).expect("导入应当成功");
@@ -391,7 +407,7 @@ fn recovery_restores_the_master_key_from_a_passphrase() {
     assert_eq!(reopened.vault().len(), 1);
 }
 
-/// 恢复口令写错时必须失败，且不得在设备上留下任何主密钥。
+/// A wrong recovery passphrase must fail and must not leave any master key on the device.
 #[test]
 fn recovery_rejects_a_wrong_passphrase() {
     let master = MasterKey::generate().expect("随机源可用");
@@ -411,15 +427,21 @@ fn recovery_rejects_a_wrong_passphrase() {
     );
 }
 
-// ── 协议层：篡改、伪造、重放 ─────────────────────────────────────────────
+// ── Protocol layer: tampering, forgery, replay ─────────────────────────
 
-/// **篡改二维码必须失败。**
+/// **A tampered QR payload must never complete a pairing.**
 ///
-/// 二维码是唯一的带外信道，攻击者若能改它就能把自己的公钥换进去。这里逐个字节翻转
-/// 载荷并确认：要么解码阶段就被拒绝，要么**配对根本无法完成**。
+/// The QR code is the only out-of-band channel, so an attacker able to modify it could substitute
+/// a public key of their own. Every byte of the payload is flipped in turn, and the result must
+/// either be rejected while decoding or fail to complete the pairing at all.
 ///
-/// 先确认未篡改的载荷能走通，否则下面的断言毫无意义——一条「什么都拒绝」的实现
-/// 也能让下面的循环全绿。
+/// The untampered payload is exercised first, otherwise the assertions below would be vacuous: an
+/// implementation that rejects everything would leave the loop green.
+///
+/// Msg1 is bound to the ephemeral key a `begin()` call generated, so the baseline reuses that same
+/// `pending`; the loop below deliberately starts a fresh initiator for every byte instead. A
+/// tampered payload that still decodes and joins — the dangerous case — must be rejected at
+/// `accept`, while failing to decode or to join also counts as rejected.
 #[test]
 fn tampered_qr_payload_never_completes_a_pairing() {
     let master = MasterKey::generate().expect("随机源可用");
@@ -428,12 +450,6 @@ fn tampered_qr_payload_never_completes_a_pairing() {
     let (payload, pending) = pairing::begin().expect("发起配对");
     let baseline = payload.encode();
 
-    // 基线：同一份载荷必须能走到 `accept` 成功。
-    //
-    // 注意用的是**上面那一个** `pending`。Msg1 是绑定到某次 `begin()` 的临时密钥上
-    // 的：另起一个 `begin()` 会得到新的临时密钥，会话标识随之不同，于是 Msg1 被拒。
-    // 这与下面循环里「每个字节都要配一个全新的发起方会话」是两件不同的事——那里是
-    // 故意的，这里是必须复用。
     {
         let decoded = QrPayload::decode(&baseline).expect("基线载荷应当能解码");
         let session = pairing::join(&decoded).expect("基线应当能加入");
@@ -447,7 +463,6 @@ fn tampered_qr_payload_never_completes_a_pairing() {
         let mut tampered = baseline.clone();
         tampered[index] ^= 0x01;
 
-        // 解码失败、或者加入失败，都属于「被拒绝」。
         let Ok(decoded) = QrPayload::decode(&tampered) else {
             continue;
         };
@@ -457,8 +472,6 @@ fn tampered_qr_payload_never_completes_a_pairing() {
         let Ok((msg1, _)) = session.request(&joiner.public) else {
             continue;
         };
-        // 走到这里说明篡改后的载荷在结构上仍然「像」一份合法载荷——那正是最危险的
-        // 情况。发起方必须在此拒绝它。
         let (_, pending) = pairing::begin().expect("发起配对");
         assert!(
             pending.accept(&msg1, &master).is_err(),
@@ -467,7 +480,13 @@ fn tampered_qr_payload_never_completes_a_pairing() {
     }
 }
 
-/// **伪造公钥必须失败**：攻击者用自己的公钥冒充设备身份，验签必须挡下来。
+/// **A forged public key must fail**: a signature produced with an attacker's own key must not
+/// verify against the real device identity.
+///
+/// The check goes through this crate's `verify_device`, so what is asserted is the error type a
+/// caller sees: the device identity library reports the failure, and it arrives wrapped as
+/// `Error::Device(qualia_dik::Error::DeviceSignatureInvalid { .. })`. A signature made by the real
+/// private key must still verify.
 #[test]
 fn forged_device_public_key_is_rejected() {
     let message = b"pairing transcript";
@@ -475,17 +494,12 @@ fn forged_device_public_key_is_rejected() {
     let attacker = Device::new(4);
 
     let signature = attacker.sign(message);
-    // 走本 crate 的 `verify_device` 而不是 `qualia_dik::device::verify`：前者才代表
-    // 调用方看到的错误类型，而「验签失败长什么样」正是这条测试要盯住的东西。
     let error = verify_device(
         &DevicePublicKey::from_sec1_bytes(&real.public).expect("合法公钥"),
         message,
         &signature,
     )
     .expect_err("攻击者签的名不该验过");
-    // 验签失败现在由设备身份库报出，经 `Error::Device` 包装过来。断言链上的**内层**
-    // 变体，而不是 Core 那一层的名字——「是验签不过」这个事实属于设备身份库，
-    // 包装只是把它带上来。
     assert!(
         matches!(
             error,
@@ -494,7 +508,6 @@ fn forged_device_public_key_is_rejected() {
         "实际是 {error:?}"
     );
 
-    // 合法签名仍然能过——否则「什么都拒绝」也能让上面那条绿。
     verify_device(
         &DevicePublicKey::from_sec1_bytes(&real.public).expect("合法公钥"),
         message,
@@ -503,10 +516,11 @@ fn forged_device_public_key_is_rejected() {
     .expect("自己的签名必须能验过");
 }
 
-/// 二维码载荷里**不得出现任何密钥材料**。
+/// **No key material may appear in the QR payload.**
 ///
-/// 二维码是公开信道（会被拍照、截图、投屏），因此它只能携带公钥与随机数。这条测试
-/// 把载荷与主密钥逐字节比对，挡住「顺手把主密钥塞进二维码」这类灾难性改动。
+/// The QR code is a public channel — it gets photographed, screenshotted and projected — so it may
+/// carry only a public key and random nonces. The encoded payload is scanned for any 8-byte window
+/// of the master key, and its length must equal `pairing::QR_PAYLOAD_LEN`.
 #[test]
 fn qr_payload_never_contains_key_material() {
     let master = MasterKey::generate().expect("随机源可用");
@@ -524,17 +538,21 @@ fn qr_payload_never_contains_key_material() {
     assert_eq!(bytes.len(), pairing::QR_PAYLOAD_LEN);
 }
 
-/// **重放整次会话必须失败**：把第一次登录的 Msg1 原样再发一次。
+/// **Replaying a whole session must fail**: the Msg1 of a first login is sent again unchanged.
 ///
-/// 重放防护在协议里是三层（见 `pairing` 与 `auth` 的模块文档），这里验证的
-/// `NonceLog` 是**跨进程重启**那一层——它是唯一需要调用方配合的，因此必须有一条
-/// 测试证明它确实能挡住东西，而不只是一个计数器。
+/// Replay protection in the protocol has three layers (see the module documentation of `pairing`
+/// and `auth`). The layer verified here is `NonceLog`, the one that survives a process restart and
+/// the only one that requires the caller's cooperation: the initiator must consult the log before
+/// answering. Recording an identifier reports whether it was new, and a replayed Msg1 keeps the
+/// session identifier it was first recorded under, so `is_used` recognises it.
+///
+/// A later pairing (a user starting login again) must produce a **new** session identifier that the
+/// log does not report as used; otherwise the replay log would make login work only once.
 #[test]
 fn replayed_pairing_messages_are_rejected() {
     let master = MasterKey::generate().expect("随机源可用");
     let joiner = Device::new(2);
 
-    // 第一次登录：完整走通，记下会话标识。
     let (payload, pending) = pairing::begin().expect("发起配对");
     let session = pairing::join(&payload).expect("接受二维码");
     let (recorded_msg1, session_id) = session.request(&joiner.public).expect("生成请求");
@@ -543,17 +561,12 @@ fn replayed_pairing_messages_are_rejected() {
         .expect("首次应当通过");
     assert_eq!(adoption.session_id(), &session_id);
 
-    // 记进重放日志。
     let mut log = NonceLog::new();
     assert!(log.record(session_id), "首次记录应当成功");
     assert!(log.is_used(&session_id));
 
-    // 攻击者把整条 Msg1 原样再发一次。发起方**必须**先查日志再应答——这是调用方的
-    // 责任，因此这里也顺带钉住了「查日志确实能认出来」。
     assert!(log.is_used(&session_id), "重放日志必须认出已经用过的会话");
 
-    // 换一个会话（对应现实里用户重新发起登录）必须是**新的**会话标识，不会被日志
-    // 误伤——否则重放防护会变成「登录只能用一次」。
     let (payload2, _pending2) = pairing::begin().expect("发起配对");
     let session2 = pairing::join(&payload2).expect("接受二维码");
     let (_msg1_2, session_id2) = session2.request(&joiner.public).expect("生成请求");
@@ -563,10 +576,15 @@ fn replayed_pairing_messages_are_rejected() {
     assert_eq!(log.len(), 2);
 }
 
-/// 重放日志的容量必须有界。
+/// The replay log's capacity must be **bounded**.
 ///
-/// 攻击者可以发起大量**不完成**的配对，每个都产生一个会话标识。若日志无界增长，
-/// 那就是一条内存耗尽路径——而这个日志的作用只是挡住重放，记不住全部也无所谓。
+/// An attacker can start a large number of pairings that are **never completed**, each producing a
+/// session identifier of `NONCE_LEN` (32) bytes. An unbounded log would be a memory-exhaustion
+/// path, while the log's only job is to block replays, so it does not have to remember them all.
+///
+/// Only the newest identifiers are kept: the most recent one must still be recognised, `len()` must
+/// stay at or below `NonceLog::DEFAULT_CAPACITY`, and recording an identifier already in the log
+/// must report `false` instead of adding it a second time.
 #[test]
 fn nonce_log_detects_replays_and_stays_bounded() {
     let mut log = NonceLog::new();
@@ -583,16 +601,18 @@ fn nonce_log_detects_replays_and_stays_bounded() {
         "日志长度 {} 超过了容量 {capacity}",
         log.len()
     );
-    // 最新的那些必须还在，否则「刚用完就被忘掉」等于没有防护。
     let newest = session_ids.last().expect("至少记录了一个");
     assert!(log.is_used(newest), "最新的会话标识不该被淘汰");
-    // 重复记录同一个标识必须返回「已经在里面了」。
     assert!(!log.record(*newest), "同一个标识不该被记两次");
 }
 
-// ── 挑战-应答（D3） ──────────────────────────────────────────────────────
+// ── Challenge-response ─────────────────────────────────────────────────
 
-/// **挑战-应答**：持有主密钥的一方能让验证方确信这一点，双方对会话标识达成一致。
+/// **Challenge-response**: the party holding the master key convinces the verifier of that fact, and
+/// both sides agree on the session identifier.
+///
+/// The response carries the device identity public key, and the confirmation tag the verifier
+/// produces must be accepted back by the responder — the same property in the reverse direction.
 #[test]
 fn challenge_response_confirms_both_sides() {
     let master = MasterKey::generate().expect("随机源可用");
@@ -608,7 +628,6 @@ fn challenge_response_confirms_both_sides() {
     assert_eq!(verified.session_id(), &responder.session_id());
     assert_eq!(verified.device_key().as_sec1_bytes(), &device.public);
 
-    // 确认标签必须被对方接受——这一步证明**反过来**也成立。
     auth::confirm(
         &master,
         &responder,
@@ -618,7 +637,10 @@ fn challenge_response_confirms_both_sides() {
     .expect("确认应当通过");
 }
 
-/// 没有主密钥的一方无法应答；伪造的应答必须被拒绝。
+/// A party without the master key cannot answer, and a forged response must be rejected.
+///
+/// The response is built from a **different** master key than the one the verifier holds, and
+/// verification must fail with `Error::AuthProofFailed`.
 #[test]
 fn challenge_response_fails_without_the_master_key() {
     let real = MasterKey::generate().expect("随机源可用");
@@ -627,7 +649,6 @@ fn challenge_response_fails_without_the_master_key() {
 
     let (challenge, verifier) = auth::begin().expect("发起挑战");
     let responder = auth::accept(&challenge).expect("接受挑战");
-    // 攻击者手里没有真主密钥，用它自己那把去应答。
     let response = responder
         .respond(&fake, &device.public, |message| Ok(device.sign(message)))
         .expect("应答本身能构造出来");
@@ -637,13 +658,14 @@ fn challenge_response_fails_without_the_master_key() {
     assert!(matches!(error, Error::AuthProofFailed), "实际是 {error:?}");
 }
 
-// ── 契约 ─────────────────────────────────────────────────────────────────
+// ── Wire-format contract ───────────────────────────────────────────────
 
-/// 各协议消息的长度是**跨版本契约**，不得随实现漂移。
+/// The length of every protocol message is a **cross-version contract** and must not drift with the
+/// implementation.
 ///
-/// 两台设备可能运行不同版本的软件（这正是本应用的使用场景），长度变化会让它们无法
-/// 互通，而症状是「配对偶尔失败」——极难定位。这些常量因此被钉在这里，改动它们必须
-/// 是一次有意识的版本升级。
+/// Two devices may run different versions of the software, and a changed length would stop them from
+/// interoperating, with the symptom being a pairing that fails intermittently. These constants are
+/// therefore pinned here, and changing one has to be a deliberate version upgrade.
 #[test]
 fn protocol_lengths_are_stable() {
     assert_eq!(pairing::QR_PAYLOAD_LEN, 99);
@@ -656,11 +678,13 @@ fn protocol_lengths_are_stable() {
     assert_eq!(recovery::FILE_LEN, 110);
 }
 
-/// 两台各有独立主密钥的设备，在同步之前互相看不到对方的条目。
+/// Two devices with independent master keys see none of each other's entries before they sync.
 ///
-/// 这条钉住 D5 的一个直接后果：登录只传主密钥，**不传条目**。一个「顺手把条目也带
-/// 过去」的实现会让同步在用户没要求的时候发生，而它的症状要到两台设备都改了同一条
-/// 目之后才显现。
+/// A direct consequence of what login transfers: the master key only, **no entries**. The second
+/// device here is built from the same master key but as a **new, empty** vault, which is the state a
+/// device is actually in after logging in; it can open the old device's file only because that file
+/// is encrypted under the same key, while its own vault stays empty. Carrying entries along with the
+/// key would make syncing happen without the user asking for it.
 #[test]
 fn a_second_vault_with_the_same_master_key_sees_nothing_until_sync() {
     let mut keys = SoftwareKeys::new();
@@ -675,13 +699,11 @@ fn a_second_vault_with_the_same_master_key_sees_nothing_until_sync() {
     first.vault_mut().vault_mut().insert(entry).expect("插入");
     let bytes = first.vault().serialize().expect("序列化");
 
-    // 第二台设备用同一把主密钥、但**新建**一个空保险库——登录之后的真实状态。
     let master = MasterKey::from_bytes(flow::master_key_to_bytes(first.vault().master_key()))
         .expect("长度由构造保证");
     let fresh = flow::empty_vault(master);
     assert!(fresh.vault().is_empty(), "新保险库不该自带条目");
 
-    // 它确实能解开老设备的文件（同一把钥匙），但自己那份还是空的。
     let opened = flow::open_vault(&store, &bytes).expect("同一把密钥应当能解开");
     assert_eq!(opened.vault().len(), 1);
     assert!(fresh.vault().is_empty());

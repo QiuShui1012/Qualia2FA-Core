@@ -13,24 +13,23 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! 同步载荷与并集合并的基于属性测试。
+//! Property-based tests for sync payloads and union merge.
 //!
-//! # 这里的核心性质
+//! Core properties:
 //!
-//! 1. **往返保真**：任意条目集合打包再解开，内容逐字段同值。
-//! 2. **幂等**：同一份载荷合并两次，第二次什么都不改。
-//! 3. **交换**：两台设备各自的载荷，以两种顺序合并，结果一致。
-//! 4. **篡改必被发现**：改动载荷中任意一个字节，解析必须失败。
-//! 5. **解析绝不 panic**：任意字节流都是可接受的输入。
+//! 1. **Round-trip fidelity**: any entry set packed and unpacked keeps every field.
+//! 2. **Idempotence**: merging the same payload twice changes nothing the second time.
+//! 3. **Commutativity**: two devices' payloads merged in either order give the same result.
+//! 4. **Tampering is detected**: changing any byte of a payload makes parsing fail.
+//! 5. **Parsing never panics**: any byte stream is acceptable input.
 //!
-//! # 为什么「合并」是本文件的主角
+//! Merge is what these tests are about: it is the only property that tombstones, conflicts
+//! and out-of-order delivery can break, and it is what the product promises — several devices
+//! that edit offline must see the same entry set after syncing.
 //!
-//! 打包与解包是单机性质，任何一台设备自己就能观察到；**合并**才是这个产品真正承诺
-//! 的东西——多台设备各自离线改动，同步之后必须看到同一份条目集合。它也是唯一一条
-//! 要在加入墓碑、冲突、乱序之后才可能被破坏的性质。
-//!
-//! 收敛的断言一律按**保险库内容**判等，而不是按冲突列表判等：冲突是「要人来决定」的
-//! 东西，先后顺序会影响哪边被当成「本地」，因此它本来就不该是确定的。
+//! Convergence is asserted on **vault content**, never on the conflict list: a conflict is
+//! something a human decides, and the order in which payloads arrive determines which side
+//! counts as local, so the conflict list is not meant to be deterministic.
 
 use std::collections::BTreeMap;
 
@@ -41,34 +40,32 @@ use qualia2fa_core::otp::{Algorithm, Digits, OtpSecret};
 use qualia2fa_core::sync::{self, MergedRecord, Payload, RecordSet, SeenSyncIds};
 use qualia2fa_core::vault::{Entry, MasterKey, Timestamp, Vault};
 
-/// 生成任意字节秘密。
+/// Generates an arbitrary byte secret.
 fn arb_secret_bytes() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(any::<u8>(), 1..=64)
 }
 
-/// 生成任意文本字段，覆盖多字节字符。
+/// Generates an arbitrary text field, multi-byte characters included.
 ///
-/// 同步路径上字段要经过「编码 → 压缩 → 加密 → 解密 → 解压 → 解码」六个步骤，任何
-/// 一步按**字符数**而不是字节数算长度都会在多字节输入上出错。每一步都只看字节，因此
-/// 这条性质应当成立——但正是这种「显然成立」的东西值得随机化验证。
+/// On the sync path a field passes through six steps — encode, compress, encrypt, decrypt,
+/// decompress, decode — and a step that measured length in **characters** instead of bytes
+/// would corrupt multi-byte input. Every step operates on bytes only, so the text must come
+/// back identical.
+///
+/// Code points are drawn from `0x20..0x7F` and `0x80..0xD800`; the surrogate range
+/// `0xD800..0xE000` is excluded because `char::from_u32` rejects it.
 fn arb_text() -> impl Strategy<Value = String> {
-    prop::collection::vec(
-        prop_oneof![
-            0x20_u32..0x7F,
-            // 多字节区间。排除代理对区，`char::from_u32` 会拒绝它们。
-            0x80_u32..0xD800,
-        ],
-        0..=48,
+    prop::collection::vec(prop_oneof![0x20_u32..0x7F, 0x80_u32..0xD800,], 0..=48).prop_map(
+        |codepoints| {
+            codepoints
+                .into_iter()
+                .filter_map(char::from_u32)
+                .collect::<String>()
+        },
     )
-    .prop_map(|codepoints| {
-        codepoints
-            .into_iter()
-            .filter_map(char::from_u32)
-            .collect::<String>()
-    })
 }
 
-/// 生成一条任意条目。
+/// Generates an arbitrary entry.
 fn arb_entry() -> impl Strategy<Value = Entry> {
     (
         arb_text(),
@@ -119,7 +116,7 @@ fn arb_entry() -> impl Strategy<Value = Entry> {
         )
 }
 
-/// 生成一台设备的保险库：若干条目，其中一部分被删除（留下墓碑）。
+/// Generates one device's vault: several entries, some of them deleted (leaving tombstones).
 fn arb_vault() -> impl Strategy<Value = Vault> {
     (
         prop::collection::vec(arb_entry(), 0..=10),
@@ -137,15 +134,15 @@ fn arb_vault() -> impl Strategy<Value = Vault> {
         })
 }
 
-/// 把保险库的**内容**抽成一个可比较的映射。
+/// Extracts the **content** of a vault into a comparable map.
 ///
-/// # 为什么不直接比 `Vault`
+/// [`Vault`] deliberately does not implement `PartialEq`: comparing it would walk all secret
+/// material, an operation with no production use. What is asserted here is content equality
+/// rather than internal-representation equality — the latter would turn pure implementation
+/// detail into a test contract.
 ///
-/// [`Vault`] 刻意不实现 `PartialEq`（比较它要遍历全部秘密材料，而那个操作没有生产
-/// 用途）。更重要的是：这里要断言的是「**内容**一致」，而不是「内部表示一致」——后者
-/// 会把纯粹的实现细节变成测试契约，让任何一次重构都要求改测试。
-///
-/// 秘密那部分用 Base32 表示比较：只用于测试，不参与任何认证判定。
+/// Secrets are compared in their Base32 form: this is test-only and takes part in no
+/// authentication decision.
 fn vault_contents(vault: &Vault) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for (id, entry) in vault.iter() {
@@ -176,12 +173,12 @@ fn vault_contents(vault: &Vault) -> BTreeMap<String, String> {
     map
 }
 
-/// 把一台设备的保险库打包成载荷。
+/// Packs one device's vault into a payload.
 fn payload_of(vault: &Vault, master: &MasterKey, sender: DeviceId) -> Payload {
     Payload::from_vault(master, sender, vault).expect("打包应当成功")
 }
 
-/// 把一份载荷解成一组可以去重的语义记录。
+/// Opens a payload into a set of semantic records suitable for deduplication.
 fn records_of(payload: &Payload, master: &MasterKey) -> RecordSet<MergedRecord> {
     let opened = payload.open_records(master).expect("记录应当能解开");
     let mut set = RecordSet::new();
@@ -191,19 +188,20 @@ fn records_of(payload: &Payload, master: &MasterKey) -> RecordSet<MergedRecord> 
     set
 }
 
-/// 把一份载荷并进一个保险库，返回结果。
+/// Merges a payload into a vault and returns the outcome.
 ///
-/// # 冲突里的 `incoming` **不**会被写入
-///
-/// 那是调用方要按用户裁定去做的。因此这个辅助函数留下的保险库只包含「自动可决定」
-/// 的那部分——而收敛断言针对的正是这部分：需要人来决定的条目不进保险库，于是同一批
-/// 输入在不同顺序下到达同一个状态。
+/// An `incoming` side of a conflict is **not** written: the caller does that once the user has
+/// decided. The vault this helper leaves behind therefore holds only the automatically
+/// decidable part, which is exactly what the convergence assertions cover — entries that need
+/// a human decision stay out of the vault, so the same inputs reach the same state in any
+/// order.
 fn merge_payload(vault: &mut Vault, payload: &Payload, master: &MasterKey) -> sync::MergeOutcome {
     let set = records_of(payload, master);
     sync::merge_into(vault, &set).expect("合并不应当因复制失败而中止")
 }
 
-/// 生成一台「设备」：保险库 + 设备标识。主密钥另行生成，方便多台设备共用一把。
+/// Generates a "device": a vault plus a device id. The master key is generated separately so
+/// several devices can share one.
 fn arb_vault_and_sender() -> impl Strategy<Value = (Vault, DeviceId)> {
     (arb_vault(), any::<[u8; DEVICE_ID_LEN]>())
         .prop_map(|(vault, sender)| (vault, DeviceId::from_bytes(sender)))
@@ -211,16 +209,15 @@ fn arb_vault_and_sender() -> impl Strategy<Value = (Vault, DeviceId)> {
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        // 每条用例要生成保险库、打包、加密、解密、合并，比纯字节级测试贵。
-        // 64 轮足够覆盖结构性组合，同时让整个文件在十几秒内跑完。
         cases: 64,
         ..ProptestConfig::default()
     })]
 
-    /// **往返保真**：打包再解开，内容逐字段同值。
+    /// **Round-trip fidelity**: packing and unpacking keeps every field of every entry.
     ///
-    /// 这是同步一切性质的基础。它失败意味着「发出去的东西与收到的不是一回事」，而
-    /// 那种故障在真实使用里表现为「某台设备上的条目偶尔不一样」——极难复现。
+    /// This underpins every other sync property. A failure means what was sent and what was
+    /// received differ, which in real use shows up as an entry that occasionally looks
+    /// different on one device.
     #[test]
     fn a_payload_roundtrips_every_entry(
         (vault, sender) in arb_vault_and_sender(),
@@ -288,11 +285,12 @@ proptest! {
         }
     }
 
-    /// **幂等**：同一份载荷合并两次，第二次什么都不改。
+    /// **Idempotence**: merging the same payload twice changes nothing the second time.
     ///
-    /// 「什么都不改」要按两个方向断言：计数为 0 **且**保险库内容逐项相同。只看计数的
-    /// 话，一个「把条目替换成另一个同 ID 的内容」的实现也能通过——而那正是幂等性
-    /// 要防的事。
+    /// "Changes nothing" is asserted in two directions: the counters stay 0 **and** the vault
+    /// content is item-for-item identical. Counters alone would let an implementation that
+    /// replaces an entry with different content under the same id pass — exactly what
+    /// idempotence has to rule out.
     #[test]
     fn merging_the_same_payload_twice_changes_nothing(
         (source, sender) in arb_vault_and_sender(),
@@ -318,11 +316,12 @@ proptest! {
         prop_assert_eq!(after_first, after_second, "第二次合并改变了保险库内容");
     }
 
-    /// **交换**：两台设备各自的载荷，以两种顺序合并，结果一致。
+    /// **Commutativity**: two devices' payloads merged in either order give the same result.
     ///
-    /// 真实场景里「先收到谁」由网络决定，因此这条性质是收敛的前提。注意它**只**对
-    /// 保险库内容成立：冲突列表可能不同（哪边被当成「本地」取决于顺序），而那正是
-    /// 「冲突要人来决定」的含义。
+    /// Which payload arrives first is decided by the network, so this property is the
+    /// precondition for convergence. It holds **only** for vault content: the conflict list may
+    /// differ, because which side counts as local depends on the order — that is what "a
+    /// conflict is decided by a human" means.
     #[test]
     fn merging_two_payloads_is_order_independent(
         (vault_a, sender_a) in arb_vault_and_sender(),
@@ -332,12 +331,10 @@ proptest! {
         let payload_a = payload_of(&vault_a, &master, sender_a);
         let payload_b = payload_of(&vault_b, &master, sender_b);
 
-        // 顺序一：先 A 后 B。
         let mut forward = Vault::new();
         merge_payload(&mut forward, &payload_a, &master);
         merge_payload(&mut forward, &payload_b, &master);
 
-        // 顺序二：先 B 后 A。
         let mut backward = Vault::new();
         merge_payload(&mut backward, &payload_b, &master);
         merge_payload(&mut backward, &payload_a, &master);
@@ -349,26 +346,26 @@ proptest! {
         );
     }
 
-    /// **收敛**：三台设备互相同步之后内容一致。
+    /// **Convergence**: three devices that sync with each other end up with the same content.
     ///
-    /// 这是本文件最重要的性质，也是唯一一条把多台设备放在一起才能验证的。它覆盖
-    /// 「新增」「删除」「两边都有」「只有一边有」四种组合在**任意**分布下的行为。
+    /// This is the property that needs several devices in one test. It covers the four
+    /// combinations — added, deleted, present on both sides, present on one side only — in
+    /// **any** distribution across the three vaults.
+    ///
+    /// Two rounds are required: the first round only exchanges each device's initial payload,
+    /// so information one device learned from a third has not propagated yet.
     #[test]
     fn three_devices_converge(
         (vault_a, sender_a) in arb_vault_and_sender(),
         (vault_b, sender_b) in arb_vault_and_sender(),
         (vault_c, sender_c) in arb_vault_and_sender(),
     ) {
-        // 三台设备共用一把主密钥（真实场景里 B、C 是通过配对拿到它的）。
         let master = MasterKey::generate().expect("OS 随机源可用");
 
         let mut a = vault_a;
         let mut b = vault_b;
         let mut c = vault_c;
 
-        // 两轮同步。为什么一轮不够：第一轮里每台设备收到的都是别人的**初始**载荷，
-        // 因此「B 从 C 那里学到的、A 还不知道」这类二阶信息在第一轮结束时还没传播
-        // 完。真实使用里就是「同步一次不够，要等大家都同步过一轮」。
         for _ in 0..2 {
             let payload_a = payload_of(&a, &master, sender_a);
             let payload_b = payload_of(&b, &master, sender_b);
@@ -386,23 +383,24 @@ proptest! {
         prop_assert_eq!(vault_contents(&b), vault_contents(&c), "B 与 C 未收敛");
     }
 
-    /// **任意字节流都不得 panic。**
+    /// **No byte stream may panic.**
     ///
-    /// 输入完全来自攻击者可控的通道。这条性质是「不 panic」约定的随机化版本——单元
-    /// 测试覆盖不了「某个长度的输入恰好走到某个 `unwrap`」这类路径。
+    /// The input comes entirely from attacker-controlled channels. This is the randomized form
+    /// of the no-panic contract: a unit test cannot cover the path where an input of a
+    /// particular length happens to reach some `unwrap`.
     #[test]
     fn parsing_arbitrary_bytes_never_panics(
         data in prop::collection::vec(any::<u8>(), 0..=512),
     ) {
         let master = MasterKey::generate().expect("OS 随机源可用");
-        // 结果无论是 Ok 还是 Err 都算通过；这里只要求不 panic。
         let _ = Payload::open(&master, &data);
     }
 
-    /// **载荷里任意一个字节被改动都必须被发现。**
+    /// **Any single flipped byte in a payload must be detected.**
     ///
-    /// 与外层 AEAD 一起工作的是压缩层：如果压缩流有「尾部垃圾被忽略」这类性质，那么
-    /// 追加在末尾的字节就可能被静默放过。逐字节翻转能同时覆盖这两条路径。
+    /// A compression layer works alongside the outer AEAD: if the compressed stream tolerated
+    /// trailing garbage, bytes appended at the end could slip through silently. Flipping one
+    /// byte at a time covers both paths.
     #[test]
     fn any_single_byte_flip_in_a_payload_is_detected(
         (vault, sender) in arb_vault_and_sender(),
@@ -425,15 +423,17 @@ proptest! {
         );
     }
 
-    /// **不同的主密钥打不开载荷。**
+    /// **A different master key cannot open a payload.**
+    ///
+    /// The same key must open it first, otherwise the negative assertion below would be
+    /// vacuous. A round whose random seed happens to equal the generated key (probability
+    /// 2^-256) is skipped: that input has no discriminating power.
     #[test]
     fn a_different_master_key_cannot_open_a_payload(
         (vault, sender) in arb_vault_and_sender(),
         other_seed in any::<[u8; DEVICE_ID_LEN]>(),
     ) {
         let master = MasterKey::generate().expect("OS 随机源可用");
-        // 生成的种子恰好与随机输入相同（概率 2^-256）时跳过：那不是性质不成立，而是
-        // 这一轮的输入没有区分力。
         prop_assume!(
             qualia2fa_core::vault::master_key_to_bytes(&master).expose_secret()
                 != other_seed.as_slice()
@@ -442,7 +442,6 @@ proptest! {
         let payload = payload_of(&vault, &master, sender);
         let sealed = payload.seal(&master).expect("打包应当成功");
 
-        // 同一把密钥必须能打开，否则下面那条断言没有意义（可能是载荷本身坏了）。
         prop_assert!(Payload::open(&master, &sealed).is_ok(), "同一把密钥打不开");
 
         let wrong = MasterKey::from_bytes(qualia2fa_core::SecretBytes::from(
@@ -455,10 +454,10 @@ proptest! {
         );
     }
 
-    /// **`SeenSyncIds` 记住的集合与放进去的完全一致。**
+    /// **`SeenSyncIds` remembers exactly what was recorded.**
     ///
-    /// 重放防护的全部内容就是这个集合，因此「记了但查不到」与「没记却查得到」两种
-    /// 错误都要排除。
+    /// This set is the whole of replay protection, so both errors are ruled out: recorded but
+    /// not found, and not recorded but found.
     #[test]
     fn the_seen_log_remembers_exactly_what_was_recorded(
         ids in prop::collection::vec(any::<[u8; DEVICE_ID_LEN]>(), 0..=64),

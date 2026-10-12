@@ -13,65 +13,83 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! 注册与登录这两条**用户旅程**的编排。
+//! Orchestration of the two user journeys: registration and login.
 //!
-//! 前面几个模块各自解决一个问题：[`crate::vault`] 管加密的条目、[`crate::pairing`]
-//! 管带外引导的密钥交换、[`qualia_dik::device`] 管设备身份、[`crate::recovery`] 管
-//! 口令备份。本模块把它们按用户实际会走的两条路串起来：
+//! The other modules each solve one problem: [`crate::vault`] holds the encrypted
+//! entries, [`crate::pairing`] performs the out-of-band bootstrapped key exchange,
+//! [`qualia_dik::device`] handles the device identity, and [`crate::recovery`]
+//! handles passphrase backups. This module chains them into the two paths a user
+//! actually walks:
 //!
 //! ```text
-//! 注册（本设备是账号的第一台设备）
-//!   生成主密钥 → 建空保险库 → 取得设备身份 → 主密钥入平台密钥库 → 保险库落盘
+//! Registration (this device is the first device of the account)
+//!   generate master key → create empty vault → obtain device identity
+//!   → master key into the platform key store → write vault to disk
 //!
-//! 登录（本设备从一台已登录的设备拿到主密钥）
-//!   老设备：显示二维码 → 收到请求 → 确认是本人 → 交出加密后的主密钥
-//!   新设备：扫码      → 发出请求 → 收到应答 → 主密钥入平台密钥库 → 建保险库
+//! Login (this device receives the master key from an already logged-in device)
+//!   old device: show QR code → receive request → confirm it is the user
+//!               → hand over the encrypted master key
+//!   new device: scan        → send request   → receive reply
+//!               → master key into the platform key store → create vault
 //! ```
 //!
-//! # 为什么要一个编排模块，而不是让调用方自己按顺序调
+//! # Step order is a security property
 //!
-//! 因为**顺序本身就是安全性质**，而散在各处的顺序没人测。举两个具体例子：
+//! Two ordering rules hold, and callers may rely on them:
 //!
-//! - 主密钥必须在保险库落盘**之前**进平台密钥库。反过来的话，中途失败会留下一
-//!   个打不开的保险库文件，而用户的数据看上去「还在」。
-//! - 设备身份必须在**发请求之前**就取得。否则登录成功后生成的身份与请求里声明的
-//!   身份不是同一个，保险库从此只能由那个临时身份打开——而它已经随会话消失了。
+//! - The master key enters the platform key store **before** the vault is written
+//!   to disk. In the reverse order, a failure in between would leave an unopenable
+//!   vault file behind while the user's data still appears to be there.
+//! - The device identity is obtained **before** the request is sent. Otherwise the
+//!   identity generated after a successful login differs from the one declared in
+//!   the request, and the vault could only ever be opened by that temporary
+//!   identity, which is gone with the session.
 //!
-//! 这两条都不是任何单个模块能表达的，只有把整条路写在一处才谈得上测试。
+//! # Platform dependencies are injected as trait parameters
 //!
-//! # 平台依赖以 trait 参数注入
+//! This crate has no I/O and does not touch platform APIs (see the crate docs), so
+//! "store the master key in the TPM" and "read the device identity from somewhere"
+//! are provided by the caller through two traits:
 //!
-//! 本 crate **没有 I/O、不碰平台 API**（见 crate 文档），因此「主密钥存进 TPM」与
-//! 「去哪里读设备身份」这两件事必须由调用方提供。它们通过两个 trait 注入：
-//!
-//! | trait | 由谁实现 | 负责 |
+//! | trait | implemented by | responsible for |
 //! |---|---|---|
-//! | [`DeviceKeys`] | `qualia2fa-keystore` 的适配层 | 取得设备身份、对消息签名 |
-//! | [`SecureStore`] | 端侧（平台密钥库 / 系统钥匙串 / 文件）| 主密钥的持久化 |
+//! | [`DeviceKeys`] | the `qualia-dik` adapter | device identity, signing |
+//! | [`SecureStore`] | the host side (key store / keychain) | master key persistence |
 //!
-//! 这样安排有两点好处。流程本身是**纯逻辑**，可以完整单测（见本模块测试），也可以用
-//! 假的实现跑遍每一条失败路径；而平台相关的部分只有薄薄一层适配，且那层适配的
-//! 职责仅限「搬运」，不掺任何判断——判断一旦漏进适配层，就再也不会被测试覆盖到。
+//! The flow itself is pure logic and is fully unit-testable (see the tests below),
+//! including every failure path, with fake implementations. The platform-specific
+//! part is a thin adapter whose only job is to forward calls and make no decision:
+//! a decision that leaks into the adapter is never covered by tests.
 //!
-//! # 失败之后的状态
+//! # State after a failure
 //!
-//! 编排跨两个存储（保险库文件与平台密钥库），**没有跨二者的原子性**：它们之间
-//! 不存在事务。因此每一步的先后都按「失败时留下什么」来选，规则是**宁可留下没用的
-//! 东西，也不要留下打不开的东西**：
+//! The orchestration spans two stores (the vault file and the platform key store)
+//! and there is no atomicity across them: no transaction exists between the two.
+//! The order of every step is therefore chosen by what a failure leaves behind,
+//! under the rule: prefer leaving something useless over leaving something that
+//! cannot be opened.
 //!
-//! - 主密钥先写入 [`SecureStore`]，再写保险库。若第一步就失败，磁盘上什么都没有，
-//!   用户重试即可；保险库此时也还没被创建，所以不会有残留。
-//! - 反面（先写保险库）会在同样的失败下留下一个**永远打不开**的保险库文件，而它
-//!   与一个完好的文件在外观上无法区分。
+//! - The master key is written to [`SecureStore`] first and the vault second. If
+//!   the first step fails, nothing is on disk and the user can simply retry; the
+//!   vault has not been created either, so no residue is left.
+//! - The reverse order (vault first) would leave a **permanently unopenable** vault
+//!   file under the same failure, indistinguishable from a healthy file.
 //!
-//! 更一般地说，**每个函数里最后一个可能失败的调用都排在写入之前**，因此本模块目前
-//! 不需要回滚逻辑。改动步骤顺序时要维持这一点，否则必须补上
-//! [`SecureStore::delete_master_key`]——密钥库里留下的孤儿密钥用户看不见，也无法从
-//! 界面删掉。
+//! More generally, the last fallible call in each function precedes the writes, so
+//! this module currently needs no rollback logic. Changing the step order must
+//! preserve that, otherwise [`SecureStore::delete_master_key`] has to be added: an
+//! orphaned key in the key store is invisible to the user and cannot be deleted
+//! from the UI.
 //!
-//! [`registration`] 与 [`Login`] 都不做任何自动重试：失败一律**如实返回**，由调用方
-//! 决定是否重来。静默重试会把「这个平台存不了密钥」这种应当立刻告知用户的问题
-//! 拖成随机出现的行为。
+//! Neither [`registration`] nor [`Login`] retries automatically: failures are
+//! returned as they are and the caller decides whether to start over. A silent
+//! retry would turn "this platform cannot store keys", which the user must be told
+//! immediately, into randomly appearing behaviour.
+//!
+//! This module performs no file I/O. The usual host-side layout keeps the master key in
+//! the platform key store (behind [`SecureStore`]) and the vault content in a file, using
+//! [`crate::vault::write_file_atomically`] and [`crate::vault::read_file`]; composing the
+//! two is the caller's job.
 
 use secrecy::{ExposeSecret as _, SecretString};
 
@@ -83,179 +101,209 @@ use crate::vault::MasterKey;
 use crate::vault::{Timestamp, Vault, VaultFile};
 use qualia_dik::{DeviceId, DevicePublicKey, DeviceSignature};
 
-/// 设备身份的来源。
+/// Source of the device identity.
 ///
-/// `qualia2fa-keystore` 已经有一个 [`DeviceKeyStore`] trait，但**本 crate 不能依赖
-/// 它**——设备身份密钥生成必然要 `unsafe` 地调平台 API，而本 crate 有
-/// `#![forbid(unsafe_code)]`。因此这里重新声明一个**只有两个方法**的最小接口，
-/// 由端侧写一层薄适配把两者接起来（见 crate 文档的分层说明）。
+/// A minimal interface with exactly two methods. Generating a key inside a platform
+/// key store needs `unsafe`, which this crate forbids, so the host side implements
+/// this trait over the [`DeviceKeyStore`] trait of `qualia-dik` with a thin
+/// forwarding adapter (see the layering notes in the crate docs).
 ///
-/// [`DeviceKeyStore`]: https://docs.rs/qualia2fa-keystore
+/// # Host-side adapter
+///
+/// `qualia-dik` provides `DeviceKeyStore` (create, open and delete a device identity) and
+/// `DeviceSigner` (signing). The forwarding layer looks like this:
+///
+/// ```text
+/// impl DeviceKeys for Adapter<'_> {
+///     fn get_or_create(&mut self, label: &str) -> Result<DevicePublicKey> {
+///         Ok(self.store.open_or_create(label)?.public_key())
+///     }
+///     fn sign(&mut self, label: &str, message: &[u8]) -> Result<DeviceSignature> {
+///         Ok(self.store.open(label)?.sign(message)?)
+///     }
+/// }
+/// ```
+///
+/// The layer must contain no `if`: a branch there is taken only by the host side, which
+/// has no unit tests in this crate.
+///
+/// [`DeviceKeyStore`]: https://docs.rs/qualia-dik
 pub trait DeviceKeys {
-    /// 取得本设备的长期身份；不存在时创建一个。
+    /// Returns the long-term identity of this device, creating it when absent.
     ///
-    /// # 契约：必须是幂等的
+    /// # Contract: idempotent
     ///
-    /// 同一个 label 上反复调用必须返回**同一对**密钥。这条不是风格要求，而是正确性
-    /// 要求：注册时创建的身份必须能在下次启动时被取回来，否则用户重启应用后就再也
-    /// 打不开自己的保险库了。
+    /// Repeated calls with the same label must return the same key pair. This is a
+    /// correctness requirement, not a style preference: the identity created during
+    /// registration has to be retrievable on the next start, otherwise a user who
+    /// restarts the app can no longer open their vault.
     ///
-    /// # 契约：必须**立即持久化**，不得延迟到会话结束
+    /// # Contract: persisted immediately
     ///
-    /// 登录流程里「发出请求」与「收到应答」可能相隔很久（用户要走到另一台设备前
-    /// 扫码）。若身份只活在内存里，中途崩溃就会让它永久丢失——而那把密钥是打开
-    /// 保险库的唯一途径。因此哪怕登录从未完成、那次创建是白费的，也必须当场落盘。
+    /// In the login flow, sending the request and receiving the reply can be far
+    /// apart in time (the user walks to the other device to scan the code). An
+    /// identity that lives only in memory is lost permanently if the process dies
+    /// in between, and that key is the only way to open the vault. It must reach
+    /// durable storage right away, even if the login never completes and the
+    /// creation was wasted.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 平台没有可用的密钥库、硬件不可用、或用户拒绝时返回错误。**不得**悄悄退回
-    /// 软件密钥：调用方需要据此告知用户保护强度下降了。
+    /// Returns an error when no platform key store is available, the hardware is
+    /// unavailable, or the user refuses. It must **not** silently fall back to a
+    /// software key: the caller relies on the error to tell the user that the
+    /// protection is weaker.
     fn get_or_create(&mut self, label: &str) -> Result<DevicePublicKey>;
 
-    /// 用设备身份对**消息本身**签名。
+    /// Signs the message itself with the device identity.
     ///
-    /// 传入的是消息，不是摘要：哈希计算恰好有一个所有者（见 [`qualia_dik::device::verify`]）。
-    /// 实现方**不要**自行先哈希再签名，那会导致验签侧再哈希一次从而必然失败。
+    /// The message is passed as is, not a digest: hashing has exactly one owner
+    /// (see [`qualia_dik::device::verify`]). Implementations must not hash before
+    /// signing, because the verifying side hashes again and the check would then
+    /// always fail.
     fn sign(&mut self, label: &str, message: &[u8]) -> Result<DeviceSignature>;
 }
 
-/// 主密钥的持久化。
+/// Persistence of the master key.
 ///
-/// 「存进 TPM」只是其中一种实现。做不到硬件保护时，端侧可以用系统钥匙串或受
-/// 用户口令保护的文件——但**那是端侧的决定**，本模块不提供也不默认任何较弱的
-/// 实现。理由见 crate 文档：静默降级会让用户以为自己受硬件保护而实际不是。
+/// Storing it in a TPM is one implementation among others. When hardware protection
+/// is unavailable, the host side may use the system keychain or a file protected by
+/// a user passphrase; that is the host side's decision, and this module neither
+/// provides nor defaults to any weaker implementation.
 pub trait SecureStore {
-    /// 取出主密钥；从未存过时返回 `None`。
+    /// Loads the master key; returns `None` when nothing was ever stored.
     ///
-    /// 返回 `Ok(None)` 与返回 `Err` 含义完全不同：前者是「这台设备还没注册或登录
-    /// 过」（正常路径，调用方应当引导用户去注册/登录），后者是「存过但现在读不出来」
-    /// （异常路径，可能意味着存储被破坏或权限被改）。把两者混为一谈会让用户被
-    /// 引导去重新注册，从而**再也拿不回**原有数据。
+    /// `Ok(None)` and `Err` mean completely different things: the former is "this
+    /// device has never registered or logged in" (the normal path, where the caller
+    /// guides the user to register or log in), the latter is "something was stored
+    /// but cannot be read now" (the abnormal path, which may mean damaged storage
+    /// or changed permissions). Conflating the two sends the user to re-register and
+    /// lose the existing data for good.
     fn load_master_key(&self) -> Result<Option<MasterKey>>;
 
-    /// 存入主密钥，覆盖已有值。
+    /// Stores the master key, overwriting any existing value.
     ///
-    /// 本模块保证每次调用传入的都是**已经过验证**的主密钥（见 [`Joiner::complete`]），
-    /// 因此实现方无需再校验。
+    /// This module guarantees that the key passed in has already been verified (see
+    /// [`Joiner::complete`]), so implementations need no further validation.
     fn store_master_key(&mut self, key: &MasterKey) -> Result<()>;
 
-    /// 删除已存的主密钥。
+    /// Deletes the stored master key.
     ///
-    /// [`registration`] 在「保险库写入失败」时会调用它做尽力回滚。返回错误时调用方
-    /// **不应**把它当成致命错误：回滚失败留下的只是一个用不上的密钥，而原始失败
-    /// 原因才是要报给用户的。从未存过时删除必须是成功的，不是错误。
+    /// Used for best-effort rollback when a later step fails. A returned error must
+    /// **not** be treated as fatal: a failed rollback only leaves behind a key that
+    /// is of no use, while the original failure is what has to reach the user.
+    /// Deleting when nothing was ever stored must succeed, not fail.
     fn delete_master_key(&mut self) -> Result<()>;
 
-    /// 给出备注：本实现是否把主密钥放在**不可导出的硬件**里。
+    /// Reports whether this implementation keeps the master key in non-exportable
+    /// hardware.
     ///
-    /// 调用方据此提示用户保护强度。这是**实现方对自己能力的声明**，不是本模块能
-    /// 验证的事实；因此实现方必须如实回答，不得为了让界面好看而返回 `true`。
+    /// Callers use it to tell the user how strong the protection is. It is a claim
+    /// by the implementation about its own capabilities, not a fact this module can
+    /// verify, so it must answer truthfully and never return `true` to make the UI
+    /// look good.
     fn is_hardware_backed(&self) -> bool;
 }
 
-/// 一次成功注册的结果。
+/// The result of a successful registration.
 #[derive(Debug)]
 pub struct Registered {
-    /// 本设备的身份公钥。
+    /// Public key of this device's identity.
     device: DevicePublicKey,
-    /// 新建的空保险库（连同它的主密钥）。
+    /// The newly created empty vault, together with its master key.
     vault: VaultFile,
-    /// 平台存储是否声称把主密钥放在了不可导出的硬件里。
+    /// Whether the platform store claims to keep the master key in non-exportable
+    /// hardware.
     hardware_backed: bool,
 }
 
 impl Registered {
-    /// 本设备的身份。
+    /// The identity of this device.
     #[must_use]
     pub const fn device(&self) -> &DevicePublicKey {
         &self.device
     }
 
-    /// 本设备的身份标识。
+    /// Identifier of this device's identity.
     #[must_use]
     pub fn device_id(&self) -> DeviceId {
         self.device.device_id()
     }
 
-    /// 新建的保险库。
+    /// The newly created vault.
     #[must_use]
     pub const fn vault(&self) -> &VaultFile {
         &self.vault
     }
 
-    /// 新建保险库的可变引用，用于写入第一批条目。
+    /// Mutable reference to the new vault, for writing the first entries.
     pub const fn vault_mut(&mut self) -> &mut VaultFile {
         &mut self.vault
     }
 
-    /// 主密钥是否由硬件保护。
+    /// Whether the master key is protected by hardware.
     #[must_use]
     pub const fn is_hardware_backed(&self) -> bool {
         self.hardware_backed
     }
 
-    /// 消费本结果，取出保险库。
+    /// Consumes the result and returns the vault.
     #[must_use]
     pub fn into_vault(self) -> VaultFile {
         self.vault
     }
 
-    /// 消费本结果，取出主密钥与保险库。
+    /// Consumes the result and returns the master key and the vault.
     #[must_use]
     pub fn into_parts(self) -> (MasterKey, Vault) {
         self.vault.into_parts()
     }
 }
 
-/// 注册一台新设备：生成主密钥、建空保险库、取得设备身份并持久化主密钥。
+/// Registers a new device: generates the master key, creates an empty vault,
+/// obtains the device identity, and persists the master key.
 ///
-/// 返回的保险库**尚未落盘**——调用方通常要先往里面写第一批条目，再调用
-/// [`crate::vault::VaultFile::serialize`]。这样安排是因为「空保险库写一次、写入条目
-/// 后再写一次」会让最终内容取决于哪一次成功，而调用方无从判断。
+/// The returned vault is **not yet written to disk**: the caller normally writes
+/// the first entries into it and then calls [`crate::vault::VaultFile::serialize`].
+/// Writing the empty vault once and again after the entries would make the final
+/// content depend on which write succeeded, and the caller cannot tell.
 ///
-/// # 参数
+/// # Parameters
 ///
-/// - `label`：设备身份在平台密钥库中的标签。调用方应当用**稳定的**值（同一台设备
-///   每次启动都相同），否则 [`DeviceKeys::get_or_create`] 会把同一个身份创建多次。
-/// - `keys` / `store`：见两个 trait 的文档。
+/// - `label`: label of the device identity in the platform key store. Use a
+///   **stable** value (identical on every start of the same device), otherwise
+///   [`DeviceKeys::get_or_create`] creates the same identity more than once.
+/// - `keys` / `store`: see the two trait documents.
 ///
-/// # 错误
+/// # Step order
 ///
-/// 设备身份创建失败（平台不支持、硬件不可用）或主密钥写入失败时返回相应错误，
-/// **此时不会创建保险库**。
+/// 1. generate the master key;
+/// 2. obtain the device identity;
+/// 3. ask the store whether it is hardware-backed;
+/// 4. store the master key ([`SecureStore::store_master_key`]).
 ///
-/// [`SecureStore::store_master_key`] 是**最后一个可能失败的步骤**，因此不存在
-/// 「主密钥已写入、后续步骤失败」的窗口，本函数也就不需要回滚。这不是巧合而是
-/// 刻意排出来的：会失败的调用（生成主密钥、取设备身份、问硬件后端）全部排在写入
-/// 之前。改动本函数的步骤顺序时要维持这个性质，否则必须同时补上
-/// [`SecureStore::delete_master_key`] 回滚——不补的话密钥库里会留下一个用户看不见、
-/// 也无法从界面删掉的孤儿密钥。
+/// Step 4 is the last fallible step: steps 1 to 3 above all precede it, so there is
+/// no window where the master key is stored and a later step fails, and this
+/// function needs no rollback. Changing this order requires adding a
+/// [`SecureStore::delete_master_key`] rollback, otherwise an orphaned key is left in
+/// the key store that the user cannot see and cannot delete from the UI.
+///
+/// # Errors
+///
+/// Returns the corresponding error when creating the device identity fails (the
+/// platform is unsupported, the hardware is unavailable) or when storing the master
+/// key fails; **no vault is created in that case**.
 pub fn registration(
     keys: &mut dyn DeviceKeys,
     store: &mut dyn SecureStore,
     label: &str,
 ) -> Result<Registered> {
-    // 主密钥先于一切：后面所有东西都依赖它，而它生成失败时磁盘上不该有任何残留。
     let master = MasterKey::generate()?;
 
-    // 设备身份。**必须在写保险库之前**取得：身份创建失败时不该留下一个已经存在的
-    // 保险库——用户会以为注册成功了。
     let device = keys.get_or_create(label)?;
 
-    // 硬件后端要先问清楚。放在存储**之前**不是随意的排序：`is_hardware_backed`
-    // 也是会失败的调用方代码（真实实现要问平台密钥库），把它留在后面就意味着
-    // 「主密钥已经存进去了，这时才发现问不到后端」。现在它失败时磁盘上仍然什么都
-    // 没有，与主密钥生成失败一样干净。
     let hardware_backed = store.is_hardware_backed();
 
-    // 先入密钥库，再建保险库。**绝不能**在存储失败后继续建保险库：那会留下一个
-    // 打不开的文件，而它与一个完好的文件在外观上无法区分。见模块文档
-    // 「失败之后的状态」。
-    //
-    // 这一行是**最后一个可能失败的步骤**，这是刻意的：它之后没有任何 `?`，因此不
-    // 存在「主密钥已存、后续失败」的窗口，也就不需要回滚。若将来在这之后加入会
-    // 失败的操作，必须同时补上回滚（`store.delete_master_key()`），否则密钥库里会
-    // 留下一个用户看不见、也无法从界面删掉的孤儿密钥。
     store.store_master_key(&master)?;
 
     Ok(Registered {
@@ -265,33 +313,39 @@ pub fn registration(
     })
 }
 
-/// 登录的发起方：一台**已经登录**、持有主密钥的设备。
+/// The initiating side of a login: a device that is **already logged in** and holds
+/// the master key.
 ///
-/// 它负责显示二维码、接收请求、把主密钥加密交给对方。
+/// It shows the QR code, receives the request, and hands over the encrypted master
+/// key.
 ///
-/// # 每次登录都要新建一个
+/// # One instance per login
 ///
-/// 本类型持有一次性的临时密钥（见 [`crate::pairing`] 的会话绑定规则）。因此
-/// 「同一个 `Login` 服务两次登录」是做不到的：`authorize` 消费掉待接受的会话，
-/// 第二次调用必然失败。用户取消后重新开始，请调 [`Login::new`]。
+/// This type holds one-time ephemeral keys (see the session binding rules in
+/// [`crate::pairing`]), so a single `Login` cannot serve two logins: `authorize`
+/// consumes the pending session and a second call always fails. Call [`Login::new`]
+/// to start over after the user cancels.
 pub struct Login {
-    /// 本次登录的二维码载荷。
+    /// QR payload of this login.
     ///
-    /// 单独存一份，而不是从 `pending` 里取：`PendingSession::accept` 收 `self`，会
-    /// 把它移走，而载荷在授权之后仍然要能被访问（它会写进日志、也可能被再次展示）。
-    /// [`QrPayload`] 是 `Copy` 的，且**本来就是要印在二维码上公开的东西**，多存一份
-    /// 不带来任何保密性问题。
+    /// Stored separately rather than read from `pending`, because
+    /// `PendingSession::accept` takes `self` and moves it out, while the payload
+    /// must remain accessible after authorization (it is logged and may be shown
+    /// again). [`QrPayload`] is `Copy` and is public material by design, so the
+    /// extra copy raises no confidentiality concern.
     payload: QrPayload,
-    /// 待对方请求的会话；`authorize` 成功后为 `None`。
+    /// Session awaiting the request of the other side; `None` after a successful
+    /// `authorize`.
     pending: Option<PendingSession>,
-    /// 已经接受的那次会话，`authorize` 成功后置位。
+    /// The accepted session, set after a successful `authorize`.
     adoption: Option<Adoption>,
-    /// 已经用过的会话标识，用于拒绝重放。
+    /// Session identifiers already used, for replay rejection.
     used: NonceLog,
 }
 
 impl core::fmt::Debug for Login {
-    /// 只打印状态，不打印会话内容（那里面有一次性的临时密钥）。
+    /// Prints state only, never session contents (they hold one-time ephemeral
+    /// keys).
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Login")
             .field("capabilities", &self.payload.capabilities())
@@ -303,12 +357,13 @@ impl core::fmt::Debug for Login {
 }
 
 impl Login {
-    /// 开始一次登录。
+    /// Starts a login.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 随机源不可用时返回 [`Error::RandomnessUnavailable`]。此时**必须失败**：临时
-    /// 密钥若可预测，握手就没有任何保密性可言。
+    /// Returns [`Error::RandomnessUnavailable`] when the randomness source is
+    /// unavailable. Failing is mandatory here: predictable ephemeral keys would
+    /// leave the handshake with no confidentiality at all.
     pub fn new() -> Result<Self> {
         let (payload, pending) = pairing::begin()?;
         Ok(Self {
@@ -319,86 +374,86 @@ impl Login {
         })
     }
 
-    /// 取出应当显示为二维码的内容。
+    /// Returns the content to be displayed as a QR code.
     ///
-    /// 调用方负责把它渲染成二维码。**注意它必须被展示在可信的屏幕上**：看到它的人
-    /// 就能与这台设备完成登录，这是设计上有意为之（D4：首次密钥传递由带外信道保护）。
+    /// The caller renders it. It must be displayed on a trusted screen: whoever
+    /// sees it can complete a login with this device. That is intentional, the first
+    /// key transfer is protected by the out-of-band channel.
     #[must_use]
     pub const fn payload(&self) -> &QrPayload {
         &self.payload
     }
 
-    /// 接受新设备的请求，把主密钥加密交给它。
+    /// Accepts the request of a new device and hands the master key over encrypted.
     ///
-    /// # 返回之前必须由**人**确认
+    /// # Human confirmation before returning
     ///
-    /// 本函数拿到的 `msg1` 只证明对方声明了一个设备身份，**不证明对方是谁**。因此
-    /// 调用方（界面）必须在二维码被扫过之后、调用本函数之前，明确让用户确认「这次
-    /// 登录是本人发起的」。跳过这一步等于把主密钥交给任何扫到二维码的人。
+    /// The `msg1` received here only proves that the other side claims a device
+    /// identity; it does not prove who they are. After the QR code has been scanned
+    /// and before calling this function, the caller (the UI) must explicitly let the
+    /// user confirm that this login is theirs. Skipping that step hands the master
+    /// key to anyone who scanned the QR code.
     ///
-    /// 这一点无法由本模块强制——它没有界面。它只能把接口做成**需要显式动作**，
-    /// 让「忘了确认」在代码审查里看得出来。
+    /// This module cannot enforce it: it has no UI. It can only shape the API so
+    /// that the call requires an explicit action, which makes a forgotten
+    /// confirmation visible in review.
     ///
-    /// # 重放
+    /// # Replay
     ///
-    /// 接受之前会检查会话是否已在本次登录里用过，用过则返回
-    /// [`Error::PairingAuthenticationFailed`]。**这个检查只覆盖本次进程内的会话**；
-    /// 跨进程重启的重放防护需要调用方把 [`Login::used_sessions`] 持久化（见
-    /// [`crate::pairing::NonceLog`] 的文档）。
+    /// Before accepting, the session is checked against the ones already used in
+    /// this login; a used session returns [`Error::PairingAuthenticationFailed`].
+    /// The check covers only sessions of the current process: replay protection
+    /// across restarts requires the caller to persist [`Login::used_sessions`] (see
+    /// [`crate::pairing::NonceLog`]).
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 请求格式错误、无法用主密钥解开（不是发给本次会话的、或被人改过）、或会话
-    /// 重放时返回相应错误。任何一种都**不返回部分结果**。
+    /// Returns the corresponding error when the request is malformed, cannot be
+    /// opened for this session (it was not addressed to this login, or it was
+    /// modified), or the session is replayed. None of them returns a partial result.
     pub fn authorize(&mut self, msg1: &[u8], master: &MasterKey) -> Result<Vec<u8>> {
-        // `take` 而不是直接调用：`accept` 收 `self`，而 `self` 在 `Login` 里是被借用的
-        // 字段。取出来之后 `pending` 为 `None`，于是「同一个 `Login` 不能授权两次」
-        // 由**类型状态**保证，而不是靠一个布尔标志加判断。
         let pending = self
             .pending
             .take()
             .ok_or(Error::PairingAuthenticationFailed)?;
         let adoption = pending.accept(msg1, master)?;
 
-        // 重放检查只能在拿到会话标识之后做，因为 `accept` 是唯一能算出它的地方（它
-        // 需要主密钥）。代价是失败时 `pending` 已经被消费掉了——这正是上面那条
-        // 「一次登录只服务一个请求」的取舍，而不是疏漏。
         if !self.used.record(*adoption.session_id()) {
             return Err(Error::PairingAuthenticationFailed);
         }
 
-        // 返回副本而不是 `Adoption` 里的借用：调用方通常要立刻把它送上网（或渲染成
-        // 二维码），而那一步不能与 `self` 的可变借用重叠。
         let reply = adoption.reply().to_vec();
         self.adoption = Some(adoption);
         Ok(reply)
     }
 
-    /// 本次登录的会话标识，`authorize` 成功之后才有值。
+    /// Session identifier of this login, available after a successful `authorize`.
     ///
-    /// 调用方应当把它连同「这次登录发生在何时」一起持久化，以便下次启动时用
-    /// [`Login::with_used_sessions`] 恢复重放防护。
+    /// The caller should persist it together with the time of this login, so that
+    /// replay protection can be restored on the next start with
+    /// [`Login::with_used_sessions`].
     #[must_use]
     pub fn session_id(&self) -> Option<&[u8; pairing::SESSION_ID_LEN]> {
         self.adoption.as_ref().map(Adoption::session_id)
     }
 
-    /// 已经用过的会话标识。
+    /// Session identifiers already used.
     #[must_use]
     pub const fn used_sessions(&self) -> &NonceLog {
         &self.used
     }
 
-    /// 恢复上次运行记录下的已用会话标识。
+    /// Restores the used session identifiers recorded by a previous run.
     #[must_use]
     pub fn with_used_sessions(mut self, used: NonceLog) -> Self {
         self.used = used;
         self
     }
 
-    /// 对方（新设备）声明的设备身份，`authorize` 成功之后才有值。
+    /// Device identity declared by the other side (the new device), available after
+    /// a successful `authorize`.
     ///
-    /// 调用方应当把它记录下来，作为「这台新设备已获授权」的凭据。
+    /// The caller should record it as evidence that this new device was authorized.
     #[must_use]
     pub fn joiner_device(&self) -> Option<DeviceId> {
         self.adoption
@@ -408,38 +463,41 @@ impl Login {
     }
 }
 
-/// 登录的接收方：一台**尚未**持有主密钥的新设备。
+/// The receiving side of a login: a new device that does **not** hold the master key
+/// yet.
 ///
-/// # 一次登录只对应一个实例
+/// # One instance per login
 ///
-/// 与 [`Login`] 同理，本类型持有一次性的临时密钥。`request` 之后必须用**同一个
-/// 实例**调 [`Joiner::complete`]；新建一个实例去完成上次的登录必然失败，因为临时
-/// 密钥不同（见 [`crate::pairing`] 的会话绑定规则）。
+/// Like [`Login`], this type holds one-time ephemeral keys. After `request`,
+/// [`Joiner::complete`] must be called on the **same instance**; a new instance
+/// cannot finish a previous login because its ephemeral keys differ (see the session
+/// binding rules in [`crate::pairing`]).
 ///
-/// # 为什么 `session` 是 `Option`
+/// # `session` is an `Option`
 ///
-/// [`Joiner::complete`] 只需 `&self` 而不是 `self`，因此端侧把本类型包在
-/// `Arc<Mutex<..>>` 之类共享容器里也能用——绑定层与界面都要求共享引用。会话本身
-/// 仍然是**一次性**的：`complete` 用 [`Option::take`] 把它取走，第二次调用会拿到
-/// [`Error::PairingAuthenticationFailed`]，而不是重放一次。
+/// [`Joiner::complete`] takes `&self` rather than `self`, so the host side can keep
+/// this type in a shared container such as `Arc<Mutex<..>>`, as the bindings layer
+/// and the UI require shared references. The session itself is still one-time:
+/// `complete` takes it with [`Option::take`] and a second call returns
+/// [`Error::PairingAuthenticationFailed`] instead of replaying.
 ///
-/// 这与 [`Login`] 用 `Option<PendingSession>` + `take` 表达「一次登录只服务一个
-/// 请求」是同一个手法：**让「只能用一次」成为类型属性**，而不是靠调用方自觉维护
-/// 一个布尔标志。`Option::take` 需要 `&mut`，因此内部用
-/// [`std::sync::Mutex`] 提供内部可变性——与绑定层的用法一致。
+/// As in [`Login`] (`Option<PendingSession>` plus `take`), single use is a property
+/// of the type rather than a boolean flag the caller has to maintain.
+/// `Option::take` needs `&mut`, hence the internal [`std::sync::Mutex`] that
+/// provides interior mutability.
 pub struct Joiner {
-    /// 本次登录的临时会话。`complete` 取走后为 `None`。
+    /// Ephemeral session of this login; `None` once `complete` has taken it.
     session: std::sync::Mutex<Option<JoinerSession>>,
-    /// 设备身份标签，`complete` 时用来签名。
+    /// Device identity label, used for signing in `complete`.
     label: String,
-    /// 已经发出请求的会话标识。
+    /// Session identifier once the request has been sent.
     session_id: Option<[u8; pairing::SESSION_ID_LEN]>,
-    /// `request` 发出的那一条消息，供诊断与测试比对。
+    /// The message emitted by `request`, for diagnostics and test comparison.
     request: Vec<u8>,
 }
 
 impl core::fmt::Debug for Joiner {
-    /// 不打印会话内容（含一次性临时密钥）。
+    /// Prints no session contents (they hold one-time ephemeral keys).
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Joiner")
             .field("label", &self.label)
@@ -449,15 +507,17 @@ impl core::fmt::Debug for Joiner {
 }
 
 impl Joiner {
-    /// 用扫到的二维码开始一次登录。
+    /// Starts a login from a scanned QR code.
     ///
-    /// 二维码应当来自**带外信道**（当面扫描）。把 `payload` 当作网络上的普通消息
-    /// 处理会失去 D4 的保护：中间人可以换成自己的公钥，从而在两台设备都察觉不到的
-    /// 情况下拿到主密钥。
+    /// The QR code must come from the out-of-band channel (scanned in person).
+    /// Handling `payload` as an ordinary message received over the network loses
+    /// that protection: a man in the middle can substitute their own public key and
+    /// obtain the master key without either device noticing.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 载荷格式错误、版本不支持、或临时公钥不在曲线上时返回相应错误。
+    /// Returns the corresponding error when the payload is malformed, its version is
+    /// unsupported, or its ephemeral public key is not on the curve.
     pub fn new(payload: &QrPayload, label: &str) -> Result<Self> {
         Ok(Self {
             session: std::sync::Mutex::new(Some(pairing::join(payload)?)),
@@ -467,26 +527,24 @@ impl Joiner {
         })
     }
 
-    /// 用支付载荷的文本形式开始一次登录。
+    /// Starts a login from the QR payload in text form.
     ///
-    /// 供扫码后拿到的是字符串（而不是字节）的调用方使用。
+    /// For callers whose scanner yields a string rather than bytes.
     pub fn from_base32(text: &str, label: &str) -> Result<Self> {
         Self::new(&QrPayload::from_base32(text)?, label)
     }
 
-    /// 取出应当发给老设备的请求消息。
+    /// Returns the request message to send to the old device.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 设备身份无法取得或签名失败时返回相应错误。**重复调用返回同一条消息的副本**，
-    /// 不会重新签名——重来一次会生成新的会话标识，让老设备认不出这是同一次登录。
+    /// Returns the corresponding error when the device identity cannot be obtained
+    /// or signing fails. **Repeated calls return a copy of the same message** and do
+    /// not sign again: a fresh message would carry a new session identifier, so the
+    /// old device would not recognize it as the same login.
     pub fn request(&mut self, keys: &mut dyn DeviceKeys) -> Result<Vec<u8>> {
         if self.request.is_empty() {
             let identity = keys.get_or_create(&self.label)?;
-            // 会话的借用必须在写 `self.request` 之前结束，否则编译器不允许对 `self`
-            // 的可变借用。用一个作用域块而不是手工 `drop`：它不依赖读者记住 guard
-            // 何时释放，而 `drop` 漏掉时的报错（E0506）指向的是赋值那一行，不容易
-            // 联想到是 guard 的生命周期问题。
             let (message, session_id) = {
                 let session = self.session_guard();
                 let session = session.as_ref().ok_or(Error::PairingAuthenticationFailed)?;
@@ -498,44 +556,49 @@ impl Joiner {
         Ok(self.request.clone())
     }
 
-    /// 本次登录的会话标识，发过请求之后才有值。
+    /// Session identifier of this login, available once the request has been sent.
     #[must_use]
     pub const fn session_id(&self) -> Option<&[u8; pairing::SESSION_ID_LEN]> {
         self.session_id.as_ref()
     }
 
-    /// 用老设备的应答完成登录，并把主密钥写入平台存储。
+    /// Completes the login with the reply of the old device and writes the master
+    /// key into the platform store.
     ///
-    /// 成功之后调用方应当写一个空的保险库文件，然后用
-    /// [`crate::vault::read_file`] 或者后续的同步把内容取回来——**不要**假设登录
-    /// 本身会带来任何条目，D5 之下主密钥与条目是分开传的。
+    /// On success the caller should write an empty vault file and later fetch the
+    /// content with [`crate::vault::read_file`] or through synchronization. The
+    /// login itself carries no entries: the master key and the entries travel
+    /// separately.
     ///
-    /// # 错误
+    /// # Errors
     ///
-    /// 应答格式错误、认证失败（不是发给本次会话的、被人改过、或来自伪造的老设备）、
-    /// 或主密钥写入平台存储失败时返回相应错误。
+    /// Returns the corresponding error when the reply is malformed, authentication
+    /// fails (it was not addressed to this session, it was modified, or it comes
+    /// from a forged old device), or storing the master key fails.
     ///
-    /// **写入失败时主密钥不会被丢掉**——它随返回值一起消失，因此不会留下一个
-    /// 「手里有密钥但没存住」的中间状态骗过调用方。调用方应当让用户重新走一次登录。
+    /// **A failed store does not lose the master key**: it disappears together with
+    /// the return value, so no intermediate state where the caller holds a key that
+    /// was not stored can mislead it. The caller should send the user through the
+    /// login again.
     ///
-    /// # 只能用一次
+    /// # Single use
     ///
-    /// 会话被 [`Option::take`] 取走，因此重复调用返回
-    /// [`Error::PairingAuthenticationFailed`]——与「应答是伪造的」同一个错误，因为
-    /// 对调用方来说这两件事的处置方式相同（重新走一次登录）。刻意不单独报「已经用
-    /// 过了」：那等于告诉攻击者他的重放被认出来了。
+    /// The session is taken with [`Option::take`], so a repeated call returns
+    /// [`Error::PairingAuthenticationFailed`], the same error as for a forged reply,
+    /// because both are handled the same way (run the login again). It deliberately
+    /// does not report "already used": that would tell an attacker their replay was
+    /// recognized.
     ///
-    /// 收 `&self` 而不是 `self`，是为了让调用方能把本类型放进 `Arc<Mutex<..>>` 之类
-    /// 的共享容器——绑定层与界面都要求共享引用。一次性由内部的 `Option` 保证，不靠
-    /// 所有权。
+    /// The receiver is `&self` rather than `self` so that callers can keep this type
+    /// in a shared container such as `Arc<Mutex<..>>`, as the bindings layer and the
+    /// UI require shared references. Single use is enforced by the internal
+    /// `Option`, not by ownership.
     pub fn complete(
         &self,
         msg2: &[u8],
         keys: &mut dyn DeviceKeys,
         store: &mut dyn SecureStore,
     ) -> Result<MasterKey> {
-        // 设备身份必须与发请求时是同一个。这里重新取一次而不是缓存 SEC1 字节：缓存
-        // 会让「密钥库变了」这种情况被掩盖过去，而它恰恰是最需要立刻发现的问题。
         let identity = keys.get_or_create(&self.label)?;
         let session = self
             .session_guard()
@@ -546,10 +609,11 @@ impl Joiner {
         Ok(master)
     }
 
-    /// 本设备在本次登录中使用的身份公钥。
+    /// Public key of the identity this device uses in this login.
     ///
-    /// 会话被 [`Joiner::complete`] 取走之后返回 `None`——端侧要在完成之前把它显示给
-    /// 用户确认（用户要能看出「请求登录的是不是我想的那台设备」）。
+    /// Returns `None` once [`Joiner::complete`] has taken the session. The host side
+    /// shows it to the user for confirmation before completion, so the user can see
+    /// whether the device requesting the login is the expected one.
     #[must_use]
     pub fn identity(&self) -> Option<[u8; pairing::PUBLIC_KEY_LEN]> {
         self.session_guard()
@@ -557,10 +621,11 @@ impl Joiner {
             .map(|session| *session.public_key())
     }
 
-    /// 借用内部会话，忽略中毒。
+    /// Borrows the inner session, ignoring poisoning.
     ///
-    /// 中毒意味着某个持锁线程 panic 过。本锁只保护一个 `Option` 的取出，没有「改了
-    /// 一半」的中间状态，因此恢复使用比让整个登录流程永久失败更可取。
+    /// Poisoning means a thread panicked while holding the lock. This lock only
+    /// guards taking an `Option` and has no half-updated intermediate state, so
+    /// recovering is preferable to a login flow that fails forever.
     fn session_guard(&self) -> std::sync::MutexGuard<'_, Option<JoinerSession>> {
         self.session
             .lock()
@@ -568,20 +633,22 @@ impl Joiner {
     }
 }
 
-/// 把主密钥交还给账号的其他设备。
+/// Hands the master key back to the other devices of the account.
 ///
-/// 从**恢复密钥的用途**看，它应当被存在的理由只有两个：设备全丢了、或者要换机。
-/// 因此本函数只负责产生文件内容；存到哪里、怎么让用户拿到，是调用方的事。
+/// The recovery key serves two situations: all devices are lost, or the user moves
+/// to a new device. This function only produces the file content; where it is
+/// stored and how the user obtains it is up to the caller.
 ///
-/// # 参数
+/// # Parameters
 ///
-/// - `passphrase`：用户口令。空口令会被 [`crate::recovery::export`] 拒绝——空口令
-///   让 Argon2id 的全部代价都白费。
-/// - `params`：KDF 参数。传 `None` 用 [`KdfParams::recommended`]。
+/// - `passphrase`: user passphrase. An empty passphrase is rejected by
+///   [`crate::recovery::export`]: it would waste the whole cost of Argon2id.
+/// - `params`: KDF parameters; `None` uses [`KdfParams::recommended`].
 ///
-/// # 错误
+/// # Errors
 ///
-/// 口令为空、参数超界、或随机源不可用时返回相应错误。
+/// Returns the corresponding error when the passphrase is empty, the parameters are
+/// out of range, or the randomness source is unavailable.
 pub fn export_recovery_key(
     master: &MasterKey,
     passphrase: &SecretString,
@@ -594,18 +661,19 @@ pub fn export_recovery_key(
     )
 }
 
-/// 从恢复密钥文件取回主密钥，并写入平台存储。
+/// Recovers the master key from a recovery file and writes it into the platform
+/// store.
 ///
-/// # 为什么由本模块负责写入，而不是把主密钥返回给调用方自己存
+/// Both steps happen here: a failure between recovering the key and storing it would
+/// leave the dangerous state where the user sees a successful recovery but the key
+/// is gone after a restart.
 ///
-/// 因为「取回主密钥」与「把它存住」之间失败会留下极危险的状态：用户看到恢复
-/// 成功了，但重启后密钥不在。由本函数一并完成，失败就没有中间状态可言。
+/// # Errors
 ///
-/// # 错误
-///
-/// 文件结构错误、口令错误、或写入平台存储失败时返回相应错误。**口令错误与文件被
-/// 篡改返回同一个错误**（见 [`crate::recovery`] 的威胁模型）：区分它们会让攻击者
-/// 能用错误类型来试探。
+/// Returns the corresponding error when the file structure is wrong, the passphrase
+/// is wrong, or the platform store write fails. **A wrong passphrase and a tampered
+/// file return the same error** (see the threat model in [`crate::recovery`]):
+/// distinguishing them would give an attacker an oracle through the error type.
 pub fn import_recovery_key(
     file: &[u8],
     passphrase: &SecretString,
@@ -616,89 +684,87 @@ pub fn import_recovery_key(
     Ok(master)
 }
 
-/// 打开一个已存在的保险库，主密钥从平台存储取。
+/// Opens an existing vault, taking the master key from the platform store.
 ///
-/// # 为什么要单独一个函数
+/// The result is decidable: [`Error::DeviceNotRegistered`] means this device never
+/// logged in (guide the user to register or log in), and any other error means it
+/// did log in but the vault cannot be opened (the data may be damaged, so do **not**
+/// suggest re-registering).
 ///
-/// 因为它把「这台设备有没有登录过」这件事变成了一个**可判定的结果**：
-/// [`Error::DeviceNotRegistered`] 表示没登录过（引导用户去注册或登录），其余错误
-/// 表示登录过但打不开（数据可能已损坏，**不要**建议用户重新注册）。
+/// # Errors
 ///
-/// # 错误
+/// Returns [`Error::DeviceNotRegistered`] when nothing is stored;
+/// [`Error::VaultDecryptionFailed`] when `data` is not the content of this vault or
+/// the master key does not match.
 ///
-/// 未登录时返回 [`Error::DeviceNotRegistered`]；`data` 不是本保险库的内容、主密钥
-/// 不匹配时返回 [`Error::VaultDecryptionFailed`]。
+/// # Empty vaults also detect a wrong master key
 ///
-/// # 空保险库也能判定主密钥对错
+/// Format version 2 puts a master key check value at the end of the file, so **a
+/// file with no entries is decided as well**: a wrong stored master key returns
+/// [`Error::VaultDecryptionFailed`] instead of surfacing only when the user adds the
+/// first entry.
 ///
-/// 格式版本 2 在文件末尾放了一个主密钥检查值，因此**条目为空的文件同样能判定**：
-/// 存着的主密钥是错的就返回 [`Error::VaultDecryptionFailed`]，而不是等到用户加进
-/// 第一条条目才暴露。
-///
-/// **版本 1 的旧文件仍然判定不了**——那份文件里确实没有可判定的信息，解析时会跳过
-/// 检查值那一步。需要对密钥做权威确认时用 [`crate::auth`] 的挑战-应答，它不依赖
-/// 文件内容。
+/// **Old version 1 files still cannot be decided**: such a file holds nothing to
+/// decide on and parsing skips the check value. Use the challenge-response of
+/// [`crate::auth`] when the key needs authoritative confirmation; it does not depend
+/// on file content.
 pub fn open_vault(store: &dyn SecureStore, data: &[u8]) -> Result<VaultFile> {
     let master = store.load_master_key()?.ok_or(Error::DeviceNotRegistered)?;
     VaultFile::parse(master, data)
 }
 
-// ── SecureStore 的通用适配 ──────────────────────────────────────────────────
-//
-// 端侧最常见的实现是「主密钥存在平台密钥库里、保险库内容存在文件里」。本模块
-// 不提供文件 I/O（那不属于 Core），但 [`crate::vault::write_file_atomically`] 与
-// [`crate::vault::read_file`] 已经在那里了，调用方组合即可。
-
-/// 把 [SecretBytes] 转成主密钥，供实现 [`SecureStore`] 的端侧代码使用。
+/// Converts [SecretBytes] into a master key, for host-side code implementing
+/// [`SecureStore`].
 ///
-/// 存在的意义是把 **[`crate::pairing::master_key_from_storage`] 与
-/// [`crate::recovery`] 两条路径的还原方式统一到一处**：端侧只需要记住「存进去的是
-/// 字节，取出来用这个函数」，而不必知道校验在哪。
+/// Both restore paths, [`crate::pairing::master_key_from_storage`] and
+/// [`crate::recovery`], are unified here: the host side only has to remember "bytes
+/// go in, this function takes them out" and needs no knowledge of where validation
+/// happens.
 ///
-/// # 错误
+/// # Errors
 ///
-/// 长度不是 [`crate::vault::MASTER_KEY_LEN`] 时返回 [`Error::MasterKeyWrongLength`]。
+/// Returns [`Error::MasterKeyWrongLength`] when the length is not
+/// [`crate::vault::MASTER_KEY_LEN`].
 pub fn master_key_from_bytes(bytes: SecretBytes) -> Result<MasterKey> {
     MasterKey::from_bytes(bytes)
 }
 
-/// 取主密钥的可存储字节形式，供实现 [`SecureStore`] 的端侧代码使用。
+/// Returns the storable byte form of a master key, for host-side code implementing
+/// [`SecureStore`].
 ///
-/// 与 [`master_key_from_bytes`] 成对。[`SecretBytes`] 在 `Drop` 时擦除。
+/// The counterpart of [`master_key_from_bytes`]. [`SecretBytes`] is wiped on drop.
 #[must_use]
 pub fn master_key_to_bytes(key: &MasterKey) -> SecretBytes {
     crate::vault::master_key_to_bytes(key)
 }
 
-/// 用恢复密钥或登录结果建一个空保险库文件。
+/// Creates an empty vault file from a recovery or login result.
 ///
-/// # 为什么需要它
-///
-/// 登录与恢复只带来主密钥，不带来条目（D5 之下二者分开传）。调用方需要一个**空的
-/// 但格式正确**的保险库文件来承载随后同步来的条目；直接手写文件字节会绕过格式
-/// 校验。本函数把这个动作收成一处。
+/// Login and recovery deliver the master key only, never entries. The caller needs
+/// an empty but correctly formatted vault file to hold the entries that are
+/// synchronized later; hand-writing the file bytes would bypass format validation.
 #[must_use]
 pub fn empty_vault(master: MasterKey) -> VaultFile {
     VaultFile::with_master_key(master)
 }
 
-/// 记录一个条目插入时间用的「现在」。
+/// The "now" recorded as an entry insertion time.
 ///
-/// 本 crate 不读时钟（见 crate 文档），因此时间一律由调用方传入。本别名存在的意义
-/// 是让编排层的签名读起来是「需要一个时间」而不是「需要一个 `u64`」。
+/// This crate does not read the clock (see the crate docs), so time is always passed
+/// in by the caller. The alias makes the orchestration signatures read as "needs a
+/// time" rather than "needs a `u64`".
 pub type Now = Timestamp;
 
-/// 供调用方在插入条目时使用的当前时间戳校验。
+/// Validates a current timestamp supplied by the caller for entry insertion.
 ///
-/// # 为什么只是校验而不是「取当前时间」
+/// This crate cannot read the clock, so the check **rejects obviously invalid
+/// values**: `0` usually means the caller forgot to pass one, and it would become
+/// the smallest timestamp in the vault, making later time-ordered merge logic
+/// produce stable but wrong results.
 ///
-/// 因为本 crate 读不到时钟。这里做的是**拒绝明显不合法的值**：`0` 通常意味着调用方
-/// 忘了传，而它会成为保险库里最小的那个时间戳，让后续按时间排序的合并逻辑得出
-/// 稳定但错误的结果。
+/// # Errors
 ///
-/// # 错误
-///
-/// `now` 为 `0` 时返回 [`Error::TimestampZero`]。
+/// Returns [`Error::TimestampZero`] when `now` is `0`.
 pub const fn check_now(now: Now) -> Result<Now> {
     if now == 0 {
         return Err(Error::TimestampZero);
@@ -706,37 +772,22 @@ pub const fn check_now(now: Now) -> Result<Now> {
     Ok(now)
 }
 
-/// 显式暴露一个 [`SecretString`] 的长度，供日志与诊断使用。
+/// Explicitly exposes the length of a [`SecretString`] for logging and diagnostics.
 ///
-/// 口令本身**永远不得**被打印，但「口令有多长」是排查「为什么导入失败」时唯一
-/// 有用又不泄露信息的事实。把它做成一个函数，是为了让「这里没有泄露口令」在代码
-/// 审查时是**可见**的，而不是靠读一遍 `format!` 猜。
+/// The passphrase itself must never be printed, but its length is the only useful
+/// and non-leaking fact when diagnosing a failed import. Making it a function keeps
+/// "no passphrase leaks here" visible in review instead of a guess from reading a
+/// `format!`.
 #[must_use]
 pub fn passphrase_len(passphrase: &SecretString) -> usize {
     passphrase.expose_secret().chars().count()
 }
 
-// ── 与 keystore 的适配契约 ──────────────────────────────────────────────────
-//
-// `qualia2fa-keystore` 提供 `DeviceKeyStore`（生成/取回/删除设备身份）与
-// `DeviceSigner`（签名）。端侧只需写一层不含判断的转发即可满足 [`DeviceKeys`]：
-//
-//   impl DeviceKeys for Adapter<'_> {
-//       fn get_or_create(&mut self, label: &str) -> Result<DevicePublicKey> {
-//           Ok(self.store.open_or_create(label)?.public_key())
-//       }
-//       fn sign(&mut self, label: &str, message: &[u8]) -> Result<DeviceSignature> {
-//           Ok(self.store.open(label)?.sign(message)?)
-//       }
-//   }
-//
-// 这层代码里**不应出现任何 `if`**。一旦出现，就说明有一条只在端侧才走的分支，
-// 而端侧没有单元测试。
-
-/// 让 `&mut T` 也能当作 [`DeviceKeys`] 用。
+/// Lets `&mut T` be used as [`DeviceKeys`] as well.
 ///
-/// 存在的理由是让调用方不必为了把实现借给本模块而写一层转发：`registration` 收
-/// `&mut dyn DeviceKeys`，而传 `&mut adapter` 与传 `&mut *adapter` 都应当能编译。
+/// Callers do not need a forwarding layer to lend an implementation to this module:
+/// `registration` takes `&mut dyn DeviceKeys`, and both `&mut adapter` and
+/// `&mut *adapter` compile.
 impl<T: DeviceKeys + ?Sized> DeviceKeys for &mut T {
     fn get_or_create(&mut self, label: &str) -> Result<DevicePublicKey> {
         (**self).get_or_create(label)
@@ -747,7 +798,7 @@ impl<T: DeviceKeys + ?Sized> DeviceKeys for &mut T {
     }
 }
 
-/// 让 `&mut T` 也能当作 [`SecureStore`] 用。
+/// Lets `&mut T` be used as [`SecureStore`] as well.
 impl<T: SecureStore + ?Sized> SecureStore for &mut T {
     fn load_master_key(&self) -> Result<Option<MasterKey>> {
         (**self).load_master_key()
@@ -766,15 +817,16 @@ impl<T: SecureStore + ?Sized> SecureStore for &mut T {
     }
 }
 
-/// 校验一个设备身份确实是本设备声明的那个。
+/// Checks that a device identity is the one this device declared.
 ///
-/// 供调用方在收到对方自称的身份之后核对。**本函数只比较标识，不做任何证明**——
-/// 「这个公钥属于谁」这件事由配对协议的认证标签回答（见 [`crate::pairing`]），
-/// 不是靠比较字节。
+/// For callers to compare against an identity claimed by the other side. **This only
+/// compares identifiers and proves nothing**: who a public key belongs to is answered
+/// by the authentication tag of the pairing protocol (see [`crate::pairing`]), not by
+/// comparing bytes.
 ///
-/// # 错误
+/// # Errors
 ///
-/// 两者不同时返回 [`Error::DeviceIdentityMismatch`]。
+/// Returns [`Error::DeviceIdentityMismatch`] when the two differ.
 pub fn expect_device(
     actual: &DevicePublicKey,
     claimed: &[u8; pairing::PUBLIC_KEY_LEN],
@@ -785,22 +837,17 @@ pub fn expect_device(
     Ok(())
 }
 
-/// 校验一段消息确实由某个设备身份签过。
+/// Checks that a message was really signed by a device identity.
 ///
-/// # 它为什么是一个包装，以及它包了什么
+/// The verification itself lives in `qualia_dik::device`; this wrapper translates a
+/// failure into this crate's error type ([`Error::Device`]). Callers get a single
+/// entry point instead of each of them calling `qualia_dik::device::verify`, and
+/// downstream layers (FFI, UI) receive this crate's error enum.
 ///
-/// 设备身份验签的**实现**在 `qualia-dik` 里——那是一个独立可复用的 crate，任何需要
-/// 硬件设备身份的项目都能用它。本函数在它之上只做一件事：把失败**翻译成本 crate 的
-/// 错误类型**（[`Error::Device`]）。
+/// # Errors
 ///
-/// 这样做的意义是让调用方有一个**统一的入口**，而不是各自去调
-/// `qualia_dik::device::verify`——后者会让「失败是什么类型」在多个地方各有一份判断，
-/// 而下游（FFI、UI）需要的是本 crate 的错误枚举。
-///
-/// # 错误
-///
-/// 签名不匹配或格式错误时返回 [`Error::Device`]（内层是设备身份库的
-/// `DeviceSignatureInvalid`）。
+/// Returns [`Error::Device`] when the signature does not match or is malformed; the
+/// inner error is `DeviceSignatureInvalid` from the device identity library.
 pub fn verify_device(
     public_key: &DevicePublicKey,
     message: &[u8],
@@ -816,15 +863,14 @@ mod tests {
     use qualia_dik::device::SIGNATURE_LEN;
     use std::collections::HashMap;
 
-    /// 一个纯内存的 [`DeviceKeys`] 实现，用来把编排逻辑与平台隔开。
+    /// An in-memory [`DeviceKeys`] implementation that keeps the orchestration logic
+    /// away from the platform.
     ///
-    /// 它**刻意不做任何安全声明**：`is_hardware_backed` 之类的判断在
-    /// [`SecureStore`] 上，而这里的签名是明文的软件密钥——测试替身伪装成硬件
-    /// 正是 AGENTS.md 禁止的事。
+    /// It signs with a plain software key and never claims hardware backing.
     struct FakeKeys {
-        /// 按 label 记住已经创建过的身份。
+        /// Identities created so far, keyed by label.
         keys: HashMap<String, SigningKey>,
-        /// 创建次数，用于验证幂等性。
+        /// Number of creations, for idempotency checks.
         creates: usize,
     }
 
@@ -840,7 +886,6 @@ mod tests {
     impl DeviceKeys for FakeKeys {
         fn get_or_create(&mut self, label: &str) -> Result<DevicePublicKey> {
             if !self.keys.contains_key(label) {
-                // 用 label 派生而不是随机：测试要能复现。
                 let scalar = label.bytes().fold(1_u8, u8::wrapping_add).max(1);
                 let mut seed = [0_u8; 32];
                 seed[31] = scalar;
@@ -852,7 +897,6 @@ mod tests {
             }
             let key = &self.keys[label];
             let point = key.verifying_key().to_sec1_point(false);
-            // `?` 把设备身份库的错误经 `Error::Device` 转换过来。
             Ok(DevicePublicKey::from_sec1_bytes(point.as_bytes())?)
         }
 
@@ -863,12 +907,13 @@ mod tests {
         }
     }
 
-    /// 内存里的 [`SecureStore`]。`hardware` 可配置，用来验证它被如实转发。
+    /// In-memory [`SecureStore`]. `hardware` is configurable so that the forwarding
+    /// of that claim can be verified.
     #[derive(Default)]
     struct FakeStore {
         master: Option<MasterKey>,
         hardware: bool,
-        /// 设为 `Some` 时让 `store_master_key` 失败，用于测失败路径。
+        /// When set, makes `store_master_key` fail; used for failure paths.
         fail_store: bool,
         deletes: usize,
     }
@@ -912,7 +957,8 @@ mod tests {
         (keys, store, result)
     }
 
-    /// 注册必须产出可用的三样东西：主密钥存住了、保险库能开、身份能取回。
+    /// Registration produces three usable things: the master key is stored, the
+    /// vault opens, and the identity can be retrieved.
     #[test]
     fn registration_produces_a_usable_device() {
         let (keys, store, result) = registered();
@@ -923,7 +969,6 @@ mod tests {
         );
         assert!(!result.is_hardware_backed());
 
-        // 保险库必须能用存住的那把主密钥打开——这是「注册成功」的真正含义。
         let data = result.vault.serialize().expect("序列化应当成功");
         let opened = open_vault(&store, &data).expect("用存住的主密钥应当能打开保险库");
         assert!(opened.vault().is_empty());
@@ -933,7 +978,8 @@ mod tests {
         );
     }
 
-    /// 两次注册必须得到**不同**的主密钥，否则第二台设备会覆盖第一台的账号。
+    /// Two registrations produce **different** master keys; otherwise a second
+    /// device would overwrite the account of the first.
     #[test]
     fn each_registration_generates_a_fresh_master_key() {
         let (_k1, _s1, first) = registered();
@@ -944,9 +990,9 @@ mod tests {
         );
     }
 
-    /// 同一个 label 重复调用 `get_or_create` 不得创建新身份。
+    /// Repeated `get_or_create` calls with the same label create no new identity.
     ///
-    /// 这条是「重启应用后还能打开保险库」的充要条件。
+    /// This is necessary and sufficient for opening the vault after an app restart.
     #[test]
     fn device_identity_is_stable_across_calls() {
         let mut keys = FakeKeys::new();
@@ -956,10 +1002,10 @@ mod tests {
         assert_eq!(keys.creates, 1, "不得重复创建");
     }
 
-    /// 主密钥写入失败时**不得**创建保险库。
+    /// A failed master key write creates **no** vault.
     ///
-    /// 这正是「失败之后的状态」那一段的核心：留下一个打不开的文件比什么都不留下
-    /// 更糟，因为用户无法区分它与一个完好的文件。
+    /// A file that cannot be opened is worse than no file at all, because the user
+    /// cannot tell it from a healthy one.
     #[test]
     fn registration_does_not_create_a_vault_when_storage_fails() {
         let mut keys = FakeKeys::new();
@@ -975,10 +1021,12 @@ mod tests {
         assert!(store.master.is_none());
     }
 
-    /// 从未登录过的设备打开保险库必须报一个**可区分**的错误。
+    /// Opening a vault on a device that never logged in reports a **distinguishable**
+    /// error.
     ///
-    /// 若它和「密钥不匹配」共用一个错误，界面就分不清该引导用户去登录还是该警告
-    /// 数据已损坏——后者会导致用户重新注册，从而永久丢失原有数据。
+    /// Sharing that error with "key mismatch" would leave the UI unable to tell
+    /// whether to guide the user to log in or to warn about damaged data; the latter
+    /// leads to re-registration and permanent loss of the existing data.
     #[test]
     fn opening_without_a_stored_key_reports_not_registered() {
         let store = FakeStore::default();
@@ -991,19 +1039,14 @@ mod tests {
         );
     }
 
-    /// **空保险库也能判定主密钥对错。**
+    /// **An empty vault also detects a wrong master key.**
     ///
-    /// 第一版写的是「换一把主密钥，`open_vault` 必须返回
-    /// [`Error::VaultDecryptionFailed`]」，它**没有失败**。查下来是格式使然：主密钥
-    /// 只参与**每条记录**的 AEAD，而条目为空的文件里没有任何密文，于是任何 32 字节
-    /// 的主密钥都能把它解析成空保险库。当时的处置是把测试改成钉住真实行为（红的
-    /// 测试等于没有测试），并把缺口记进 TODO。
+    /// Format version 2 appends a master key check value, so a file with no entries
+    /// is decided as well: an empty vault opened with the wrong key must be rejected.
     ///
-    /// 格式版本 2 在文件末尾加了主密钥检查值，这个缺口因此关闭。测试现在钉住**正确
-    /// 的行为**：空保险库用错误的密钥必须被拒。
-    ///
-    /// 「另一台设备」用的是它**自己**的主密钥，而不是一个借来的随机值——后者会掩盖
-    /// 「两台设备各自注册、各自持有一把合法主密钥」这个真实场景。
+    /// The "other device" uses **its own** master key rather than a borrowed random
+    /// value, which would hide the real situation of two devices that each registered
+    /// and each hold a valid master key.
     #[test]
     fn an_empty_vault_rejects_a_wrong_key() {
         let (_k, _s, result) = registered();
@@ -1027,11 +1070,12 @@ mod tests {
         );
     }
 
-    /// 有内容之后，主密钥不匹配同样必须被拒。
+    /// A vault with entries rejects the wrong key as well.
     ///
-    /// 这是上一条的另一半，两条覆盖的是**不同**的失败点：空文件靠末尾的检查值，
-    /// 有内容的文件靠记录的 AEAD 标签（那个检查值也在，但先撞上的是它）。
-    /// 只测其中一条会对另一半的实现错误完全盲目。
+    /// This is the other half of the previous test; the two cover **different**
+    /// failure points: an empty file relies on the trailing check value, a file with
+    /// entries on the AEAD tag of a record (the check value is there too, but the
+    /// record is reached first).
     #[test]
     fn a_vault_with_entries_rejects_the_wrong_key() {
         use crate::uri;
@@ -1057,14 +1101,13 @@ mod tests {
         );
     }
 
-    /// 登录的完整往返：新设备拿到的主密钥必须**就是**老设备的那一把。
+    /// A full login round trip: the master key the new device receives must be
+    /// exactly the one of the old device, and a login can be completed only once.
     ///
-    /// 一次登录只能完成一次。
-    ///
-    /// `Joiner::complete` 收 `&self`（好让调用方把它放进共享容器），一次性由内部的
-    /// `Option` 保证。这条测试钉住那个保证：第二次调用必须失败，而且**必须与
-    /// 「应答是伪造的」报同一个错误**——单独报「已经用过了」等于告诉攻击者他的重放
-    /// 被认出来了。
+    /// `Joiner::complete` takes `&self` (so callers can keep it in a shared container)
+    /// and the internal `Option` enforces single use. A second call must fail with the
+    /// **same error as a forged reply**: reporting "already used" separately would
+    /// tell an attacker their replay was recognized.
     #[test]
     fn a_login_can_only_be_completed_once() {
         let (_old_keys, _old_store, account) = registered();
@@ -1082,7 +1125,6 @@ mod tests {
             .complete(&reply, &mut keys, &mut store)
             .expect("第一次应当成功");
 
-        // 第二次：同一条应答原样再交一次。
         let error = joiner
             .complete(&reply, &mut keys, &mut store)
             .expect_err("第二次必须失败");
@@ -1091,12 +1133,12 @@ mod tests {
             "必须与伪造应答报同一个错误，实际是 {error:?}"
         );
 
-        // 完成后身份也取不到了——端侧只能在完成之前把它显示给用户确认。
         assert!(joiner.identity().is_none());
     }
 
-    /// 只比较「没有报错」是不够的——一个把主密钥换成新随机值的实现同样不报错，
-    /// 而用户要到同步时才发现条目一条都对不上。
+    /// Comparing only "no error" is not enough: an implementation that replaces the
+    /// master key with a fresh random value reports no error either, and the user only
+    /// finds out at synchronization time that no entry matches.
     #[test]
     fn login_transfers_the_exact_master_key() {
         let (_old_keys, old_store, account) = registered();
@@ -1129,7 +1171,6 @@ mod tests {
             "主密钥必须已经写入新设备的平台存储"
         );
 
-        // 并且它真的能打开老设备的保险库。
         let data = account.vault.serialize().expect("序列化应当成功");
         let opened = open_vault(&joiner_store, &data).expect("新设备应当能打开老设备的保险库");
         assert_eq!(
@@ -1138,7 +1179,8 @@ mod tests {
         );
     }
 
-    /// 授权前后，会话标识都应当能被调用方取到并持久化。
+    /// Before and after authorization the caller can read the session identifier and
+    /// persist it.
     #[test]
     fn login_reports_the_session_for_persistence() {
         let (_k, _s, account) = registered();
@@ -1163,7 +1205,7 @@ mod tests {
         assert_eq!(login.used_sessions().len(), 1);
     }
 
-    /// 同一条请求不得被接受两次。
+    /// The same request cannot be authorized twice.
     #[test]
     fn the_same_request_cannot_be_authorized_twice() {
         let (_k, _s, account) = registered();
@@ -1175,8 +1217,6 @@ mod tests {
         let master = account.vault.master_key();
 
         login.authorize(&request, master).expect("第一次应当成功");
-        // `authorize` 每次都消费 `pending`，因此第二次必然失败——这里验证的是
-        // 「它失败」而不是「它返回了什么具体错误」，因为两条防线都可能先触发。
         let error = login
             .authorize(&request, master)
             .expect_err("第二次必须失败");
@@ -1189,23 +1229,20 @@ mod tests {
         );
     }
 
-    /// 用**另一个** `Login` 的载荷，请求必须被拒绝。
+    /// A request produced from the payload of **another** `Login` must be rejected.
     ///
-    /// # 这条测试为什么长这样
+    /// The authentication tag of Msg1 is derived from the **ECDH shared secret**, not
+    /// from the master key: the master key is what this flow transfers, not a
+    /// credential that authenticates the sender. Its confidentiality rests on only the
+    /// person who scanned the QR code being able to compute that shared secret.
     ///
-    /// 第一版写的是「用一把随机主密钥去 `authorize`，必须失败」，结果它**成功了**。
-    /// 查过 `pairing::PendingSession::accept` 才确认这不是缺陷：Msg1 的认证标签由
-    /// **ECDH 共享秘密**派生，而不是由主密钥——主密钥是这次要**传过去的东西**
-    /// （载荷），不是用来认证发送方的凭据。它的保密性由「只有扫到二维码的人才能算出
-    /// 那个共享秘密」保证，也就是 D4 的带外信道。
-    ///
-    /// 所以真正会失败的场景是**会话对不上**（临时密钥不同 ⇒ 共享秘密不同 ⇒ 解密
-    /// 必失败），以及加入方拿到错误的回复。当前这条覆盖前者，见
-    /// [`a_reply_encrypted_for_another_session_cannot_be_opened`] 覆盖后者。
+    /// The failing scenario is therefore a **session mismatch** (different ephemeral
+    /// keys imply a different shared secret, so decryption must fail), as well as a
+    /// joiner receiving a reply for another session. This test covers the former;
+    /// [`a_reply_encrypted_for_another_session_cannot_be_opened`] covers the latter.
     #[test]
     fn a_request_from_another_login_is_rejected() {
         let (_k, _s, account) = registered();
-        // 第一台设备显示了自己的二维码，但用户没扫它，而是扫了第二台设备的。
         let first = Login::new().expect("应当能开始登录");
         let payload_from_first = first.payload().clone();
 
@@ -1224,28 +1261,24 @@ mod tests {
         assert!(second.session_id().is_none(), "失败不得留下会话标识");
     }
 
-    /// 发给**另一次会话**的回复，加入方解不开。
+    /// A reply encrypted for **another session** cannot be opened by the joiner.
     ///
-    /// 这条补上主密钥真正起作用的那个位置：`complete` 里用会话密钥解 Msg2，而会话
-    /// 密钥由 ECDH 共享秘密决定。回复若来自另一次会话，解密必然失败——主密钥没有
-    /// 机会被写进存储。
+    /// `complete` decrypts Msg2 with the session key, which comes from the ECDH shared
+    /// secret. A reply from another session therefore fails to decrypt and the master
+    /// key never reaches storage.
     #[test]
     fn a_reply_encrypted_for_another_session_cannot_be_opened() {
         let (_k, _s, account) = registered();
         let mut keys = FakeKeys::new();
 
-        // 会话 A：用户实际扫的那一次。
         let mut login_a = Login::new().expect("应当能开始登录");
         let payload_a = login_a.payload().clone();
         let mut joiner_a = Joiner::new(&payload_a, "new-device").expect("应当能开始扫码");
         let request_a = joiner_a.request(&mut keys).expect("应当能发出请求");
-        // 会话 A：用户实际扫的那一次。它也必须能正常授权——否则下面的失败可能只是
-        // 因为会话 A 本身是坏的，那样这条测试就什么也没证明。
         login_a
             .authorize(&request_a, account.vault.master_key())
             .expect("会话 A 应当能授权");
 
-        // 会话 B：另一台设备上的另一次登录，用它的回复去糊弄会话 A。
         let mut login_b = Login::new().expect("应当能开始登录");
         let payload_b = login_b.payload().clone();
         let mut joiner_b = Joiner::new(&payload_b, "new-device").expect("应当能开始扫码");
@@ -1263,13 +1296,9 @@ mod tests {
             "实际是 {error:?}"
         );
         assert!(store.master.is_none(), "失败不得留下主密钥");
-        // 这里刻意**不**再补一句「而 reply_a 是好的」：`complete` 收 `self`，因此
-        // 那句只能靠新建一个 `Joiner` 来做，而新实例有新的临时密钥，本来就解不开
-        // `reply_a`——那句断言永远不会通过。「合法回复能解开」由
-        // `login_transfers_the_exact_master_key` 覆盖，两条测试各管一头。
     }
 
-    /// 篡改来自老设备的应答必须被拒绝。
+    /// A tampered reply from the old device is rejected.
     #[test]
     fn tampering_with_the_reply_is_detected() {
         let (_k, _s, account) = registered();
@@ -1297,7 +1326,8 @@ mod tests {
         }
     }
 
-    /// `request` 必须幂等：重复调用返回同一条消息，而不是重新签名。
+    /// `request` is idempotent: repeated calls return the same message rather than
+    /// signing again.
     #[test]
     fn requesting_twice_returns_the_same_message() {
         let login = Login::new().expect("应当能开始登录");
@@ -1310,12 +1340,12 @@ mod tests {
         assert_eq!(keys.creates, 1, "不得为第二次请求创建新身份");
     }
 
-    /// 恢复密钥的往返：导出、导入、写入存储，拿到的主密钥必须一致。
+    /// Recovery round trip: export, import, and write to storage, with the master key
+    /// unchanged throughout.
     #[test]
     fn recovery_roundtrip_restores_the_master_key() {
         let (_k, mut store, account) = registered();
         let master = account.vault.master_key();
-        // 用最低参数让测试快，真实默认值见 `KdfParams::recommended`。
         let params = KdfParams::new(8, 1, 1).expect("最低参数应当合法");
         let passphrase = SecretString::from("correct horse battery staple");
 
@@ -1323,12 +1353,11 @@ mod tests {
         let restored = import_recovery_key(&file, &passphrase, &mut store).expect("导入应当成功");
 
         assert_eq!(restored.expose(), master.expose());
-        // 并且恢复出来的密钥能打开原来的保险库。
         let data = account.vault.serialize().expect("序列化应当成功");
         open_vault(&store, &data).expect("恢复后应当能打开保险库");
     }
 
-    /// 口令错误时不得写入任何主密钥。
+    /// A wrong passphrase writes no master key at all.
     #[test]
     fn recovery_with_a_wrong_passphrase_leaves_storage_untouched() {
         let mut store = FakeStore::default();
@@ -1346,7 +1375,8 @@ mod tests {
         assert!(store.master.is_none(), "失败不得写入主密钥");
     }
 
-    /// 口令为空时导出必须失败——否则 Argon2id 的代价全是白费。
+    /// Export fails on an empty passphrase; otherwise the whole cost of Argon2id would
+    /// be wasted.
     #[test]
     fn an_empty_passphrase_is_rejected() {
         let master = MasterKey::generate().expect("随机源可用");
@@ -1358,7 +1388,7 @@ mod tests {
         );
     }
 
-    /// 存储自称不硬件保护时必须如实转发。
+    /// The store's hardware-backing claim is forwarded truthfully.
     #[test]
     fn hardware_backing_is_reported_truthfully() {
         let mut keys = FakeKeys::new();
@@ -1375,7 +1405,8 @@ mod tests {
         assert!(result.is_hardware_backed());
     }
 
-    /// 互操作检查：对方声明的身份必须与本地取到的逐字节一致。
+    /// Interoperability check: an identity claimed by the other side must match the
+    /// local one byte for byte.
     #[test]
     fn device_identity_comparison_works_both_ways() {
         let mut keys = FakeKeys::new();
@@ -1390,7 +1421,8 @@ mod tests {
         );
     }
 
-    /// 签名与验签必须互相匹配，且签名长度固定。
+    /// Signature and verification match each other, and the signature has a stable
+    /// length.
     #[test]
     fn signatures_verify_and_have_a_stable_length() {
         let mut keys = FakeKeys::new();
@@ -1402,7 +1434,7 @@ mod tests {
         assert!(verify_device(&public, b"other", &signature).is_err());
     }
 
-    /// 对未创建的 label 签名必须报一个明确的错误，而不是 panic。
+    /// Signing with an unknown label reports a clear error instead of panicking.
     #[test]
     fn signing_without_an_identity_fails_cleanly() {
         let mut keys = FakeKeys::new();
@@ -1410,24 +1442,24 @@ mod tests {
         assert!(matches!(error, Error::DeviceKeyMissing), "实际是 {error:?}");
     }
 
-    /// 时间为 `0` 必须被拒绝：它通常意味着调用方忘了传。
+    /// A timestamp of `0` is rejected: it usually means the caller forgot to pass one.
     #[test]
     fn a_zero_timestamp_is_rejected() {
         assert!(check_now(0).is_err());
         assert_eq!(check_now(1).expect("非零应当通过"), 1);
     }
 
-    /// 口令长度可以查，但口令本身不出现在任何输出里。
+    /// The passphrase length can be queried, while the passphrase itself appears in no
+    /// output.
     #[test]
     fn passphrase_length_is_available_without_exposing_the_passphrase() {
         let passphrase = SecretString::from("hunter2");
         assert_eq!(passphrase_len(&passphrase), 7);
         assert_eq!(passphrase_len(&SecretString::from("")), 0);
-        // 多字节字符按字符数而不是字节数，界面上的「长度提示」才不会吓到用户。
         assert_eq!(passphrase_len(&SecretString::from("口令")), 2);
     }
 
-    /// `Debug` 输出不得包含任何密钥材料。
+    /// `Debug` output contains no key material.
     #[test]
     fn debug_output_is_redacted() {
         let (_k, _s, account) = registered();
@@ -1478,7 +1510,7 @@ mod tests {
         }
     }
 
-    /// 空保险库助手产出的文件必须是合法且可打开的。
+    /// The empty-vault helper produces a valid, openable file.
     #[test]
     fn an_empty_vault_is_openable() {
         let master = MasterKey::generate().expect("随机源可用");
@@ -1491,7 +1523,7 @@ mod tests {
         assert!(opened.vault().is_empty());
     }
 
-    /// `&mut T` 的转发实现必须与直接调用等价。
+    /// The `&mut T` forwarding implementations are equivalent to a direct call.
     #[test]
     fn mutable_references_forward_correctly() {
         let mut keys = FakeKeys::new();

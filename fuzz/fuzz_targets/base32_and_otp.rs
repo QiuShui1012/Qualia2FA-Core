@@ -13,23 +13,30 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! fuzz 目标：Base32 编解码与 OTP 计算。
+//! Fuzz target: Base32 encoding/decoding and OTP computation.
 //!
-//! # 为什么要单独 fuzz Base32
+//! # Input surface
 //!
-//! Base32 是**所有种子进入系统的必经之路**——它把一个长度任意的字符串映射成
-//! 长度不同的字节序列，涉及位对齐、尾部余数处理与填充校验。这类「位级搬运」
-//! 代码是越界和差一错误的经典温床，而它的输入直接来自二维码。
+//! Base32 is the path every seed takes to enter the system: it maps a string of
+//! arbitrary length to a byte sequence of a different length, involving bit
+//! alignment, trailing-remainder handling and padding validation. This input is
+//! untrusted and comes directly from a QR code.
 //!
-//! # 覆盖的性质
+//! # Properties covered
 //!
-//! 1. **绝不 panic**——`decode` 与 `decode_strict` 对任意字符串都必须返回。
-//! 2. **往返精确**——`decode(encode(bytes)) == bytes`，对任意字节序列成立。
-//! 3. **两种模式的关系**——严格模式接受的输入，宽容模式也必须接受
-//!    （严格是宽容的子集）。反向不成立，但这不构成缺陷：宽容模式的存在
-//!    意义就是接受其它认证器产出的非规范编码。
-//! 4. **OTP 输出形状**——任意种子、任意计数器下，码必须恒为定宽十进制。
-//!    这是「把码当整数处理就会丢前导零」这类 bug 的防线。
+//! 1. **Never panics** — `decode` and `decode_strict` must return for any string.
+//! 2. **Exact round-trip** — `decode(encode(bytes)) == bytes` for any byte
+//!    sequence.
+//! 3. **Relation between the two modes** — whatever the strict mode accepts, the
+//!    lenient mode must accept as well (strict is a subset of lenient). The
+//!    converse does not hold, and that is not a defect: the lenient mode exists
+//!    to accept the non-canonical encodings produced by other authenticators.
+//! 4. **OTP output shape** — for any seed and any counter the code must always be
+//!    fixed-width decimal. This guards against bugs such as dropping leading
+//!    zeros by treating the code as an integer.
+//!
+//! Preconditions: no feature flags, and no valid skeleton has to be built to
+//! bypass AEAD — the target consumes arbitrary bytes as they are.
 
 #![no_main]
 
@@ -39,10 +46,7 @@ use qualia2fa_core::otp::{self, Algorithm, Digits, OtpSecret};
 use qualia2fa_core::ExposeSecret;
 
 fuzz_target!(|data: &[u8]| {
-    // ── 0. 空输入是**明确拒绝**的（空种子无意义）──────────────────────
-    // 这条必须单独处理：`encode([])` 合法地返回空串，而解码端会正确拒绝它。
-    // 最初把「往返必须成功」写成无条件断言，于是 fuzz 一启动就在 `data` 为空时
-    // 报假阳性。库的行为是对的，错的是断言。
+    // ── 0. Empty input is explicitly rejected (an empty seed is meaningless) ──
     if data.is_empty() {
         assert!(
             base32::decode("").is_err(),
@@ -55,7 +59,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    // ── 1. 任意字节序列 → Base32 → 解码，必须精确还原 ──────────────────
+    // ── 1. Arbitrary bytes → Base32 → decode must round-trip exactly ────────
     let encoded = base32::encode(data);
     let decoded = base32::decode_strict(&encoded)
         .expect("自己编码出的规范形式必须能被严格模式解码");
@@ -66,7 +70,6 @@ fuzz_target!(|data: &[u8]| {
         data.len()
     );
 
-    // 无填充形式同样必须可解码（真实世界绝大多数种子无填充）。
     let unpadded = encoded.trim_end_matches('=');
     let decoded_unpadded = base32::decode(unpadded).expect("无填充形式必须可解码");
     assert_eq!(
@@ -75,23 +78,18 @@ fuzz_target!(|data: &[u8]| {
         "无填充往返不精确：{unpadded}"
     );
 
-    // 两处编码必须一致——`decode_strict` 的输入是规范形式。
     assert_eq!(
         base32::encode(decoded_unpadded.expose_secret()),
         encoded,
         "重新编码的结果与首次编码不一致"
     );
 
-    // ── 2. 任意文本 → 两种解码模式，均不得 panic ────────────────────────
-    // fuzz 输入不保证是合法 UTF-8，用 lossy 转换保留信息。
+    // ── 2. Arbitrary text → both decode modes, neither may panic ────────────
     let text = String::from_utf8_lossy(data);
 
     let lenient = base32::decode(&text);
     let strict = base32::decode_strict(&text);
 
-    // 严格模式接受的，宽容模式也必须接受（含错误类型也应一致地成功）。
-    // 注意：这里比较的是「都成功」这一事实，而不是错误内容——两种模式在
-    // 非规范填充上的错误类型本就不同。
     if let Ok(from_strict) = &strict {
         assert!(
             lenient.is_ok(),
@@ -104,15 +102,13 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    // ── 3. 用解码出的种子算 OTP，验证输出形状 ──────────────────────────
-    // 只在解码成功且非空时继续；空种子会被 `OtpSecret` 拒绝（这是设计如此）。
+    // ── 3. Compute OTP from the decoded seed and verify the output shape ────
     if let Ok(bytes) = strict
         && !bytes.expose_secret().is_empty()
     {
         let secret = OtpSecret::from_bytes(bytes.expose_secret().to_vec())
             .expect("已确认非空");
 
-        // 用输入的字节派生计数器，使 fuzzer 能同时变异种子与计数器。
         let counter = u64::from_le_bytes([
             data.first().copied().unwrap_or(0),
             data.get(1).copied().unwrap_or(0),
@@ -136,13 +132,11 @@ fuzz_target!(|data: &[u8]| {
                     code.bytes().all(|b| b.is_ascii_digit()),
                     "码含非数字字符：{code}"
                 );
-                // 数值必须落在 [0, 10^digits)。
                 let numeric: u64 = code.parse().expect("码应可解析为数字");
                 assert!(
                     numeric < 10_u64.pow(digits.count()),
                     "码超出位数范围：{code}"
                 );
-                // `format_code` 与 `hotp` 必须一致。
                 assert_eq!(
                     otp::format_code(otp::hotp(&secret, counter, algorithm, digits), digits),
                     code
@@ -150,7 +144,6 @@ fuzz_target!(|data: &[u8]| {
             }
         }
 
-        // TOTP 与 Steam：周期非零时必须成功，且形状固定。
         let time = counter;
         let totp_code = otp::totp_code(&secret, time, 30, Algorithm::Sha1, Digits::Six)
             .expect("周期非零");
@@ -165,7 +158,6 @@ fuzz_target!(|data: &[u8]| {
             "Steam 码含字母表外字符：{steam}"
         );
 
-        // 校验函数自反。
         assert!(otp::verify_code(&totp_code, &totp_code));
     }
 });

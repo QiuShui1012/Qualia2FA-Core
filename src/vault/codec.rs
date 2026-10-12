@@ -13,53 +13,54 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! 定长大端序读写游标。
+//! Fixed-width big-endian read/write cursor.
 //!
-//! 只服务保险库文件格式。之所以自己写而不引入 `byteorder`/`nom`：整个需求
-//! 就是「定长大端整数 + 有界切片」，十几行代码，而多一个依赖就多一份需要
-//! 审计的攻击面——这个模块处理的是**攻击者可能构造的文件**。
+//! Serves only the vault file format: fixed-width big-endian integers and bounded
+//! slices, with no dependencies outside `core`. The bytes it parses may have been
+//! constructed by an attacker.
 //!
-//! # 一切读取都必须是带边界的
+//! # Every read is bounds-checked
 //!
-//! 这是本模块存在的核心理由。解析不可信输入时，最容易犯的错误是
-//! `data[offset..offset + n]` 这类「先算再切」的写法——`offset + n` 会溢出
-//! （release 构建下回绕成一个小值，于是切片悄悄取到错误的数据），或者越界
-//! panic。本模块的所有读取都用 [`slice::get`]，越界返回 `None`，由调用方
-//! 转成 [`crate::Error::VaultTruncated`]。
+//! `data[offset..offset + n]` is the classic mistake when parsing untrusted input:
+//! `offset + n` overflows (wrapping to a small value in release builds, so the slice
+//! silently yields the wrong bytes) or panics out of range. Every read here goes
+//! through [`slice::get`]; data that runs short returns `None`, which the caller turns
+//! into [`crate::Error::VaultTruncated`].
 //!
-//! fuzz 目标 `vault_parse` 专门盯这一点。
+//! The `vault_parse` fuzz target exercises this module.
 
-/// 读取游标。所有方法在数据不足时返回 `None`，**从不 panic**。
+/// Read cursor. Every method returns `None` when the data runs short and **never
+/// panics**.
 pub(crate) struct Reader<'a> {
-    /// 剩余未读的数据。
+    /// Bytes not yet read.
     data: &'a [u8],
-    /// 已消耗的字节数，只用于错误报告与测试断言。
+    /// Bytes consumed so far; used only for error reporting and test assertions.
     consumed: usize,
 }
 
 impl<'a> Reader<'a> {
-    /// 在给定数据上创建游标。
+    /// Creates a cursor over the given data.
     pub(crate) const fn new(data: &'a [u8]) -> Self {
         Self { data, consumed: 0 }
     }
 
-    /// 已消耗的字节数。
+    /// Bytes consumed so far.
     #[cfg(test)]
     pub(crate) const fn consumed(&self) -> usize {
         self.consumed
     }
 
-    /// 剩余可读字节数。
+    /// Bytes still readable.
     pub(crate) const fn remaining(&self) -> usize {
         self.data.len()
     }
 
-    /// 是否已读完。
+    /// Whether everything has been read.
     pub(crate) const fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
-    /// 读取固定长度的字节切片。
+    /// Reads a fixed-length byte slice.
     pub(crate) fn take(&mut self, len: usize) -> Option<&'a [u8]> {
         let head = self.data.get(..len)?;
         self.data = self.data.get(len..)?;
@@ -67,43 +68,43 @@ impl<'a> Reader<'a> {
         Some(head)
     }
 
-    /// 读取一个字节。
+    /// Reads one byte.
     pub(crate) fn u8(&mut self) -> Option<u8> {
         Some(*self.take(1)?.first()?)
     }
 
-    /// 读取一个大端 `u32`。
+    /// Reads a big-endian `u32`.
     pub(crate) fn u32(&mut self) -> Option<u32> {
         let bytes = self.take(4)?;
         Some(u32::from_be_bytes(bytes.try_into().ok()?))
     }
 
-    /// 读取 16 字节的条目标识。
+    /// Reads a 16-byte entry identifier.
     pub(crate) fn entry_id(&mut self) -> Option<super::entry::EntryId> {
         let bytes = self.take(super::entry::EntryId::LEN)?;
         Some(super::entry::EntryId::from_bytes(bytes.try_into().ok()?))
     }
 
-    /// 读取 24 字节的 nonce。
+    /// Reads a 24-byte nonce.
     pub(crate) fn nonce(&mut self) -> Option<super::crypto::Nonce> {
         let bytes = self.take(super::crypto::NONCE_LEN)?;
         bytes.try_into().ok()
     }
 }
 
-/// 把一个大端 `u32` 追加到缓冲区。
+/// Appends a big-endian `u32` to the buffer.
 pub(crate) fn put_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
-/// 把一段带长度前缀的字节追加到缓冲区。
+/// Appends length-prefixed bytes to the buffer.
 ///
 /// # Panics
 ///
-/// 若 `bytes` 长度超过 `u32::MAX` 则 panic。这在实践中不可达——所有可变长
-/// 字段在进入本函数前都已按
-/// [`crate::vault::Entry::MAX_FIELD_LEN`] 校验过，
-/// 而记录本身也受 [`crate::vault::MAX_RECORD_LEN`] 约束。
+/// Panics when `bytes` is longer than `u32::MAX`. Unreachable in practice: every
+/// variable-length field is checked against
+/// [`crate::vault::Entry::MAX_FIELD_LEN`] before it reaches this function, and a record
+/// is bounded by [`crate::vault::MAX_RECORD_LEN`].
 pub(crate) fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     #[expect(
         clippy::cast_possible_truncation,
@@ -122,8 +123,8 @@ pub(crate) fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 mod tests {
     use super::*;
 
-    /// 本模块只读固定宽度整数，`u64` 由调用方用 `to_be_bytes` 直接写——因此
-    /// 这个辅助函数只服务于测试。
+    /// This module reads only fixed-width integers and callers write `u64` directly with
+    /// `to_be_bytes`, so this helper serves tests only.
     fn put_u64(out: &mut Vec<u8>, value: u64) {
         out.extend_from_slice(&value.to_be_bytes());
     }
@@ -149,14 +150,13 @@ mod tests {
         assert_eq!(r.consumed(), buf.len());
     }
 
-    /// **核心性质**：任何读取都不得 panic，且读不到就返回 `None`。
+    /// **Core property**: no read may panic, and a read that cannot be satisfied returns
+    /// `None`.
     #[test]
     fn reader_never_panics_on_short_input() {
-        // 对每一种长度都试一遍，覆盖「差一字节」的边界。
         for len in 0..40_usize {
             let data = vec![0xAB_u8; len];
             let mut r = Reader::new(&data);
-            // 依次尝试各种读取，只要不 panic 即可；成功与否不作断言。
             let _ = r.u32();
             let _ = r.take(8);
             let _ = r.entry_id();
@@ -167,17 +167,17 @@ mod tests {
         }
     }
 
-    /// 超长长度前缀不得导致越界或巨大分配。
+    /// An oversized length prefix must not cause an out-of-range read or a huge
+    /// allocation.
     #[test]
     fn huge_length_prefix_does_not_allocate() {
         let mut buf = Vec::new();
-        put_u32(&mut buf, u32::MAX); // 声称后面有 4 GiB
+        put_u32(&mut buf, u32::MAX);
         buf.extend_from_slice(b"short");
 
         let mut r = Reader::new(&buf);
         let claimed = r.u32().expect("长度前缀可读");
         assert_eq!(claimed, u32::MAX);
-        // 真正读取时会因数据不足而失败，而不是尝试分配 4 GiB。
         assert_eq!(r.take(claimed as usize), None);
     }
 
