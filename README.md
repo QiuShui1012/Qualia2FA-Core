@@ -1,5 +1,7 @@
 # Qualia2FA-Core
 
+English version: [README.en.md](README.en.md).
+
 Qualia2FA 的核心库。承载双因素认证（2FA）的全部核心逻辑：TOTP/HOTP 计算、
 `otpauth://` 解析、加密保险库、设备配对与同步合并。
 
@@ -19,15 +21,14 @@ Qualia2FA 的核心库。承载双因素认证（2FA）的全部核心逻辑：T
 | 许可证 | `LGPL-3.0-or-later` |
 
 已实现：HOTP（RFC 4226）、TOTP（RFC 6238）、Base32（RFC 4648，宽容与严格两种
-模式）、`otpauth://` 解析与序列化、Steam Guard、加密保险库（本地存储格式）。
-
-**尚未实现**：设备配对与条目同步合并。这些是当前的开发重点。
+模式）、`otpauth://` 解析与序列化、Steam Guard、加密保险库（本地存储格式）、
+恢复密钥、挑战-应答认证、设备配对、同步载荷与合并，以及传输层协议。
 
 ## 用法
 
 ```toml
 [dependencies]
-qualia2fa-core = { git = "https://github.com/Qualia2FA/Qualia2FA-Core" }
+qualia2fa-core = "0.1"
 ```
 
 计算验证码：
@@ -83,7 +84,8 @@ let bytes = file.serialize()?;
 vault::write_file_atomically(std::path::Path::new("vault.q2fa"), &bytes)?;
 ```
 
-读回来需要**主密钥**——文件里不含它，也不含任何能用来验证它的东西：
+读回来需要**主密钥**——文件里不含它，只含一个由它派生的检查值（格式版本 2 起，
+32 字节，只能回答「是不是这把密钥」，无法反推出主密钥）：
 
 ```rust
 use qualia2fa_core::vault::{self, MasterKey};
@@ -167,18 +169,12 @@ Unix 秒传入。** 这不是洁癖：只有时间作为参数传入，RFC 6238 
 
 ## 接入你自己的项目
 
-作为 submodule 引入：
-
-```powershell
-git submodule add https://github.com/Qualia2FA/Qualia2FA-Core core
-git submodule update --init --recursive
-```
-
-然后在 `Cargo.toml` 中以路径依赖引用：
+本库已发布到 crates.io：在 `Cargo.toml` 里写版本号即可，不需要 submodule，也不
+需要指向上游目录的路径依赖。
 
 ```toml
 [dependencies]
-qualia2fa-core = { path = "core" }
+qualia2fa-core = "0.1"
 ```
 
 > ⚠️ 若你用 **Gobley + uniffi** 做 Kotlin 绑定，注意 Gobley 当前强制
@@ -225,8 +221,7 @@ cargo +nightly fuzz run vault_parse -- -max_total_time=300
 `rust-version = "1.89"` 是**最低支持声明**，不是开发工具链版本：
 
 - **开发工具链**由 `rust-toolchain.toml` 固定为 `stable`，避免各人本机漂移。
-- **MSRV 下限**由依赖栈决定（当前实际约束来自 `thiserror` 与传递引入的 `zeroize`；
-  将来引入 AEAD/KEM 后会更紧）。
+- **MSRV 下限**由依赖栈决定（当前实际约束来自加密依赖栈；将来引入 KEM 后会更紧）。
 - CI 有独立的 MSRV job，用 1.89 真机编译一遍——**声明的 MSRV 必须真的能编译**，
   否则这个字段就是谎言。
 
