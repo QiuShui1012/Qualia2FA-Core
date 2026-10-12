@@ -85,7 +85,7 @@ impl Device {
     fn new(scalar: u8) -> Self {
         let mut bytes = [0_u8; 32];
         bytes[31] = scalar;
-        let signing = SigningKey::from_bytes((&bytes).into()).expect("小标量必定合法");
+        let signing = SigningKey::from_bytes((&bytes).into()).expect("a small scalar is valid");
         let point = signing.verifying_key().to_sec1_point(false);
         let mut public = [0_u8; PUBLIC_KEY_LEN];
         public.copy_from_slice(point.as_bytes());
@@ -98,7 +98,7 @@ impl Device {
     /// verification side hashes it once more.
     fn sign(&self, message: &[u8]) -> DeviceSignature {
         let signature: Signature = self.signing.sign(message);
-        DeviceSignature::from_bytes(&signature.to_bytes()).expect("固定 64 字节")
+        DeviceSignature::from_bytes(&signature.to_bytes()).expect("fixed 64 bytes")
     }
 }
 
@@ -204,36 +204,45 @@ impl SecureStore for MemoryStore {
 fn registration_produces_a_usable_vault() {
     let mut keys = SoftwareKeys::new();
     let mut store = MemoryStore::new(true);
-    let mut registered = flow::registration(&mut keys, &mut store, LABEL).expect("注册应当成功");
+    let mut registered = flow::registration(&mut keys, &mut store, LABEL).expect("registers ok");
 
-    assert!(registered.vault().vault().is_empty(), "新保险库必须是空的");
+    assert!(
+        registered.vault().vault().is_empty(),
+        "a new vault must be empty"
+    );
     assert!(
         registered.is_hardware_backed(),
-        "存储自称硬件保护，必须原样转发"
+        "the store claims hardware backing, which must be forwarded"
     );
 
     let entry = vault::entry_from_parsed_uri(
         &qualia2fa_core::uri::parse(
             "otpauth://totp/ACME:alice?secret=JBSWY3DPEHPK3PXP&issuer=ACME",
         )
-        .expect("合法 URI"),
+        .expect("valid URI"),
         TEST_NOW,
     )
-    .expect("构造条目");
+    .expect("build the entry");
     registered
         .vault_mut()
         .vault_mut()
         .insert(entry)
-        .expect("插入条目");
-    let bytes = registered.vault().serialize().expect("序列化");
+        .expect("insert the entry");
+    let bytes = registered.vault().serialize().expect("serialize");
 
-    let reopened = flow::open_vault(&store, &bytes).expect("重新打开应当成功");
-    assert_eq!(reopened.vault().len(), 1, "条目应当在重新打开后还在");
+    let reopened = flow::open_vault(&store, &bytes).expect("reopening should succeed");
+    assert_eq!(
+        reopened.vault().len(),
+        1,
+        "the entry should still be there after reopening"
+    );
 
     let message = b"registration";
-    let public = keys.get_or_create(LABEL).expect("身份应当能用");
-    flow::verify_device(&public, message, &keys.sign(LABEL, message).expect("签名"))
-        .expect("自己签的名必须能验过");
+    let public = keys
+        .get_or_create(LABEL)
+        .expect("the identity should be usable");
+    flow::verify_device(&public, message, &keys.sign(LABEL, message).expect("sign"))
+        .expect("a signature we made ourselves must verify");
 }
 
 /// The master key produced by registration must be a **fresh random value**, not a derivable
@@ -243,13 +252,13 @@ fn registration_generates_a_fresh_master_key_each_time() {
     let mut keys_a = SoftwareKeys::new();
     let mut keys_b = SoftwareKeys::new();
     let a =
-        flow::registration(&mut keys_a, &mut MemoryStore::new(false), LABEL).expect("随机源可用");
+        flow::registration(&mut keys_a, &mut MemoryStore::new(false), LABEL).expect("rng present");
     let b =
-        flow::registration(&mut keys_b, &mut MemoryStore::new(false), LABEL).expect("随机源可用");
+        flow::registration(&mut keys_b, &mut MemoryStore::new(false), LABEL).expect("rng present");
     assert_ne!(
         a.vault().master_key().expose(),
         b.vault().master_key().expose(),
-        "两次注册得到了同一个主密钥"
+        "two registrations produced the same master key"
     );
 }
 
@@ -268,22 +277,24 @@ fn registration_generates_a_fresh_master_key_each_time() {
 /// longer match; the failure surfaces as `PairingAuthenticationFailed`.
 #[test]
 fn login_transfers_the_exact_master_key() {
-    let master = MasterKey::generate().expect("随机源可用");
+    let master = MasterKey::generate().expect("rng present");
     let joiner = Device::new(2);
 
-    let (payload, pending) = pairing::begin().expect("发起配对");
-    let session = pairing::join(&payload).expect("接受二维码");
-    let (msg1, _) = session.request(&joiner.public).expect("生成请求");
-    let adoption = pending.accept(&msg1, &master).expect("发起方接受请求");
+    let (payload, pending) = pairing::begin().expect("begin pairing");
+    let session = pairing::join(&payload).expect("accept the QR code");
+    let (msg1, _) = session.request(&joiner.public).expect("generate request");
+    let adoption = pending
+        .accept(&msg1, &master)
+        .expect("the initiator accepts the request");
 
     let received = session
         .open(adoption.reply(), &joiner.public)
-        .expect("加入方打开 Msg2");
+        .expect("the joiner opens Msg2");
 
     assert_eq!(
         received.expose(),
         master.expose(),
-        "加入方拿到的主密钥与发起方不一致"
+        "the master key the joiner received differs from the initiator's"
     );
 }
 
@@ -300,37 +311,45 @@ fn login_transfers_the_exact_master_key() {
 fn login_lets_the_new_device_open_the_old_vault() {
     let mut old_keys = SoftwareKeys::new();
     let mut old_store = MemoryStore::new(true);
-    let mut old = flow::registration(&mut old_keys, &mut old_store, LABEL).expect("老设备注册");
+    let mut old = flow::registration(&mut old_keys, &mut old_store, LABEL).expect("register old");
     let entry = vault::entry_from_parsed_uri(
         &qualia2fa_core::uri::parse("otpauth://totp/Example:bob?secret=JBSWY3DPEHPK3PXP")
-            .expect("合法 URI"),
+            .expect("valid URI"),
         TEST_NOW,
     )
-    .expect("构造条目");
-    old.vault_mut().vault_mut().insert(entry).expect("插入");
-    let file_bytes = old.vault().serialize().expect("序列化");
+    .expect("build the entry");
+    old.vault_mut().vault_mut().insert(entry).expect("insert");
+    let file_bytes = old.vault().serialize().expect("serialize");
     let master = MasterKey::from_bytes(flow::master_key_to_bytes(old.vault().master_key()))
-        .expect("长度由构造保证");
+        .expect("the length is guaranteed by construction");
 
-    let mut login = Login::new().expect("发起登录");
+    let mut login = Login::new().expect("begin login");
     let payload = login.payload().clone();
 
     let mut new_keys = SoftwareKeys::new();
     let mut new_store = MemoryStore::new(true);
-    let mut joiner = Joiner::new(&payload, LABEL).expect("新设备应当能扫码");
-    let request = joiner.request(&mut new_keys).expect("生成请求");
+    let mut joiner = Joiner::new(&payload, LABEL).expect("the new device should scan the code");
+    let request = joiner.request(&mut new_keys).expect("generate request");
 
     let reply = login
         .authorize(&request, &master)
-        .expect("老设备授权应当成功");
+        .expect("the old device should authorize successfully");
 
     let received = joiner
         .complete(&reply, &mut new_keys, &mut new_store)
-        .expect("新设备应当能完成登录");
-    assert_eq!(received.expose(), master.expose(), "主密钥必须逐字节一致");
+        .expect("the new device should complete the login");
+    assert_eq!(
+        received.expose(),
+        master.expose(),
+        "the master key must match byte for byte"
+    );
 
-    let reopened = flow::open_vault(&new_store, &file_bytes).expect("新设备应当能解开");
-    assert_eq!(reopened.vault().len(), 1, "新设备应当看到那条条目");
+    let reopened = flow::open_vault(&new_store, &file_bytes).expect("the new device can open it");
+    assert_eq!(
+        reopened.vault().len(),
+        1,
+        "the new device should see that entry"
+    );
 }
 
 /// Two devices that register separately must end up with different master keys and different
@@ -351,9 +370,9 @@ fn two_devices_register_independently() {
     let mut keys_a = SoftwareKeys::new();
     let mut keys_b = SoftwareKeys::new();
     let a =
-        flow::registration(&mut keys_a, &mut MemoryStore::new(true), "device-a").expect("注册 A");
+        flow::registration(&mut keys_a, &mut MemoryStore::new(true), "device-a").expect("device A");
     let b =
-        flow::registration(&mut keys_b, &mut MemoryStore::new(true), "device-b").expect("注册 B");
+        flow::registration(&mut keys_b, &mut MemoryStore::new(true), "device-b").expect("device B");
 
     assert_ne!(a.device().as_sec1_bytes(), b.device().as_sec1_bytes());
     assert_ne!(a.device_id(), b.device_id());
@@ -362,8 +381,8 @@ fn two_devices_register_independently() {
         b.vault().master_key().expose()
     );
     let mut keys = SoftwareKeys::new();
-    let first = keys.get_or_create(LABEL).expect("首次");
-    let second = keys.get_or_create(LABEL).expect("再次");
+    let first = keys.get_or_create(LABEL).expect("first call");
+    let second = keys.get_or_create(LABEL).expect("second call");
     assert_eq!(first.as_sec1_bytes(), second.as_sec1_bytes());
 }
 
@@ -378,52 +397,55 @@ fn two_devices_register_independently() {
 fn recovery_restores_the_master_key_from_a_passphrase() {
     let mut keys = SoftwareKeys::new();
     let mut store = MemoryStore::new(true);
-    let mut registered = flow::registration(&mut keys, &mut store, LABEL).expect("注册");
+    let mut registered = flow::registration(&mut keys, &mut store, LABEL).expect("register");
     let entry = vault::entry_from_parsed_uri(
         &qualia2fa_core::uri::parse("otpauth://totp/Recovery:carol?secret=JBSWY3DPEHPK3PXP")
-            .expect("合法 URI"),
+            .expect("valid URI"),
         TEST_NOW,
     )
-    .expect("构造条目");
+    .expect("build the entry");
     registered
         .vault_mut()
         .vault_mut()
         .insert(entry)
-        .expect("插入");
-    let file_bytes = registered.vault().serialize().expect("序列化");
+        .expect("insert");
+    let file_bytes = registered.vault().serialize().expect("serialize");
 
-    let params = KdfParams::new(8, 1, 1).expect("最低参数应当合法");
+    let params = KdfParams::new(8, 1, 1).expect("the minimum parameters must be valid");
     let passphrase = SecretString::from("correct horse battery staple");
     let backup =
         flow::export_recovery_key(registered.vault().master_key(), &passphrase, Some(params))
-            .expect("导出应当成功");
+            .expect("export should succeed");
 
     let mut new_store = MemoryStore::new(true);
     let restored =
-        flow::import_recovery_key(&backup, &passphrase, &mut new_store).expect("导入应当成功");
+        flow::import_recovery_key(&backup, &passphrase, &mut new_store).expect("import succeeds");
     assert_eq!(restored.expose(), registered.vault().master_key().expose());
 
-    let reopened = flow::open_vault(&new_store, &file_bytes).expect("恢复后应当能打开");
+    let reopened = flow::open_vault(&new_store, &file_bytes).expect("it opens after recovery");
     assert_eq!(reopened.vault().len(), 1);
 }
 
 /// A wrong recovery passphrase must fail and must not leave any master key on the device.
 #[test]
 fn recovery_rejects_a_wrong_passphrase() {
-    let master = MasterKey::generate().expect("随机源可用");
-    let params = KdfParams::new(8, 1, 1).expect("最低参数应当合法");
-    let backup = recovery::export(&master, &SecretString::from("right"), &params).expect("导出");
+    let master = MasterKey::generate().expect("rng present");
+    let params = KdfParams::new(8, 1, 1).expect("the minimum parameters must be valid");
+    let backup = recovery::export(&master, &SecretString::from("right"), &params).expect("export");
 
     let mut store = MemoryStore::new(true);
     let error = flow::import_recovery_key(&backup, &SecretString::from("wrong"), &mut store)
-        .expect_err("口令错误必须失败");
+        .expect_err("a wrong passphrase must fail");
     assert!(
         matches!(error, Error::RecoveryAuthenticationFailed),
-        "实际是 {error:?}"
+        "actual: {error:?}"
     );
     assert!(
-        store.load_master_key().expect("读取不应失败").is_none(),
-        "失败不得留下主密钥"
+        store
+            .load_master_key()
+            .expect("reading must not fail")
+            .is_none(),
+        "a failure must not leave a master key behind"
     );
 }
 
@@ -444,19 +466,19 @@ fn recovery_rejects_a_wrong_passphrase() {
 /// `accept`, while failing to decode or to join also counts as rejected.
 #[test]
 fn tampered_qr_payload_never_completes_a_pairing() {
-    let master = MasterKey::generate().expect("随机源可用");
+    let master = MasterKey::generate().expect("rng present");
     let joiner = Device::new(2);
 
-    let (payload, pending) = pairing::begin().expect("发起配对");
+    let (payload, pending) = pairing::begin().expect("begin pairing");
     let baseline = payload.encode();
 
     {
-        let decoded = QrPayload::decode(&baseline).expect("基线载荷应当能解码");
-        let session = pairing::join(&decoded).expect("基线应当能加入");
-        let (msg1, _) = session.request(&joiner.public).expect("生成请求");
+        let decoded = QrPayload::decode(&baseline).expect("the baseline payload should decode");
+        let session = pairing::join(&decoded).expect("the baseline should join");
+        let (msg1, _) = session.request(&joiner.public).expect("generate request");
         pending
             .accept(&msg1, &master)
-            .expect("基线必须能走通，否则下面的断言没有意义");
+            .expect("the baseline must work, or the assertions below are vacuous");
     }
 
     for index in 0..baseline.len() {
@@ -472,10 +494,10 @@ fn tampered_qr_payload_never_completes_a_pairing() {
         let Ok((msg1, _)) = session.request(&joiner.public) else {
             continue;
         };
-        let (_, pending) = pairing::begin().expect("发起配对");
+        let (_, pending) = pairing::begin().expect("begin pairing");
         assert!(
             pending.accept(&msg1, &master).is_err(),
-            "第 {index} 字节被篡改后仍然完成了配对"
+            "byte {index} was tampered with yet the pairing completed"
         );
     }
 }
@@ -495,25 +517,25 @@ fn forged_device_public_key_is_rejected() {
 
     let signature = attacker.sign(message);
     let error = verify_device(
-        &DevicePublicKey::from_sec1_bytes(&real.public).expect("合法公钥"),
+        &DevicePublicKey::from_sec1_bytes(&real.public).expect("valid public key"),
         message,
         &signature,
     )
-    .expect_err("攻击者签的名不该验过");
+    .expect_err("an attacker's signature must not verify");
     assert!(
         matches!(
             error,
             Error::Device(qualia_dik::Error::DeviceSignatureInvalid { .. })
         ),
-        "实际是 {error:?}"
+        "actual: {error:?}"
     );
 
     verify_device(
-        &DevicePublicKey::from_sec1_bytes(&real.public).expect("合法公钥"),
+        &DevicePublicKey::from_sec1_bytes(&real.public).expect("valid public key"),
         message,
         &real.sign(message),
     )
-    .expect("自己的签名必须能验过");
+    .expect("our own signature must verify");
 }
 
 /// **No key material may appear in the QR payload.**
@@ -523,15 +545,15 @@ fn forged_device_public_key_is_rejected() {
 /// of the master key, and its length must equal `pairing::QR_PAYLOAD_LEN`.
 #[test]
 fn qr_payload_never_contains_key_material() {
-    let master = MasterKey::generate().expect("随机源可用");
-    let (payload, _pending) = pairing::begin().expect("发起配对");
+    let master = MasterKey::generate().expect("rng present");
+    let (payload, _pending) = pairing::begin().expect("begin pairing");
     let bytes = payload.encode();
     let text = payload.to_base32();
 
     for window in master.expose().windows(8) {
         assert!(
             !bytes.windows(8).any(|w| w == window),
-            "二维码载荷里出现了主密钥的片段"
+            "a fragment of the master key appeared in the QR payload"
         );
     }
     assert!(!text.is_empty());
@@ -550,28 +572,34 @@ fn qr_payload_never_contains_key_material() {
 /// log does not report as used; otherwise the replay log would make login work only once.
 #[test]
 fn replayed_pairing_messages_are_rejected() {
-    let master = MasterKey::generate().expect("随机源可用");
+    let master = MasterKey::generate().expect("rng present");
     let joiner = Device::new(2);
 
-    let (payload, pending) = pairing::begin().expect("发起配对");
-    let session = pairing::join(&payload).expect("接受二维码");
-    let (recorded_msg1, session_id) = session.request(&joiner.public).expect("生成请求");
+    let (payload, pending) = pairing::begin().expect("begin pairing");
+    let session = pairing::join(&payload).expect("accept the QR code");
+    let (recorded_msg1, session_id) = session.request(&joiner.public).expect("generate request");
     let adoption = pending
         .accept(&recorded_msg1, &master)
-        .expect("首次应当通过");
+        .expect("the first attempt should pass");
     assert_eq!(adoption.session_id(), &session_id);
 
     let mut log = NonceLog::new();
-    assert!(log.record(session_id), "首次记录应当成功");
+    assert!(log.record(session_id), "the first recording should succeed");
     assert!(log.is_used(&session_id));
 
-    assert!(log.is_used(&session_id), "重放日志必须认出已经用过的会话");
+    assert!(
+        log.is_used(&session_id),
+        "the replay log must recognize a used session"
+    );
 
-    let (payload2, _pending2) = pairing::begin().expect("发起配对");
-    let session2 = pairing::join(&payload2).expect("接受二维码");
-    let (_msg1_2, session_id2) = session2.request(&joiner.public).expect("生成请求");
+    let (payload2, _pending2) = pairing::begin().expect("begin pairing");
+    let session2 = pairing::join(&payload2).expect("accept the QR code");
+    let (_msg1_2, session_id2) = session2.request(&joiner.public).expect("generate request");
     assert_ne!(session_id, session_id2);
-    assert!(!log.is_used(&session_id2), "新会话不该被误判为重放");
+    assert!(
+        !log.is_used(&session_id2),
+        "a new session must not look like a replay"
+    );
     assert!(log.record(session_id2));
     assert_eq!(log.len(), 2);
 }
@@ -593,17 +621,23 @@ fn nonce_log_detects_replays_and_stays_bounded() {
     for index in 0..(capacity + 16) {
         let mut id = [0_u8; NONCE_LEN];
         id[..8].copy_from_slice(&(index as u64).to_le_bytes());
-        assert!(log.record(id), "第 {index} 个标识应当能记录");
+        assert!(log.record(id), "identifier {index} should be recordable");
         session_ids.push(id);
     }
     assert!(
         log.len() <= capacity,
-        "日志长度 {} 超过了容量 {capacity}",
+        "the log length {} exceeds the capacity {capacity}",
         log.len()
     );
-    let newest = session_ids.last().expect("至少记录了一个");
-    assert!(log.is_used(newest), "最新的会话标识不该被淘汰");
-    assert!(!log.record(*newest), "同一个标识不该被记两次");
+    let newest = session_ids.last().expect("at least one was recorded");
+    assert!(
+        log.is_used(newest),
+        "the newest session id must not be evicted"
+    );
+    assert!(
+        !log.record(*newest),
+        "the same identifier must not be recorded twice"
+    );
 }
 
 // ── Challenge-response ─────────────────────────────────────────────────
@@ -615,15 +649,17 @@ fn nonce_log_detects_replays_and_stays_bounded() {
 /// produces must be accepted back by the responder — the same property in the reverse direction.
 #[test]
 fn challenge_response_confirms_both_sides() {
-    let master = MasterKey::generate().expect("随机源可用");
+    let master = MasterKey::generate().expect("rng present");
     let device = Device::new(5);
 
-    let (challenge, verifier) = auth::begin().expect("发起挑战");
-    let responder = auth::accept(&challenge).expect("接受挑战");
+    let (challenge, verifier) = auth::begin().expect("begin the challenge");
+    let responder = auth::accept(&challenge).expect("accept the challenge");
     let response = responder
         .respond(&master, &device.public, |message| Ok(device.sign(message)))
-        .expect("应答");
-    let verified = verifier.verify(&response, &master).expect("验证应当通过");
+        .expect("respond");
+    let verified = verifier
+        .verify(&response, &master)
+        .expect("verification should pass");
 
     assert_eq!(verified.session_id(), &responder.session_id());
     assert_eq!(verified.device_key().as_sec1_bytes(), &device.public);
@@ -634,7 +670,7 @@ fn challenge_response_confirms_both_sides() {
         verified.session_id(),
         &verified.confirmation(),
     )
-    .expect("确认应当通过");
+    .expect("confirmation should pass");
 }
 
 /// A party without the master key cannot answer, and a forged response must be rejected.
@@ -643,19 +679,19 @@ fn challenge_response_confirms_both_sides() {
 /// verification must fail with `Error::AuthProofFailed`.
 #[test]
 fn challenge_response_fails_without_the_master_key() {
-    let real = MasterKey::generate().expect("随机源可用");
-    let fake = MasterKey::generate().expect("随机源可用");
+    let real = MasterKey::generate().expect("rng present");
+    let fake = MasterKey::generate().expect("rng present");
     let device = Device::new(6);
 
-    let (challenge, verifier) = auth::begin().expect("发起挑战");
-    let responder = auth::accept(&challenge).expect("接受挑战");
+    let (challenge, verifier) = auth::begin().expect("begin the challenge");
+    let responder = auth::accept(&challenge).expect("accept the challenge");
     let response = responder
         .respond(&fake, &device.public, |message| Ok(device.sign(message)))
-        .expect("应答本身能构造出来");
+        .expect("the response itself can be built");
     let error = verifier
         .verify(&response, &real)
-        .expect_err("伪造的应答必须被拒绝");
-    assert!(matches!(error, Error::AuthProofFailed), "实际是 {error:?}");
+        .expect_err("a forged response must be rejected");
+    assert!(matches!(error, Error::AuthProofFailed), "actual: {error:?}");
 }
 
 // ── Wire-format contract ───────────────────────────────────────────────
@@ -689,22 +725,25 @@ fn protocol_lengths_are_stable() {
 fn a_second_vault_with_the_same_master_key_sees_nothing_until_sync() {
     let mut keys = SoftwareKeys::new();
     let mut store = MemoryStore::new(true);
-    let mut first = flow::registration(&mut keys, &mut store, LABEL).expect("注册");
+    let mut first = flow::registration(&mut keys, &mut store, LABEL).expect("register");
     let entry = vault::entry_from_parsed_uri(
         &qualia2fa_core::uri::parse("otpauth://totp/Sync:dave?secret=JBSWY3DPEHPK3PXP")
-            .expect("合法 URI"),
+            .expect("valid URI"),
         TEST_NOW,
     )
-    .expect("构造条目");
-    first.vault_mut().vault_mut().insert(entry).expect("插入");
-    let bytes = first.vault().serialize().expect("序列化");
+    .expect("build the entry");
+    first.vault_mut().vault_mut().insert(entry).expect("insert");
+    let bytes = first.vault().serialize().expect("serialize");
 
     let master = MasterKey::from_bytes(flow::master_key_to_bytes(first.vault().master_key()))
-        .expect("长度由构造保证");
+        .expect("the length is guaranteed by construction");
     let fresh = flow::empty_vault(master);
-    assert!(fresh.vault().is_empty(), "新保险库不该自带条目");
+    assert!(
+        fresh.vault().is_empty(),
+        "a new vault must not come with entries"
+    );
 
-    let opened = flow::open_vault(&store, &bytes).expect("同一把密钥应当能解开");
+    let opened = flow::open_vault(&store, &bytes).expect("the same key should open it");
     assert_eq!(opened.vault().len(), 1);
     assert!(fresh.vault().is_empty());
 }

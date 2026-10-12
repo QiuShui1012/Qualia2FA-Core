@@ -180,7 +180,9 @@ fn payload_of(vault: &Vault, master: &MasterKey, sender: DeviceId) -> Payload {
 
 /// Opens a payload into a set of semantic records suitable for deduplication.
 fn records_of(payload: &Payload, master: &MasterKey) -> RecordSet<MergedRecord> {
-    let opened = payload.open_records(master).expect("the records should open");
+    let opened = payload
+        .open_records(master)
+        .expect("the records should open");
     let mut set = RecordSet::new();
     for record in opened {
         set.insert(record.into_merged());
@@ -260,7 +262,7 @@ proptest! {
         );
 
         for (id, original) in vault.iter() {
-            let received = got_entries.get(id).expect("this entry is missing from what was received");
+            let received = got_entries.get(id).expect("the received set lacks this entry");
             prop_assert_eq!(&received.name, &original.name, "name");
             prop_assert_eq!(&received.issuer, &original.issuer, "issuer");
             prop_assert_eq!(&received.account, &original.account, "account");
@@ -279,7 +281,7 @@ proptest! {
         }
 
         for (id, original) in vault.iter_tombstones() {
-            let received = got_tombstones.get(id).expect("this tombstone is missing from what was received");
+            let received = got_tombstones.get(id).expect("the received set lacks this tombstone");
             prop_assert_eq!(received.deleted_at, original.deleted_at, "deleted_at");
             prop_assert_eq!(received.deleted_by, original.deleted_by, "deleted_by");
         }

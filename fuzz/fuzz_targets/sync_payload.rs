@@ -104,7 +104,7 @@ fuzz_target!(|data: &[u8]| {
 
     // ── Mode 3: round-trip of compression itself ────────────────────────────
     if let Ok(packed) = sync::compress::compress(data) {
-        let back = sync::compress::decompress(&packed).expect("a stream this target compressed itself must decompress again");
+        let back = sync::compress::decompress(&packed).expect("our own stream must decompress");
         assert_eq!(back, data, "the compression round trip changed the content");
     }
 });

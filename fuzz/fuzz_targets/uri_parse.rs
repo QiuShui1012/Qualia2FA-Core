@@ -141,9 +141,9 @@ fn check(text: &str) {
                 base32,
                 "the seed changed after the round trip"
             );
-            assert_eq!(reparsed.account, parsed.account, "the account changed after the round trip");
+            assert_eq!(reparsed.account, parsed.account, "account changed after the round trip");
             assert_eq!(reparsed.issuer, parsed.issuer, "the issuer changed after the round trip");
-            let again = uri::serialize(&reparsed).expect("it serialized once, so it must serialize again");
+            let again = uri::serialize(&reparsed).expect("it must serialize again");
             assert_eq!(again, roundtrip, "serialization is not idempotent");
         }
     }

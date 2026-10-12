@@ -115,21 +115,21 @@ proptest! {
 
         prop_assert!(
             lower.contains("redacted"),
-            "Debug 未标注脱敏（长度 {}）：{}",
+            "Debug does not carry the redaction marker (length {}): {}",
             data.len(),
             debug
         );
 
         if data.len() >= 4 {
             let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
-            prop_assert!(!lower.contains(&hex), "泄露十六进制明文：{}", debug);
+            prop_assert!(!lower.contains(&hex), "hexadecimal plaintext leaked: {}", debug);
 
             let decimal = data
                 .iter()
                 .map(u8::to_string)
                 .collect::<Vec<_>>()
                 .join("");
-            prop_assert!(!debug.contains(&decimal), "泄露十进制明文：{}", debug);
+            prop_assert!(!debug.contains(&decimal), "decimal plaintext leaked: {}", debug);
         }
     }
 
@@ -138,7 +138,7 @@ proptest! {
     fn debug_never_leaks_when_nested(data in arb_bytes()) {
         #[expect(
             dead_code,
-            reason = "字段仅用于构造 Debug 输出；这是本测试的全部意图"
+            reason = "the field only exists to build the Debug output"
         )]
         #[derive(Debug)]
         struct Holder {
@@ -155,7 +155,7 @@ proptest! {
             let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
             prop_assert!(
                 !debug.to_lowercase().contains(&hex),
-                "嵌套 Debug 泄露十六进制明文：{}",
+                "nested Debug leaked hexadecimal plaintext: {}",
                 debug
             );
         }
@@ -177,11 +177,11 @@ proptest! {
         let encoded = base32::encode(&data);
         prop_assert!(
             encoded.bytes().all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b) || b == b'='),
-            "编码含字母表外字符：{}",
+            "the encoding contains a character outside the alphabet: {}",
             encoded
         );
         let decoded = base32::decode_strict(&encoded)
-            .map_err(|e| TestCaseError::fail(format!("严格解码自己的编码失败：{e}（原文 {}）", encoded)))?;
+            .map_err(|e| TestCaseError::fail(format!("strict decoding of our own encoding failed: {e} (input {})", encoded)))?;
         prop_assert_eq!(decoded.expose_secret(), data.as_slice());
     }
 
@@ -195,7 +195,7 @@ proptest! {
         let padded = base32::encode(&data);
         let unpadded = padded.trim_end_matches('=');
         let decoded = base32::decode(unpadded)
-            .map_err(|e| TestCaseError::fail(format!("无填充解码失败：{e}")))?;
+            .map_err(|e| TestCaseError::fail(format!("unpadded decoding failed: {e}")))?;
         prop_assert_eq!(decoded.expose_secret(), data.as_slice());
     }
 
@@ -227,15 +227,15 @@ proptest! {
         digits in prop_oneof![Just(Digits::Six), Just(Digits::Seven), Just(Digits::Eight)],
     ) {
         let secret = OtpSecret::from_bytes(data)
-            .map_err(|e| TestCaseError::fail(format!("非空种子应被接受：{e}")))?;
+            .map_err(|e| TestCaseError::fail(format!("a non-empty seed must be accepted: {e}")))?;
         let code = otp::hotp_code(&secret, counter, algorithm, digits);
         prop_assert_eq!(code.len(), digits.count() as usize);
         prop_assert!(
             code.bytes().all(|b| b.is_ascii_digit()),
-            "含非数字字符：{}",
+            "contains a non-digit character: {}",
             code
         );
-        let numeric: u64 = code.parse().expect("应可解析为数字");
+        let numeric: u64 = code.parse().expect("it should parse as a number");
         prop_assert!(numeric < 10_u64.pow(digits.count()));
     }
 
@@ -246,10 +246,10 @@ proptest! {
         counter in any::<u64>(),
         digits in prop_oneof![Just(Digits::Six), Just(Digits::Seven), Just(Digits::Eight)],
     ) {
-        let secret = OtpSecret::from_bytes(data).expect("非空");
+        let secret = OtpSecret::from_bytes(data).expect("non-empty");
         let numeric = otp::hotp(&secret, counter, Algorithm::Sha1, digits);
         let formatted = otp::format_code(numeric, digits);
-        let reparsed: u64 = formatted.parse().expect("应可解析");
+        let reparsed: u64 = formatted.parse().expect("it parses");
         let expected = otp::hotp_code(&secret, counter, Algorithm::Sha1, digits);
         prop_assert_eq!(formatted, expected);
         prop_assert_eq!(reparsed, u64::from(numeric));
@@ -264,15 +264,15 @@ proptest! {
         period in 1_u64..=86_400,
         offset in 0_u64..86_400,
     ) {
-        let secret = OtpSecret::from_bytes(data).expect("非空");
+        let secret = OtpSecret::from_bytes(data).expect("non-empty");
         let base = time - (time % period);
         let same_step = base + (offset % period);
-        prop_assert_eq!(base / period, same_step / period, "构造应落在同一时间步");
+        prop_assert_eq!(base / period, same_step / period, "the setup must land in one step");
 
         let a = otp::totp_code(&secret, base, period, Algorithm::Sha1, Digits::Six)
-            .expect("period 非零");
+            .expect("period is non-zero");
         let b = otp::totp_code(&secret, same_step, period, Algorithm::Sha1, Digits::Six)
-            .expect("period 非零");
+            .expect("period is non-zero");
         prop_assert_eq!(a, b);
     }
 
@@ -283,9 +283,9 @@ proptest! {
         data in prop::collection::vec(any::<u8>(), 1..=64),
         counter in any::<u64>(),
     ) {
-        let secret = OtpSecret::from_bytes(data).expect("非空");
+        let secret = OtpSecret::from_bytes(data).expect("non-empty");
         let code = otp::hotp_code(&secret, counter, Algorithm::Sha1, Digits::Six);
-        prop_assert!(otp::verify_code(&code, &code), "自反性失败：{}", code);
+        prop_assert!(otp::verify_code(&code, &code), "reflexivity failed: {}", code);
         let too_long = format!("{code}0");
         let one_shorter = code[1..].to_owned();
         prop_assert!(!otp::verify_code(&code, &too_long));
@@ -299,13 +299,13 @@ proptest! {
         data in prop::collection::vec(any::<u8>(), 1..=64),
         time in 0_u64..1_000_000_000_000,
     ) {
-        let secret = OtpSecret::from_bytes(data).expect("非空");
+        let secret = OtpSecret::from_bytes(data).expect("non-empty");
         let code = otp::steam_guard_code(&secret, time, 30, Algorithm::Sha1)
-            .expect("period 非零");
+            .expect("period is non-zero");
         prop_assert_eq!(code.chars().count(), otp::STEAM_DIGITS);
         const ALPHABET: &str = "23456789BCDFGHJKMNPQRTVWXY";
         let all_in_alphabet = code.chars().all(|c| ALPHABET.contains(c));
-        prop_assert!(all_in_alphabet, "含字母表外字符：{}", code);
+        prop_assert!(all_in_alphabet, "contains a character outside the alphabet: {}", code);
     }
 }
 
@@ -371,7 +371,7 @@ fn arb_otp_auth() -> impl Strategy<Value = OtpAuth> {
                     } else {
                         UriType::Totp
                     },
-                    secret: OtpSecret::from_bytes(secret_bytes).expect("非空"),
+                    secret: OtpSecret::from_bytes(secret_bytes).expect("non-empty"),
                     issuer,
                     account,
                     algorithm,
@@ -394,30 +394,30 @@ proptest! {
     #[test]
     fn otpauth_uri_roundtrips(auth in arb_otp_auth()) {
         let text = uri::serialize(&auth)
-            .map_err(|e| TestCaseError::fail(format!("序列化失败：{e}")))?;
+            .map_err(|e| TestCaseError::fail(format!("serialization failed: {e}")))?;
         let parsed = uri::parse(&text)
-            .map_err(|e| TestCaseError::fail(format!("解析自己的输出失败：{e}\nURI: {text}")))?;
+            .map_err(|e| TestCaseError::fail(format!("parse failed: {e}\nURI: {text}")))?;
 
-        prop_assert_eq!(parsed.uri_type, auth.uri_type, "类型不同");
-        prop_assert_eq!(parsed.account.clone(), auth.account.clone(), "账号不同");
-        prop_assert_eq!(parsed.issuer.clone(), auth.issuer.clone(), "issuer 不同");
-        prop_assert_eq!(parsed.algorithm, auth.algorithm, "算法不同");
-        prop_assert_eq!(parsed.digits, auth.digits, "位数不同");
-        prop_assert_eq!(parsed.period, auth.period, "周期不同");
-        prop_assert_eq!(parsed.counter, auth.counter, "计数器不同");
+        prop_assert_eq!(parsed.uri_type, auth.uri_type, "the type differs");
+        prop_assert_eq!(parsed.account.clone(), auth.account.clone(), "the account differs");
+        prop_assert_eq!(parsed.issuer.clone(), auth.issuer.clone(), "the issuer differs");
+        prop_assert_eq!(parsed.algorithm, auth.algorithm, "the algorithm differs");
+        prop_assert_eq!(parsed.digits, auth.digits, "the digit count differs");
+        prop_assert_eq!(parsed.period, auth.period, "the period differs");
+        prop_assert_eq!(parsed.counter, auth.counter, "the counter differs");
         prop_assert_eq!(
             parsed.secret.to_base32(),
             auth.secret.to_base32(),
-            "种子不同"
+            "the secret differs"
         );
     }
 
     /// Property: serializing twice yields the same text — normalization is idempotent.
     #[test]
     fn otpauth_serialization_is_idempotent(auth in arb_otp_auth()) {
-        let once = uri::serialize(&auth).expect("应可序列化");
-        let parsed = uri::parse(&once).expect("自己的输出应可解析");
-        let twice = uri::serialize(&parsed).expect("应可序列化");
+        let once = uri::serialize(&auth).expect("it should serialize");
+        let parsed = uri::parse(&once).expect("our own output should parse");
+        let twice = uri::serialize(&parsed).expect("it should serialize");
         prop_assert_eq!(once, twice);
     }
 
@@ -456,7 +456,7 @@ proptest! {
     fn secret_length_survives_base32_roundtrip(data in prop::collection::vec(any::<u8>(), 1..=64)) {
         let encoded = base32::encode(&data);
         let secret = OtpSecret::from_base32(&encoded)
-            .map_err(|e| TestCaseError::fail(format!("从 Base32 构造种子失败：{e}")))?;
+            .map_err(|e| TestCaseError::fail(format!("cannot build the secret from Base32: {e}")))?;
         prop_assert_eq!(secret.len(), data.len());
         prop_assert_eq!(secret.to_base32(), encoded.trim_end_matches('='));
     }
@@ -494,13 +494,13 @@ fn regression_account_with_colon_is_rejected_on_both_ends() {
                 uri::parse(bad),
                 Err(qualia2fa_core::Error::UriAccountContainsColon { .. })
             ),
-            "{bad:?} 应因账号名含冒号被拒绝"
+            "{bad:?} should be rejected for a colon in the account name"
         );
     }
 
     let auth = OtpAuth {
         uri_type: UriType::Totp,
-        secret: OtpSecret::from_bytes(vec![1, 2, 3, 4]).expect("非空"),
+        secret: OtpSecret::from_bytes(vec![1, 2, 3, 4]).expect("non-empty"),
         issuer: Some("ACME".to_owned()),
         account: "john:8080".to_owned(),
         algorithm: Algorithm::Sha1,
@@ -510,15 +510,15 @@ fn regression_account_with_colon_is_rejected_on_both_ends() {
     };
     assert!(
         uri::serialize(&auth).is_err(),
-        "serialize 应拒绝含冒号的账号名"
+        "serialize should reject a colon in the account name"
     );
 
     let ok = OtpAuth {
         account: "john@example.com".to_owned(),
         ..auth
     };
-    let text = uri::serialize(&ok).expect("不含冒号应可序列化");
-    let parsed = uri::parse(&text).expect("应可解析");
+    let text = uri::serialize(&ok).expect("a colon-free account should serialize");
+    let parsed = uri::parse(&text).expect("it parses");
     assert_eq!(parsed.account, "john@example.com");
     assert_eq!(parsed.issuer.as_deref(), Some("ACME"));
 }
@@ -554,7 +554,7 @@ fn regression_scheme_stripping_never_panics_on_multibyte_boundary() {
         let _ = uri::parse(&format!("otpauth://totp/{text}?secret=AA"));
     }
 
-    let parsed = uri::parse("OTPAUTH://totp/a?secret=AA").expect("大小写不敏感的 scheme 应被接受");
+    let parsed = uri::parse("OTPAUTH://totp/a?secret=AA").expect("scheme is case-insensitive");
     assert_eq!(parsed.account, "a");
 }
 
@@ -567,33 +567,36 @@ fn regression_scheme_stripping_never_panics_on_multibyte_boundary() {
 #[test]
 fn regression_hotp_period_is_normalized_to_default() {
     let parsed = uri::parse("otpauth://hotp/acct?secret=JBSWY3DPEHPK3PXP&counter=0&period=1")
-        .expect("应可解析");
+        .expect("it parses");
     assert_eq!(parsed.uri_type, UriType::Hotp);
     assert_eq!(
         parsed.period,
         uri::DEFAULT_PERIOD,
-        "HOTP 的 period 应被归一为默认值"
+        "the HOTP period must be normalized to the default"
     );
 
-    let text = uri::serialize(&parsed).expect("应可序列化");
+    let text = uri::serialize(&parsed).expect("it should serialize");
     assert!(
         !text.contains("period="),
-        "HOTP 的序列化不应写出 period：{text}"
+        "HOTP serialization must not write a period: {text}"
     );
-    let reparsed = uri::parse(&text).expect("应可解析");
+    let reparsed = uri::parse(&text).expect("it parses");
     assert_eq!(reparsed.period, uri::DEFAULT_PERIOD);
 
     let totp =
-        uri::parse("otpauth://totp/acct?secret=JBSWY3DPEHPK3PXP&period=60").expect("应可解析");
-    assert_eq!(totp.period, 60, "TOTP 的非默认 period 应被保留");
-    let totp_text = uri::serialize(&totp).expect("应可序列化");
+        uri::parse("otpauth://totp/acct?secret=JBSWY3DPEHPK3PXP&period=60").expect("it parses");
+    assert_eq!(
+        totp.period, 60,
+        "a non-default TOTP period must be preserved"
+    );
+    let totp_text = uri::serialize(&totp).expect("it should serialize");
     assert!(
         totp_text.contains("period=60"),
-        "TOTP 应写出 period：{totp_text}"
+        "TOTP should write the period: {totp_text}"
     );
     assert_eq!(
-        uri::parse(&totp_text).expect("应可解析").period,
+        uri::parse(&totp_text).expect("it parses").period,
         60,
-        "TOTP period 往返应保持"
+        "the TOTP period must survive the round trip"
     );
 }

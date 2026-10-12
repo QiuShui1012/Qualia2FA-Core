@@ -393,7 +393,7 @@ proptest! {
         other[0] ^= delta;
         let other = MasterKey::from_bytes(other.into()).expect("the length is correct");
 
-        prop_assert!(VaultFile::parse(other, &bytes).is_err(), "a different master key could open it");
+        prop_assert!(VaultFile::parse(other, &bytes).is_err(), "a different key must not open it");
     }
 }
 

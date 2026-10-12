@@ -317,7 +317,7 @@ impl fmt::Display for SyncOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "新增 {}、墓碑 {}、应用删除 {}、未变 {}、冲突 {}",
+            "added {}, tombstones {}, deletions applied {}, unchanged {}, conflicts {}",
             self.merge.added,
             self.merge.tombstones_added,
             self.merge.deletions_applied,
@@ -370,9 +370,12 @@ impl SharePlan {
 impl fmt::Display for SharePlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Self::FullPayload { len } => write!(f, "整份载荷（{len} 字节）"),
+            Self::FullPayload { len } => write!(f, "full payload ({len} bytes)"),
             Self::LinkEstablishment { needed, limit } => {
-                write!(f, "装不下：需要 {needed} 字节，上限 {limit} 字节")
+                write!(
+                    f,
+                    "does not fit: {needed} bytes needed, limit {limit} bytes"
+                )
             }
         }
     }
@@ -642,8 +645,8 @@ mod tests {
         /// With `honest` set to `false` the claimed sender is replaced, which models a third
         /// party replaying someone else's payload unchanged on a broadcast channel.
         fn deliver_to(&self, target: &MemoryTransport, honest: bool) {
-            let outbox = self.outbox.lock().expect("锁未中毒");
-            let mut inbox = target.inbox.lock().expect("锁未中毒");
+            let outbox = self.outbox.lock().expect("lock not poisoned");
+            let mut inbox = target.inbox.lock().expect("lock not poisoned");
             for (recipient, sender, bytes) in outbox.iter() {
                 let addressed = match recipient {
                     Recipient::All => true,
@@ -663,14 +666,14 @@ mod tests {
         /// keeps the previous round's payload from being delivered twice, which the receiver
         /// would report as [`Error::SyncAlreadyApplied`].
         fn clear_outbox(&self) {
-            self.outbox.lock().expect("锁未中毒").clear();
+            self.outbox.lock().expect("lock not poisoned").clear();
         }
 
         /// Pushes a message straight into the inbound queue (models an attacker).
         fn inject(&self, claimed_sender: DeviceId, bytes: Vec<u8>) {
             self.inbox
                 .lock()
-                .expect("锁未中毒")
+                .expect("lock not poisoned")
                 .push((claimed_sender, bytes));
         }
     }
@@ -687,13 +690,13 @@ mod tests {
         fn send(&self, to: Recipient, message: &[u8]) -> Result<()> {
             self.outbox
                 .lock()
-                .expect("锁未中毒")
+                .expect("lock not poisoned")
                 .push((to, self.me, message.to_vec()));
             Ok(())
         }
 
         fn receive(&self) -> Result<(DeviceId, Vec<u8>)> {
-            let mut inbox = self.inbox.lock().expect("锁未中毒");
+            let mut inbox = self.inbox.lock().expect("lock not poisoned");
             if inbox.is_empty() {
                 return Err(Error::SyncNoSessionFound);
             }
@@ -706,7 +709,7 @@ mod tests {
     }
 
     fn a_device(seed: u8) -> (DeviceId, MasterKey, Vault) {
-        let master = MasterKey::generate().expect("OS 随机源可用");
+        let master = MasterKey::generate().expect("OS random source is available");
         (DeviceId::from_bytes([seed; 32]), master, Vault::new())
     }
 
@@ -715,7 +718,7 @@ mod tests {
             name.into(),
             Some("组织".into()),
             "user@example.com".into(),
-            OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("合法 Base32"),
+            OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("valid Base32"),
             Algorithm::Sha1,
             Digits::Six,
             30,
@@ -724,7 +727,7 @@ mod tests {
             Timestamp::from(1_700_000_000_u64),
             Timestamp::from(updated_at),
         )
-        .expect("字段合法")
+        .expect("the fields are valid")
     }
 
     /// A full two-party round trip: A's entry shows up in B's vault.
@@ -734,7 +737,7 @@ mod tests {
         let (id_b, _, mut vault_b) = a_device(2);
         vault_a
             .insert(sample_entry("A 的条目", 1_700_000_000))
-            .expect("随机源可用");
+            .expect("random source is available");
 
         let caps = TransportCapabilities::stream(Roster::TwoParty);
         let ta = MemoryTransport::new(id_a, caps).with_peers(vec![id_b]);
@@ -746,21 +749,31 @@ mod tests {
         let session_a = SyncSession::open(&master, &mut vault_a, &mut seen_a);
         session_a
             .send(&ta, Recipient::One(id_b), PayloadKind::Vault)
-            .expect("发送");
+            .expect("send");
 
         ta.deliver_to(&tb, true);
 
         let outcome = {
             let mut session_b = SyncSession::open(&master, &mut vault_b, &mut seen_b);
-            session_b.receive(&tb).expect("接收")
+            session_b.receive(&tb).expect("receive")
         };
 
-        assert_eq!(outcome.merge.added, 1, "应当并进来一条：{outcome}");
+        assert_eq!(
+            outcome.merge.added, 1,
+            "one record should have been merged: {outcome}"
+        );
         assert_eq!(vault_b.len(), 1);
-        assert!(!outcome.needs_adjudication(), "内容相同不该报冲突");
-        assert_eq!(seen_b.len(), 1, "收到之后应当记一笔");
+        assert!(
+            !outcome.needs_adjudication(),
+            "identical content must not count as a conflict"
+        );
+        assert_eq!(seen_b.len(), 1, "a received payload must be recorded");
 
-        assert_eq!(seen_a.len(), 0, "发出载荷不该记进重放日志");
+        assert_eq!(
+            seen_a.len(),
+            0,
+            "an outgoing payload must not enter the replay log"
+        );
 
         ta.deliver_to(&tb, true);
         let again = {
@@ -769,7 +782,7 @@ mod tests {
         };
         assert!(
             matches!(again, Err(Error::SyncAlreadyApplied)),
-            "重复的载荷未被拒绝，实际 {again:?}"
+            "a duplicate payload was not rejected, got {again:?}"
         );
     }
 
@@ -784,7 +797,7 @@ mod tests {
         let (id_c, _, mut vault_c) = a_device(3);
         vault_b
             .insert(sample_entry("B 的条目", 1_700_000_000))
-            .expect("随机源可用");
+            .expect("random source is available");
 
         let caps = TransportCapabilities::stream(Roster::MultiParty);
 
@@ -796,25 +809,25 @@ mod tests {
         let session_b = SyncSession::open(&master, &mut vault_b, &mut seen_b);
         session_b
             .send(&tb, Recipient::All, PayloadKind::Vault)
-            .expect("发送");
+            .expect("send");
 
         let b_payload = tb
             .outbox
             .lock()
-            .expect("锁未中毒")
+            .expect("lock not poisoned")
             .first()
             .map(|(_, _, bytes)| bytes.clone())
-            .expect("B 的出站里应当有那份载荷");
+            .expect("B's outbox should hold that payload");
 
         tb.deliver_to(&ta, true);
         let mut seen_a = SeenSyncIds::new();
         let outcome_a = {
             let mut session_a = SyncSession::open(&master, &mut vault_a, &mut seen_a);
-            session_a.receive(&ta).expect("A 正常收到")
+            session_a.receive(&ta).expect("A receives it normally")
         };
-        assert_eq!(outcome_a.merge.added, 1, "A 应当收下 B 的那条");
+        assert_eq!(outcome_a.merge.added, 1, "A should have taken B's record");
 
-        ta.send(Recipient::One(id_c), &b_payload).expect("转发");
+        ta.send(Recipient::One(id_c), &b_payload).expect("forward");
         ta.deliver_to(&tc, true);
 
         let mut seen_c = SeenSyncIds::new();
@@ -822,10 +835,14 @@ mod tests {
         let result = session_c.receive(&tc);
         assert!(
             matches!(result, Err(Error::SyncSenderMismatch)),
-            "被转发的载荷未被拒绝，实际 {result:?}"
+            "a forwarded payload was not rejected, got {result:?}"
         );
-        assert_eq!(vault_c.len(), 0, "被拒绝的载荷不得改动保险库");
-        assert_eq!(seen_c.len(), 0, "被拒绝的载荷不得记账");
+        assert_eq!(
+            vault_c.len(),
+            0,
+            "a rejected payload must not modify the vault"
+        );
+        assert_eq!(seen_c.len(), 0, "a rejected payload must not be recorded");
     }
 
     /// A payload from a peer outside the list is dropped.
@@ -836,7 +853,7 @@ mod tests {
         let (id_c, _, mut vault_c) = a_device(3);
         vault_b
             .insert(sample_entry("B 的条目", 1_700_000_000))
-            .expect("随机源可用");
+            .expect("random source is available");
 
         let caps = TransportCapabilities::stream(Roster::MultiParty);
         let tb = MemoryTransport::new(id_b, caps).with_peers(vec![id_c]);
@@ -845,7 +862,7 @@ mod tests {
         let mut seen_b = SeenSyncIds::new();
         SyncSession::open(&master, &mut vault_b, &mut seen_b)
             .send(&tb, Recipient::All, PayloadKind::Vault)
-            .expect("发送");
+            .expect("send");
         tb.deliver_to(&tc, true);
 
         let mut seen_c = SeenSyncIds::new();
@@ -856,7 +873,7 @@ mod tests {
         };
         assert!(
             matches!(result, Err(Error::SyncSenderMismatch)),
-            "名单外的对端未被拒绝，实际 {result:?}"
+            "a peer outside the list was not rejected, got {result:?}"
         );
         assert_eq!(vault_c.len(), 0);
     }
@@ -874,9 +891,9 @@ mod tests {
         let mut source_vault = Vault::new();
         source_vault
             .insert(sample_entry("条目", 1_700_000_000))
-            .expect("随机源可用");
-        let payload = Payload::from_vault(&master, id_b, &source_vault).expect("打包");
-        let sealed = payload.seal(&master).expect("封装");
+            .expect("random source is available");
+        let payload = Payload::from_vault(&master, id_b, &source_vault).expect("pack");
+        let sealed = payload.seal(&master).expect("seal");
         let good_id = payload.sync_id;
 
         let mut broken = sealed.clone();
@@ -891,17 +908,19 @@ mod tests {
             let mut session_a = SyncSession::open(&master, &mut vault_a, &mut seen_a);
             session_a.receive(&ta)
         };
-        assert!(result.is_err(), "被篡改的载荷应当被拒绝");
-        assert_eq!(seen_a.len(), 0, "被拒绝的载荷不得记账");
+        assert!(result.is_err(), "a tampered payload must be rejected");
+        assert_eq!(seen_a.len(), 0, "a rejected payload must not be recorded");
         assert!(
             !seen_a.contains(&good_id),
-            "垃圾载荷把合法载荷的标识污染了——真正的载荷将永远被拒绝"
+            "garbage poisoned the valid payload's id, so the real one is rejected forever"
         );
 
         ta.inject(id_b, sealed);
         let outcome = {
             let mut session_a = SyncSession::open(&master, &mut vault_a, &mut seen_a);
-            session_a.receive(&ta).expect("合法载荷应当被接受")
+            session_a
+                .receive(&ta)
+                .expect("a valid payload must be accepted")
         };
         assert_eq!(outcome.merge.added, 1);
         assert_eq!(seen_a.len(), 1);
@@ -915,7 +934,7 @@ mod tests {
         for i in 0..40_u64 {
             vault_a
                 .insert(sample_entry(&format!("条目 {i}"), 1_700_000_000 + i))
-                .expect("随机源可用");
+                .expect("random source is available");
         }
 
         let caps = TransportCapabilities::qr(4, 64);
@@ -928,14 +947,17 @@ mod tests {
         match result {
             Err(Error::TransportMessageTooLarge { needed, limit }) => {
                 assert_eq!(limit, 64);
-                assert!(needed > 64, "报出来的需求量 {needed} 应当大于上限");
+                assert!(
+                    needed > 64,
+                    "the reported need {needed} must exceed the limit"
+                );
             }
-            other => panic!("应当报「装不下」，实际 {other:?}"),
+            other => panic!("expected a does-not-fit error, got {other:?}"),
         }
 
         assert!(
-            ta.outbox.lock().expect("锁未中毒").is_empty(),
-            "装不下时不该已经往通道里写了东西"
+            ta.outbox.lock().expect("lock not poisoned").is_empty(),
+            "nothing may be written to the channel when it does not fit"
         );
     }
 
@@ -957,7 +979,7 @@ mod tests {
         let (id_c, _, mut vault_c) = a_device(3);
         vault_a
             .insert(sample_entry("A 的条目", 1_700_000_000))
-            .expect("随机源可用");
+            .expect("random source is available");
 
         let caps = TransportCapabilities::stream(Roster::MultiParty);
         let ta = MemoryTransport::new(id_a, caps).with_peers(vec![id_b, id_c]);
@@ -967,7 +989,7 @@ mod tests {
         let mut seen_a = SeenSyncIds::new();
         SyncSession::open(&master, &mut vault_a, &mut seen_a)
             .send(&ta, Recipient::All, PayloadKind::Vault)
-            .expect("广播");
+            .expect("broadcast");
 
         ta.deliver_to(&tb, true);
         ta.deliver_to(&tc, true);
@@ -975,13 +997,13 @@ mod tests {
         let mut seen_b = SeenSyncIds::new();
         let outcome_b = SyncSession::open(&master, &mut vault_b, &mut seen_b)
             .receive(&tb)
-            .expect("B 接收");
+            .expect("B receives");
         assert_eq!(outcome_b.merge.added, 1);
 
         let mut seen_c = SeenSyncIds::new();
         let outcome_c = SyncSession::open(&master, &mut vault_c, &mut seen_c)
             .receive(&tc)
-            .expect("C 接收");
+            .expect("C receives");
         assert_eq!(outcome_c.merge.added, 1);
 
         assert_eq!(vault_b.len(), 1);
@@ -999,7 +1021,7 @@ mod tests {
         let (id_c, _, mut vault_c) = a_device(3);
         vault_a
             .insert(sample_entry("只给 B", 1_700_000_000))
-            .expect("随机源可用");
+            .expect("random source is available");
 
         let caps = TransportCapabilities::stream(Roster::MultiParty);
         let ta = MemoryTransport::new(id_a, caps).with_peers(vec![id_b, id_c]);
@@ -1009,16 +1031,19 @@ mod tests {
         let mut seen_a = SeenSyncIds::new();
         SyncSession::open(&master, &mut vault_a, &mut seen_a)
             .send(&ta, Recipient::One(id_b), PayloadKind::Vault)
-            .expect("定向发送");
+            .expect("targeted send");
 
         ta.deliver_to(&tc, true);
         assert!(
-            tc.inbox.lock().expect("锁未中毒").is_empty(),
-            "定向发给 B 的消息送到了 C"
+            tc.inbox.lock().expect("lock not poisoned").is_empty(),
+            "a message addressed to B reached C"
         );
 
         ta.deliver_to(&tb, true);
-        assert!(!tb.inbox.lock().expect("锁未中毒").is_empty(), "应当送到 B");
+        assert!(
+            !tb.inbox.lock().expect("lock not poisoned").is_empty(),
+            "it must reach B"
+        );
         let _ = &mut vault_b;
         let _ = &mut vault_c;
     }
@@ -1030,7 +1055,7 @@ mod tests {
         let (id_b, _, mut vault_b) = a_device(2);
         vault_a
             .insert(sample_entry("同一条", 1_700_000_000))
-            .expect("随机源可用");
+            .expect("random source is available");
 
         let caps = TransportCapabilities::stream(Roster::TwoParty);
         let ta = MemoryTransport::new(id_a, caps).with_peers(vec![id_b]);
@@ -1039,27 +1064,30 @@ mod tests {
         let mut seen_a = SeenSyncIds::new();
         SyncSession::open(&master, &mut vault_a, &mut seen_a)
             .send(&ta, Recipient::One(id_b), PayloadKind::Vault)
-            .expect("发送");
+            .expect("send");
         ta.deliver_to(&tb, true);
         let mut seen_b = SeenSyncIds::new();
         let first = SyncSession::open(&master, &mut vault_b, &mut seen_b)
             .receive(&tb)
-            .expect("接收");
+            .expect("receive");
         assert_eq!(first.merge.added, 1);
-        assert!(!first.made_no_change(), "第一轮确实改了东西");
+        assert!(
+            !first.made_no_change(),
+            "the first round really did change something"
+        );
 
         ta.clear_outbox();
         SyncSession::open(&master, &mut vault_a, &mut seen_a)
             .send(&ta, Recipient::One(id_b), PayloadKind::Vault)
-            .expect("发送");
+            .expect("send");
         ta.deliver_to(&tb, true);
         let second = SyncSession::open(&master, &mut vault_b, &mut seen_b)
             .receive(&tb)
-            .expect("接收");
+            .expect("receive");
 
         assert!(
             second.made_no_change(),
-            "内容相同时应当报「无改动」，实际 {second}"
+            "identical content must report no change, got {second}"
         );
         assert!(!second.needs_adjudication());
     }
@@ -1076,13 +1104,13 @@ mod tests {
 
         vault_a
             .insert(sample_entry("A", 1_700_000_000))
-            .expect("随机源可用");
+            .expect("random source is available");
         vault_b
             .insert(sample_entry("B", 1_700_000_100))
-            .expect("随机源可用");
+            .expect("random source is available");
         vault_c
             .insert(sample_entry("C", 1_700_000_200))
-            .expect("随机源可用");
+            .expect("random source is available");
 
         let caps = TransportCapabilities::stream(Roster::MultiParty);
         let ta = MemoryTransport::new(id_a, caps).with_peers(vec![id_b, id_c]);
@@ -1099,13 +1127,13 @@ mod tests {
             tc.clear_outbox();
             SyncSession::open(&master, &mut vault_a, &mut seen_a)
                 .send(&ta, Recipient::All, PayloadKind::Vault)
-                .expect("A 广播");
+                .expect("A broadcasts");
             SyncSession::open(&master, &mut vault_b, &mut seen_b)
                 .send(&tb, Recipient::All, PayloadKind::Vault)
-                .expect("B 广播");
+                .expect("B broadcasts");
             SyncSession::open(&master, &mut vault_c, &mut seen_c)
                 .send(&tc, Recipient::All, PayloadKind::Vault)
-                .expect("C 广播");
+                .expect("C broadcasts");
 
             ta.deliver_to(&tb, true);
             ta.deliver_to(&tc, true);
@@ -1130,15 +1158,15 @@ mod tests {
                     match result {
                         Ok(_) => {}
                         Err(Error::SyncNoSessionFound) => break,
-                        Err(other) => panic!("不该出现的错误：{other:?}"),
+                        Err(other) => panic!("unexpected error: {other:?}"),
                     }
                 }
             }
         }
 
-        assert_eq!(vault_a.len(), 3, "A 应当有三条");
-        assert_eq!(vault_b.len(), 3, "B 应当有三条");
-        assert_eq!(vault_c.len(), 3, "C 应当有三条");
+        assert_eq!(vault_a.len(), 3, "A must have three records");
+        assert_eq!(vault_b.len(), 3, "B must have three records");
+        assert_eq!(vault_c.len(), 3, "C must have three records");
     }
 
     /// **Planning and sending must agree.**
@@ -1152,7 +1180,7 @@ mod tests {
         let (id_b, _, _) = a_device(2);
         vault_a
             .insert(sample_entry("条目", 1_700_000_000))
-            .expect("随机源可用");
+            .expect("random source is available");
 
         let roomy = MemoryTransport::new(id_a, TransportCapabilities::stream(Roster::TwoParty));
         let tiny = MemoryTransport::new(id_a, TransportCapabilities::qr(1, 8));
@@ -1160,31 +1188,34 @@ mod tests {
         let mut seen = SeenSyncIds::new();
         let session = SyncSession::open(&master, &mut vault_a, &mut seen);
 
-        let len = match session.plan_share(&roomy).expect("规划") {
+        let len = match session.plan_share(&roomy).expect("plan") {
             SharePlan::FullPayload { len } => len,
-            other => panic!("宽裕通道不该要求建链：{other}"),
+            other => panic!("a roomy channel must not require a link: {other}"),
         };
-        assert!(len > 0, "一条条目的载荷不可能是空的");
+        assert!(len > 0, "a payload with one entry cannot be empty");
         session
             .send(&roomy, Recipient::One(id_b), PayloadKind::Vault)
-            .expect("规划说装得下，发送就必须成功");
+            .expect("planning said it fits, so sending must succeed");
 
-        let plan = session.plan_share(&tiny).expect("规划");
+        let plan = session.plan_share(&tiny).expect("plan");
         match plan {
             SharePlan::LinkEstablishment { needed, limit } => {
-                assert_eq!(limit, 8, "上限应当来自通道的能力声明");
+                assert_eq!(
+                    limit, 8,
+                    "the limit must come from the channel's declared capability"
+                );
                 assert_eq!(
                     needed, len,
-                    "两次规划给出的载荷大小不一致——那说明封装不是确定性的长度"
+                    "the two plans disagree on the size, so sealing is not length-deterministic"
                 );
             }
-            other => panic!("装不下时应当要求建链：{other}"),
+            other => panic!("a channel that does not fit must require a link: {other}"),
         }
         let result = session.send(&tiny, Recipient::One(id_b), PayloadKind::Vault);
         let is_too_large = matches!(result, Err(Error::TransportMessageTooLarge { .. }));
         assert!(
             is_too_large,
-            "规划说装不下，发送也必须报「装不下」：{result:?}"
+            "planning said it does not fit, so sending must report the same: {result:?}"
         );
     }
 
@@ -1199,7 +1230,7 @@ mod tests {
         let (id_a, master, mut vault_a) = a_device(1);
         vault_a
             .insert(sample_entry("条目", 1_700_000_000))
-            .expect("随机源可用");
+            .expect("random source is available");
 
         let framed = MemoryTransport::new(id_a, TransportCapabilities::qr(40, 4096));
         let equivalent = MemoryTransport::new(
@@ -1227,14 +1258,14 @@ mod tests {
         let mut seen = SeenSyncIds::new();
         let session = SyncSession::open(&master, &mut vault_a, &mut seen);
         for (left, right, what) in [
-            (&framed, &equivalent, "宽裕"),
-            (&tiny_framed, &tiny_equivalent, "极小"),
+            (&framed, &equivalent, "roomy"),
+            (&tiny_framed, &tiny_equivalent, "tiny"),
         ] {
-            let a = session.plan_share(left).expect("规划");
-            let b = session.plan_share(right).expect("规划");
+            let a = session.plan_share(left).expect("plan");
+            let b = session.plan_share(right).expect("plan");
             assert_eq!(
                 a, b,
-                "{what}通道：同样的字节上限必须给出同样的答复（帧的有无不该影响这个判断）"
+                "{what} channel: the same limit must give the same answer (frames are irrelevant)"
             );
         }
     }
@@ -1250,20 +1281,23 @@ mod tests {
         for i in 0..64_u64 {
             vault_a
                 .insert(sample_entry(&format!("条目 {i}"), 1_700_000_000 + i))
-                .expect("随机源可用");
+                .expect("random source is available");
         }
         let transport =
             MemoryTransport::new(id_a, TransportCapabilities::stream(Roster::MultiParty));
         assert!(
             transport.capabilities().max_message_len.is_none(),
-            "字节流通道不该有单条上限"
+            "a byte-stream channel must have no per-message limit"
         );
 
         let mut seen = SeenSyncIds::new();
         let plan = SyncSession::open(&master, &mut vault_a, &mut seen)
             .plan_share(&transport)
-            .expect("规划");
-        assert!(!plan.needs_link(), "字节流通道不该要求建链：{plan}");
+            .expect("plan");
+        assert!(
+            !plan.needs_link(),
+            "a byte-stream channel must not require a link: {plan}"
+        );
     }
 
     /// **The first step of link establishment must actually work.**
@@ -1278,19 +1312,19 @@ mod tests {
         for i in 0..8_u64 {
             vault_a
                 .insert(sample_entry(&format!("条目 {i}"), 1_700_000_000 + i))
-                .expect("随机源可用");
+                .expect("random source is available");
         }
 
         let transport = MemoryTransport::new(id_a, TransportCapabilities::qr(10, 200));
         let mut seen = SeenSyncIds::new();
         let session = SyncSession::open(&master, &mut vault_a, &mut seen);
 
-        let plan = session.plan_share(&transport).expect("规划");
-        assert!(plan.needs_link(), "全量状态应当装不下：{plan}");
+        let plan = session.plan_share(&transport).expect("plan");
+        assert!(plan.needs_link(), "the full state must not fit: {plan}");
 
         session
             .send(&transport, Recipient::One(id_b), PayloadKind::Request)
-            .expect("请求必须装得下——否则「建链」这条路的第一步就不成立");
+            .expect("the request must fit, or link establishment cannot even start");
     }
 
     /// Conflicts are reported rather than silently resolved to one side.
@@ -1302,10 +1336,10 @@ mod tests {
         let shared = EntryId::from_bytes([9; EntryId::LEN]);
         vault_a
             .insert_with_id(shared, sample_entry("本机版本", 1_700_000_000))
-            .expect("插入");
+            .expect("insert");
         vault_b
             .insert_with_id(shared, sample_entry("对端版本", 1_700_000_500))
-            .expect("插入");
+            .expect("insert");
 
         let caps = TransportCapabilities::stream(Roster::TwoParty);
         let ta = MemoryTransport::new(id_a, caps).with_peers(vec![id_b]);
@@ -1314,23 +1348,23 @@ mod tests {
         let mut seen_a = SeenSyncIds::new();
         SyncSession::open(&master, &mut vault_a, &mut seen_a)
             .send(&ta, Recipient::One(id_b), PayloadKind::Vault)
-            .expect("发送");
+            .expect("send");
         ta.deliver_to(&tb, true);
 
         let mut seen_b = SeenSyncIds::new();
         let outcome = SyncSession::open(&master, &mut vault_b, &mut seen_b)
             .receive(&tb)
-            .expect("接收");
+            .expect("receive");
 
         assert!(
             outcome.needs_adjudication(),
-            "两端内容不同时应当报冲突，实际 {outcome}"
+            "divergent content must be reported as a conflict, got {outcome}"
         );
         assert_eq!(outcome.merge.conflicts.len(), 1);
         assert_eq!(
-            vault_b.get(&shared).expect("条目还在").name,
+            vault_b.get(&shared).expect("the entry is still there").name,
             "对端版本",
-            "冲突不该自动改掉本地内容"
+            "a conflict must not silently overwrite local content"
         );
     }
 
@@ -1342,15 +1376,15 @@ mod tests {
         let mut source = VaultAlias::new();
         source
             .insert(sample_entry("来自别处", 1_700_000_000))
-            .expect("随机源可用");
+            .expect("random source is available");
 
         let payload =
-            Payload::from_vault(&master, DeviceId::from_bytes([2; 32]), &source).expect("打包");
+            Payload::from_vault(&master, DeviceId::from_bytes([2; 32]), &source).expect("pack");
         let mut set = RecordSet::new();
-        for record in payload.open_records(&master).expect("解密") {
+        for record in payload.open_records(&master).expect("decrypt") {
             set.insert(record.into_merged());
         }
-        let outcome = merge_into(&mut vault, &set).expect("合并");
+        let outcome = merge_into(&mut vault, &set).expect("merge");
         assert_eq!(outcome.added, 1);
         assert_eq!(vault.len(), 1);
     }
