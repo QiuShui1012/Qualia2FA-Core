@@ -7,16 +7,18 @@ edition = "2024"
 # The 1.89 floor comes from the crypto stack (the tightest is aes 0.9.3); this crate's
 # own code compiles on 1.85, so 1.89 leaves headroom for upstream tightening.
 rust-version = "1.89"
-description = "Qualia2FA 核心库：TOTP/HOTP 原语、加密保险库与设备同步逻辑"
+description = "Qualia2FA core library: TOTP/HOTP primitives, encrypted vault and device sync"
 license = "LGPL-3.0-or-later"
 
-# The upstream repository URL. This repository is consumed as a git submodule by the
-# UI side; `cargo doc` and a future `cargo publish` (currently `publish = false`) use it.
+# The upstream repository URL, used by `cargo doc`, crates.io and the publish workflow.
 repository = "https://github.com/Qualia2FA/Qualia2FA-Core"
 readme = "README.md"
 keywords = ["2fa", "totp", "hotp", "otp", "authentication"]
 categories = ["authentication", "cryptography"]
-publish = false
+# CI configuration, the dependency audit manifest and the fuzz targets are not part of
+# the published package: they are meaningless to users, and the size and contents of a
+# crates.io package are publicly visible.
+exclude = ["/.github", "/deny.toml", "/fuzz"]
 
 [dependencies]
 # ── Passphrase derivation for the recovery key ───────────────────
