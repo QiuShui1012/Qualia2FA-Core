@@ -736,7 +736,7 @@ mod tests {
         let (id_a, master, mut vault_a) = a_device(1);
         let (id_b, _, mut vault_b) = a_device(2);
         vault_a
-            .insert(sample_entry("A 的条目", 1_700_000_000))
+            .insert(sample_entry("A's entry", 1_700_000_000))
             .expect("random source is available");
 
         let caps = TransportCapabilities::stream(Roster::TwoParty);
@@ -796,7 +796,7 @@ mod tests {
         let (id_b, _, mut vault_b) = a_device(2);
         let (id_c, _, mut vault_c) = a_device(3);
         vault_b
-            .insert(sample_entry("B 的条目", 1_700_000_000))
+            .insert(sample_entry("B's entry", 1_700_000_000))
             .expect("random source is available");
 
         let caps = TransportCapabilities::stream(Roster::MultiParty);
@@ -852,7 +852,7 @@ mod tests {
         let (id_b, _, mut vault_b) = a_device(2);
         let (id_c, _, mut vault_c) = a_device(3);
         vault_b
-            .insert(sample_entry("B 的条目", 1_700_000_000))
+            .insert(sample_entry("B's entry", 1_700_000_000))
             .expect("random source is available");
 
         let caps = TransportCapabilities::stream(Roster::MultiParty);
@@ -890,7 +890,7 @@ mod tests {
 
         let mut source_vault = Vault::new();
         source_vault
-            .insert(sample_entry("条目", 1_700_000_000))
+            .insert(sample_entry("entry", 1_700_000_000))
             .expect("random source is available");
         let payload = Payload::from_vault(&master, id_b, &source_vault).expect("pack");
         let sealed = payload.seal(&master).expect("seal");
@@ -933,7 +933,7 @@ mod tests {
         let (id_b, _, _) = a_device(2);
         for i in 0..40_u64 {
             vault_a
-                .insert(sample_entry(&format!("条目 {i}"), 1_700_000_000 + i))
+                .insert(sample_entry(&format!("entry {i}"), 1_700_000_000 + i))
                 .expect("random source is available");
         }
 
@@ -978,7 +978,7 @@ mod tests {
         let (id_b, _, mut vault_b) = a_device(2);
         let (id_c, _, mut vault_c) = a_device(3);
         vault_a
-            .insert(sample_entry("A 的条目", 1_700_000_000))
+            .insert(sample_entry("A's entry", 1_700_000_000))
             .expect("random source is available");
 
         let caps = TransportCapabilities::stream(Roster::MultiParty);
@@ -1020,7 +1020,7 @@ mod tests {
         let (id_b, _, mut vault_b) = a_device(2);
         let (id_c, _, mut vault_c) = a_device(3);
         vault_a
-            .insert(sample_entry("只给 B", 1_700_000_000))
+            .insert(sample_entry("only to B", 1_700_000_000))
             .expect("random source is available");
 
         let caps = TransportCapabilities::stream(Roster::MultiParty);
@@ -1054,7 +1054,7 @@ mod tests {
         let (id_a, master, mut vault_a) = a_device(1);
         let (id_b, _, mut vault_b) = a_device(2);
         vault_a
-            .insert(sample_entry("同一条", 1_700_000_000))
+            .insert(sample_entry("the same one", 1_700_000_000))
             .expect("random source is available");
 
         let caps = TransportCapabilities::stream(Roster::TwoParty);
@@ -1179,7 +1179,7 @@ mod tests {
         let (id_a, master, mut vault_a) = a_device(1);
         let (id_b, _, _) = a_device(2);
         vault_a
-            .insert(sample_entry("条目", 1_700_000_000))
+            .insert(sample_entry("entry", 1_700_000_000))
             .expect("random source is available");
 
         let roomy = MemoryTransport::new(id_a, TransportCapabilities::stream(Roster::TwoParty));
@@ -1229,7 +1229,7 @@ mod tests {
     fn the_share_plan_depends_only_on_the_declared_byte_limit() {
         let (id_a, master, mut vault_a) = a_device(1);
         vault_a
-            .insert(sample_entry("条目", 1_700_000_000))
+            .insert(sample_entry("entry", 1_700_000_000))
             .expect("random source is available");
 
         let framed = MemoryTransport::new(id_a, TransportCapabilities::qr(40, 4096));
@@ -1280,7 +1280,7 @@ mod tests {
         let (id_a, master, mut vault_a) = a_device(1);
         for i in 0..64_u64 {
             vault_a
-                .insert(sample_entry(&format!("条目 {i}"), 1_700_000_000 + i))
+                .insert(sample_entry(&format!("entry {i}"), 1_700_000_000 + i))
                 .expect("random source is available");
         }
         let transport =
@@ -1311,7 +1311,7 @@ mod tests {
         let (id_b, _, _) = a_device(2);
         for i in 0..8_u64 {
             vault_a
-                .insert(sample_entry(&format!("条目 {i}"), 1_700_000_000 + i))
+                .insert(sample_entry(&format!("entry {i}"), 1_700_000_000 + i))
                 .expect("random source is available");
         }
 
@@ -1335,10 +1335,10 @@ mod tests {
 
         let shared = EntryId::from_bytes([9; EntryId::LEN]);
         vault_a
-            .insert_with_id(shared, sample_entry("本机版本", 1_700_000_000))
+            .insert_with_id(shared, sample_entry("local version", 1_700_000_000))
             .expect("insert");
         vault_b
-            .insert_with_id(shared, sample_entry("对端版本", 1_700_000_500))
+            .insert_with_id(shared, sample_entry("peer version", 1_700_000_500))
             .expect("insert");
 
         let caps = TransportCapabilities::stream(Roster::TwoParty);
@@ -1363,7 +1363,7 @@ mod tests {
         assert_eq!(outcome.merge.conflicts.len(), 1);
         assert_eq!(
             vault_b.get(&shared).expect("the entry is still there").name,
-            "对端版本",
+            "peer version",
             "a conflict must not silently overwrite local content"
         );
     }
@@ -1375,7 +1375,7 @@ mod tests {
         let (_, master, mut vault) = a_device(1);
         let mut source = VaultAlias::new();
         source
-            .insert(sample_entry("来自别处", 1_700_000_000))
+            .insert(sample_entry("from elsewhere", 1_700_000_000))
             .expect("random source is available");
 
         let payload =

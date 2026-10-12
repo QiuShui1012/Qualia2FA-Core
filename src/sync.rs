@@ -891,7 +891,7 @@ mod tests {
     /// Build one valid entry.
     fn sample_entry(seed: u8) -> VaultEntry {
         VaultEntry::new(
-            format!("服务 {seed}"),
+            format!("entry {seed}"),
             Some("组织".into()),
             format!("user{seed}@example.com"),
             OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("valid Base32"),
