@@ -29,12 +29,18 @@
 //!
 //! | 方式 | 队形 | 单条上限 | 说明 |
 //! |------|------|----------|------|
-//! | 二维码 | 两方 | 有（几千字节，随版本变化） | 一次性、带外 |
+//! | 二维码 | 两方 | 有（一张几千字节，装不下时拆成多张） | 一次性、带外 |
 //! | 局域网（QWBP） | 多方 | 无（可靠字节流） | 主要方式 |
 //! | 热点 | 多方 | 无 | 局域网的一种，平台差异在实现里 |
 //!
 //! 三者的差别全部被 [`TransportCapabilities`] 描述，因此 [`SyncSession`] 不需要为
 //! 它们各写一条分支。
+//!
+//! **「一条消息」不等于「一个物理制品」。** 二维码装不下时可以连续显示多张、由对端
+//! 逐张扫回来拼成一份载荷（动态二维码），而核心库对这一层是**无感**的：通道声明的是
+//! 「一条消息能带过去多少字节」（各张之和），帧怎么切、怎么拼都属于通道实现。核心库
+//! 因此不需要认识「帧」——它比较的始终是字节数，见
+//! [`TransportCapabilities::max_message_len`]。
 //!
 //! # 两方与多方的分工（用户要求）
 //!
@@ -98,6 +104,21 @@ pub enum Recipient {
 ///
 /// 远期要支持智能手表时，唯一变化的就是这里的一个数字——那是把它做成能力声明的
 /// 全部理由。
+///
+/// # 一条消息可以横跨多个物理制品
+///
+/// 二维码装不下整份载荷时，通道可以把同一条消息**连续显示成好几张码**（动态二维码），
+/// 由对端逐张扫、拼回原来的字节；将来别的通道也可能有自己的分片方式（多个文件、多段
+/// 剪贴板）。核心库对这一层**刻意无感**：
+///
+/// - [`TransportCapabilities::max_message_len`] 说的是**一条消息**（各制品合起来）能
+///   带过去的字节数，而不是单个制品的字节数；
+/// - 核心库没有「帧数」这个字段，也不该有：切几张、每张多大是通道实现的事，而多一
+///   个字段就多一处「声明与实现不一致」的机会。
+///
+/// 两处的数字必须来自**同一个计算**：声明给这里的那一个，与通道真正拆帧时用的那一个。
+/// 平台侧的多帧二维码通道用 `qualia-transport` 的
+/// `QrProfile::exchange_capacity(max_frames)` 得到它——那里同时也是渲染时用的容量。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportCapabilities {
     /// 队形。
@@ -106,6 +127,9 @@ pub struct TransportCapabilities {
     ///
     /// 二维码是 `Some`：它的容量随版本变化，且**装不下就是装不下**，没有重试余地。
     /// 局域网是 `None`：那是字节流，几千条记录的载荷照发。
+    ///
+    /// **多帧通道填的是各张码之和**，不是一张码的容量（见类型文档的「一条消息可以
+    /// 横跨多个物理制品」）。
     pub max_message_len: Option<usize>,
     /// 展示二维码时允许的最大版本（1–40）。
     ///
@@ -142,9 +166,14 @@ impl TransportCapabilities {
 
     /// 一条**定长**通道（二维码）。
     ///
-    /// `max_message_len` 是这条码在给定版本下能装的字节数，由平台侧按纠错级别算好。
+    /// `max_message_len` 是这条通道**一条消息**能带的字节数：单张码时就是那张码的
+    /// 容量（由平台侧按纠错级别算好），多张码时是[各张之和](TransportCapabilities)。
     /// 这里不接受「版本号」作为输入，因为「40 版能装多少字节」取决于纠错级别与编码
     /// 模式，而那是平台库的事——核心库替它算，就是把一个易变的表抄进来。
+    ///
+    /// **多帧的通道请把这个数字取自同一个计算。** 平台侧拆帧时用的容量与声明在这里的
+    /// 上限必须一致，否则核心库会批准一份这份载荷渲染不出来的分享。多帧二维码用
+    /// `qualia-transport` 的 `QrProfile::exchange_capacity(max_frames)`。
     #[must_use]
     pub const fn qr(max_qr_version: u8, max_message_len: usize) -> Self {
         Self {
@@ -158,6 +187,10 @@ impl TransportCapabilities {
     }
 
     /// 这条通道能否装下一份 `len` 字节的载荷。
+    ///
+    /// `len` 是**一条消息**的字节数；多帧通道上它对应的是各帧之和，而不是某一帧。
+    /// 这是「装不装得下」的**唯一**判据：规划与发送都必须走它，否则会出现「规划说
+    /// 装得下、发送却报错」——用户那时已经举着手机在扫了。
     ///
     /// # 错误
     ///
@@ -1171,6 +1204,61 @@ mod tests {
             is_too_large,
             "规划说装不下，发送也必须报「装不下」：{result:?}"
         );
+    }
+
+    /// **核心库不认识「帧」：分享的抉择只看声明出来的字节上限。**
+    ///
+    /// 一条「多帧二维码」通道在这里与「同上限的字节流通道」完全同形。这条测试把那个
+    /// 设计判断钉住——若将来有人往 [`TransportCapabilities`] 里加一个「帧数」并让
+    /// [`TransportCapabilities::check_fits`] 用它，两个答复就会分叉，而分叉的症状是
+    /// 「核心库说装得下、通道却渲染不出来」。
+    #[test]
+    fn the_share_plan_depends_only_on_the_declared_byte_limit() {
+        let (id_a, master, mut vault_a) = a_device(1);
+        vault_a
+            .insert(sample_entry("条目", 1_700_000_000))
+            .expect("随机源可用");
+
+        // 同一套字节上限的两种通道：一条自称多帧二维码（4 张 × 1024 字节），一条是
+        // 结构体字面量写出来的「同上限的字节流」。两者除字节上限之外处处不同。
+        let framed = MemoryTransport::new(id_a, TransportCapabilities::qr(40, 4096));
+        let equivalent = MemoryTransport::new(
+            id_a,
+            TransportCapabilities {
+                roster: Roster::MultiParty,
+                max_message_len: Some(4096),
+                max_qr_version: None,
+                single_use: false,
+                can_carry_payload: true,
+            },
+        );
+        // 同上限的「极小通道」，用来看装不下那一侧的答复是否也只由数字决定。
+        let tiny_framed = MemoryTransport::new(id_a, TransportCapabilities::qr(1, 8));
+        let tiny_equivalent = MemoryTransport::new(
+            id_a,
+            TransportCapabilities {
+                roster: Roster::TwoParty,
+                max_message_len: Some(8),
+                max_qr_version: None,
+                single_use: false,
+                can_carry_payload: true,
+            },
+        );
+
+        let mut seen = SeenSyncIds::new();
+        let session = SyncSession::open(&master, &mut vault_a, &mut seen);
+        // 两组通道各比一次：宽裕的那一对走「整份发」，极小的那一对走「建链」。
+        for (left, right, what) in [
+            (&framed, &equivalent, "宽裕"),
+            (&tiny_framed, &tiny_equivalent, "极小"),
+        ] {
+            let a = session.plan_share(left).expect("规划");
+            let b = session.plan_share(right).expect("规划");
+            assert_eq!(
+                a, b,
+                "{what}通道：同样的字节上限必须给出同样的答复（帧的有无不该影响这个判断）"
+            );
+        }
     }
 
     /// 字节流通道没有上限，「建链」这条路对它永远用不上。
