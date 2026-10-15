@@ -13,7 +13,7 @@ Qualia2FA 的核心库。承载双因素认证（2FA）的全部核心逻辑：T
 | 项 | 值 |
 |---|---|
 | Crate 名 | `qualia2fa-core` |
-| 版本 | `0.1.0` |
+| 版本 | `0.1.1` |
 | 类型 | 纯 library crate |
 | Edition | 2024 |
 | MSRV | **1.89** |
