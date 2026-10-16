@@ -46,6 +46,7 @@ use proptest::prelude::*;
 use qualia2fa_core::base32;
 use qualia2fa_core::otp::{self, Algorithm, Digits, OtpSecret};
 use qualia2fa_core::uri::{self, OtpAuth, UriType};
+use qualia2fa_core::vault::EntryKind;
 use qualia2fa_core::{ExposeSecret, SecretBytes, SecretString};
 
 /// Generates an arbitrary byte sequence.
@@ -350,7 +351,6 @@ fn arb_label_text() -> impl Strategy<Value = String> {
 /// states.
 fn arb_otp_auth() -> impl Strategy<Value = OtpAuth> {
     (
-        prop::collection::vec(any::<u8>(), 1..=64),
         arb_label_text(),
         prop::option::of(arb_label_text()),
         prop_oneof![
@@ -359,25 +359,67 @@ fn arb_otp_auth() -> impl Strategy<Value = OtpAuth> {
             Just(Algorithm::Sha512)
         ],
         prop_oneof![Just(Digits::SIX), Just(Digits::SEVEN), Just(Digits::EIGHT)],
+        prop::collection::vec(any::<u8>(), 1..=64),
+        any::<[u8; 16]>(),
         1_u64..=604_800,
-        any::<bool>(),
         any::<u64>(),
+        prop::option::of("[0-9]{1,12}"),
+        0_u8..5,
     )
         .prop_map(
-            |(secret_bytes, account, issuer, algorithm, digits, period, is_hotp, counter)| {
+            |(
+                account,
+                issuer,
+                algorithm,
+                digits,
+                secret_bytes,
+                yandex_bytes,
+                period,
+                counter,
+                pin,
+                type_selector,
+            )| {
+                let secret =
+                    OtpSecret::from_bytes(secret_bytes).expect("the generator is non-empty");
+                let (kind, secret, algorithm, digits) = match type_selector {
+                    0 => (EntryKind::Totp { period }, secret, algorithm, digits),
+                    1 => (EntryKind::Hotp { counter }, secret, algorithm, digits),
+                    2 => (
+                        EntryKind::Motp {
+                            period,
+                            pin: pin.map(qualia2fa_core::motp::MotpPin::new),
+                        },
+                        secret,
+                        Algorithm::Sha1,
+                        digits,
+                    ),
+                    3 => (
+                        EntryKind::Yandex {
+                            period,
+                            pin: pin.map(qualia2fa_core::yaotp::YandexPin::new),
+                        },
+                        OtpSecret::from_bytes(yandex_bytes.to_vec())
+                            .expect("sixteen bytes is non-empty"),
+                        Algorithm::Sha256,
+                        digits,
+                    ),
+                    _ => (EntryKind::Steam, secret, Algorithm::Sha1, Digits::FIVE),
+                };
+                // The Yandex issuer is filled in by parsing when the URI names none, so an
+                // auth without it is not a state a URI can produce. Generating one would make
+                // the property fail on the normalization rather than on a real difference.
+                let issuer = match kind {
+                    EntryKind::Yandex { .. } => issuer.or_else(|| Some("Yandex".to_owned())),
+                    _ => issuer,
+                };
+
                 OtpAuth {
-                    uri_type: if is_hotp {
-                        UriType::Hotp
-                    } else {
-                        UriType::Totp
-                    },
-                    secret: OtpSecret::from_bytes(secret_bytes).expect("non-empty"),
+                    kind,
+                    secret,
                     issuer,
                     account,
                     algorithm,
                     digits,
-                    period: if is_hotp { uri::DEFAULT_PERIOD } else { period },
-                    counter: is_hotp.then_some(counter),
                 }
             },
         )
@@ -398,13 +440,12 @@ proptest! {
         let parsed = uri::parse(&text)
             .map_err(|e| TestCaseError::fail(format!("parse failed: {e}\nURI: {text}")))?;
 
-        prop_assert_eq!(parsed.uri_type, auth.uri_type, "the type differs");
+        prop_assert_eq!(parsed.uri_type(), auth.uri_type(), "the type differs");
         prop_assert_eq!(parsed.account.clone(), auth.account.clone(), "the account differs");
         prop_assert_eq!(parsed.issuer.clone(), auth.issuer.clone(), "the issuer differs");
         prop_assert_eq!(parsed.algorithm, auth.algorithm, "the algorithm differs");
         prop_assert_eq!(parsed.digits, auth.digits, "the digit count differs");
-        prop_assert_eq!(parsed.period, auth.period, "the period differs");
-        prop_assert_eq!(parsed.counter, auth.counter, "the counter differs");
+        prop_assert_eq!(&parsed.kind, &auth.kind, "the kind differs");
         prop_assert_eq!(
             parsed.secret.to_base32(),
             auth.secret.to_base32(),
@@ -499,14 +540,14 @@ fn regression_account_with_colon_is_rejected_on_both_ends() {
     }
 
     let auth = OtpAuth {
-        uri_type: UriType::Totp,
+        kind: EntryKind::Totp {
+            period: uri::DEFAULT_PERIOD,
+        },
         secret: OtpSecret::from_bytes(vec![1, 2, 3, 4]).expect("non-empty"),
         issuer: Some("ACME".to_owned()),
         account: "john:8080".to_owned(),
         algorithm: Algorithm::Sha1,
         digits: Digits::SIX,
-        period: uri::DEFAULT_PERIOD,
-        counter: None,
     };
     assert!(
         uri::serialize(&auth).is_err(),
@@ -560,19 +601,34 @@ fn regression_scheme_stripping_never_panics_on_multibyte_boundary() {
 
 /// HOTP always carries [`uri::DEFAULT_PERIOD`].
 ///
-/// `serialize` writes no `period` for HOTP, and `parse` normalizes any `period` read from a
-/// HOTP URI to [`uri::DEFAULT_PERIOD`]: HOTP advances by counter, so `period` has no meaning
-/// for it. `OtpAuth` therefore has no state in which HOTP carries a non-default `period`, and
-/// a serialize/parse round trip cannot produce one.
+/// A `period` on an HOTP URI is **rejected**, and HOTP serialization writes none.
+///
+/// HOTP advances by counter, so a step has no meaning for it. Accepting the parameter and
+/// quietly dropping it would leave the user with a configuration they believe in and the code
+/// does not implement, which is the failure mode this library refuses elsewhere; and `OtpAuth`
+/// has no state in which HOTP carries a step, so a round trip could not even preserve it.
 #[test]
-fn regression_hotp_period_is_normalized_to_default() {
-    let parsed = uri::parse("otpauth://hotp/acct?secret=JBSWY3DPEHPK3PXP&counter=0&period=1")
-        .expect("it parses");
-    assert_eq!(parsed.uri_type, UriType::Hotp);
+fn regression_hotp_carries_no_period() {
+    let rejected = uri::parse("otpauth://hotp/acct?secret=JBSWY3DPEHPK3PXP&counter=0&period=1");
+    assert!(
+        matches!(
+            rejected,
+            Err(qualia2fa_core::Error::UriParameterNotSupported {
+                parameter: "period",
+                ..
+            })
+        ),
+        "a period on an HOTP URI must be rejected, actual ok={}",
+        rejected.is_ok()
+    );
+
+    let parsed =
+        uri::parse("otpauth://hotp/acct?secret=JBSWY3DPEHPK3PXP&counter=0").expect("it parses");
+    assert_eq!(parsed.uri_type(), UriType::Hotp);
     assert_eq!(
-        parsed.period,
-        uri::DEFAULT_PERIOD,
-        "the HOTP period must be normalized to the default"
+        parsed.kind,
+        EntryKind::Hotp { counter: 0 },
+        "HOTP carries a counter and no step"
     );
 
     let text = uri::serialize(&parsed).expect("it should serialize");
@@ -580,13 +636,16 @@ fn regression_hotp_period_is_normalized_to_default() {
         !text.contains("period="),
         "HOTP serialization must not write a period: {text}"
     );
-    let reparsed = uri::parse(&text).expect("it parses");
-    assert_eq!(reparsed.period, uri::DEFAULT_PERIOD);
+    assert_eq!(
+        uri::parse(&text).expect("it parses").kind,
+        EntryKind::Hotp { counter: 0 }
+    );
 
     let totp =
         uri::parse("otpauth://totp/acct?secret=JBSWY3DPEHPK3PXP&period=60").expect("it parses");
     assert_eq!(
-        totp.period, 60,
+        totp.kind,
+        EntryKind::Totp { period: 60 },
         "a non-default TOTP period must be preserved"
     );
     let totp_text = uri::serialize(&totp).expect("it should serialize");
@@ -595,8 +654,8 @@ fn regression_hotp_period_is_normalized_to_default() {
         "TOTP should write the period: {totp_text}"
     );
     assert_eq!(
-        uri::parse(&totp_text).expect("it parses").period,
-        60,
+        uri::parse(&totp_text).expect("it parses").kind,
+        EntryKind::Totp { period: 60 },
         "the TOTP period must survive the round trip"
     );
 }

@@ -192,6 +192,28 @@ impl EntryKind {
         }
     }
 
+    /// Normalizes an empty PIN to "no PIN".
+    ///
+    /// **Invariant: a PIN is either absent or non-empty.** The storage format cannot tell an
+    /// empty pin node from an absent one, so allowing both would give one state two
+    /// representations — and two devices holding the same PIN in the two representations would
+    /// disagree about whether their entries are equal, which is exactly what the sync merge
+    /// compares. Same reasoning as the issuer invariant on [`Entry`].
+    #[must_use]
+    pub(crate) fn without_empty_pin(self) -> Self {
+        match self {
+            Self::Motp { period, pin } => Self::Motp {
+                period,
+                pin: pin.filter(|pin| !pin.is_empty()),
+            },
+            Self::Yandex { period, pin } => Self::Yandex {
+                period,
+                pin: pin.filter(|pin| !pin.is_empty()),
+            },
+            other => other,
+        }
+    }
+
     /// The mOTP PIN, for a variant that has one.
     #[must_use]
     pub const fn motp_pin(&self) -> Option<&crate::motp::MotpPin> {
@@ -218,6 +240,12 @@ impl EntryKind {
 /// deserialization, so getters would only add noise. The one distinction is `secret`,
 /// whose type [`otp::OtpSecret`] offers neither `Clone` nor a plaintext `Debug` output,
 /// so secret handling is enforced by the type rather than by visibility.
+///
+/// # Invariant: a PIN is absent or non-empty
+///
+/// The same rule as the issuer below, for the same reason: the storage format cannot represent
+/// an empty PIN apart from a missing one, so a value that cannot survive a round trip must not
+/// be constructible. [`Entry::new`] normalizes it.
 ///
 /// # Invariant: `issuer` is `None`, never `Some("")`
 ///
@@ -402,6 +430,7 @@ impl Entry {
         if kind.period() == Some(0) {
             return Err(Error::InvalidPeriod);
         }
+        let kind = kind.without_empty_pin();
         for (field, value) in [
             ("name", Some(&name)),
             ("issuer", issuer.as_ref()),
@@ -432,54 +461,46 @@ impl Entry {
         })
     }
 
-    /// The `otpauth://` type that can express this entry, if any.
+    /// The URI type of this entry.
     ///
-    /// [`None`] means the scheme has no URI representation in this library **yet** (mOTP,
-    /// Yandex OTP and Steam Guard are stored and computed, but their URI forms are not
-    /// implemented). Returning an option rather than a default keeps a caller from silently
-    /// writing an mOTP entry out as TOTP, which is a code that never works.
+    /// Every kind has one: mOTP is written as `motp:/…` and Yandex OTP and Steam Guard as
+    /// `otpauth://yaotp/…` and `otpauth://steam/…`.
     #[must_use]
-    pub const fn uri_type(&self) -> Option<crate::uri::UriType> {
-        match self.kind {
-            EntryKind::Totp { .. } => Some(crate::uri::UriType::Totp),
-            EntryKind::Hotp { .. } => Some(crate::uri::UriType::Hotp),
-            EntryKind::Motp { .. } | EntryKind::Yandex { .. } | EntryKind::Steam => None,
-        }
+    pub const fn uri_type(&self) -> crate::uri::UriType {
+        crate::uri::UriType::of(&self.kind)
     }
 }
 
-/// Builds an entry from a parsed `otpauth://` result.
+/// Builds an entry from a parsed URI.
 ///
 /// This is the step joining a scanned QR configuration to the storage model of this
 /// library. `now` is the current Unix second supplied by the caller (this library reads no
 /// clock) and is used as both the creation and the modification time.
 ///
+/// # It takes the parsed configuration by value
+///
+/// A secret is neither [`Clone`] nor copyable out of its container, and an [`EntryKind`] holds
+/// a PIN, which is not [`Clone`] either. Taking ownership moves both into the entry instead of
+/// rebuilding them, so no copy of key material is made on this path.
+///
 /// # Errors
 ///
 /// The same checks as [`Entry::new`], so a URI that parsed normally does not fail here:
-/// `uri::parse` already guarantees a non-empty secret and a non-zero `period`. Both checks
-/// are kept so that the invariants of [`Entry`] do not depend on the order of calls.
-pub fn entry_from_parsed_uri(parsed: &crate::uri::OtpAuth, now: Timestamp) -> Result<Entry> {
-    let secret = otp::OtpSecret::from_base32(&parsed.secret.to_base32())?;
+/// `uri::parse` already guarantees a non-empty secret and a non-zero time step. Both checks are
+/// kept so that the invariants of [`Entry`] do not depend on the order of calls.
+pub fn entry_from_parsed_uri(parsed: crate::uri::OtpAuth, now: Timestamp) -> Result<Entry> {
     let name = match &parsed.issuer {
         Some(issuer) => format!("{issuer}:{}", parsed.account),
         None => parsed.account.clone(),
     };
     Entry::new(
         name,
-        parsed.issuer.clone(),
-        parsed.account.clone(),
-        secret,
+        parsed.issuer,
+        parsed.account,
+        parsed.secret,
         parsed.algorithm,
         parsed.digits,
-        match parsed.uri_type {
-            crate::uri::UriType::Totp => EntryKind::Totp {
-                period: parsed.period,
-            },
-            crate::uri::UriType::Hotp => EntryKind::Hotp {
-                counter: parsed.counter.ok_or(Error::UriMissingCounter)?,
-            },
-        },
+        parsed.kind,
         String::new(),
         now,
         now,
@@ -623,13 +644,12 @@ mod tests {
         assert_eq!(blank.issuer.as_deref(), Some("   "));
     }
 
-    /// Every kind whose scheme has an `otpauth://` form maps to it; the others report `None`
-    /// rather than silently claiming to be TOTP.
+    /// Every kind maps to its own URI type; none of them silently claims to be TOTP.
     #[test]
-    fn uri_type_covers_totp_and_hotp_only() {
+    fn every_kind_maps_to_its_own_uri_type() {
         assert_eq!(
             sample_entry().uri_type(),
-            Some(crate::uri::UriType::Totp),
+            crate::uri::UriType::Totp,
             "a TOTP entry"
         );
 
@@ -646,7 +666,7 @@ mod tests {
             0,
         )
         .expect("valid entry");
-        assert_eq!(hotp.uri_type(), Some(crate::uri::UriType::Hotp));
+        assert_eq!(hotp.uri_type(), crate::uri::UriType::Hotp);
         assert_eq!(hotp.kind, EntryKind::Hotp { counter: 7 });
 
         for kind in [
@@ -675,10 +695,97 @@ mod tests {
             .expect("valid entry");
             assert_eq!(
                 entry.uri_type(),
-                None,
-                "this scheme has no URI form yet, and must not claim TOTP"
+                crate::uri::UriType::of(&entry.kind),
+                "the URI type follows the kind"
+            );
+            assert_ne!(
+                entry.uri_type(),
+                crate::uri::UriType::Totp,
+                "a scheme of its own must not be written out as TOTP"
             );
         }
+    }
+
+    /// **Invariant test**: an empty PIN is normalized to "no PIN" by the constructor, and a
+    /// non-empty one is kept.
+    ///
+    /// The storage format cannot represent "a PIN that is present but empty" apart from "no
+    /// PIN", so a value that cannot survive a round trip must not be constructible: two devices
+    /// holding the same PIN in the two representations would disagree about whether their
+    /// entries are equal, and the sync merge compares exactly that.
+    #[test]
+    fn an_empty_pin_is_normalized_to_none() {
+        let empty = Entry::new(
+            "x".into(),
+            None,
+            "a".into(),
+            sample_secret(),
+            otp::Algorithm::Sha1,
+            otp::Digits::SIX,
+            EntryKind::Motp {
+                period: 10,
+                pin: Some(crate::motp::MotpPin::new(String::new())),
+            },
+            String::new(),
+            0,
+            0,
+        )
+        .expect("the remaining fields are valid");
+        assert_eq!(
+            empty.kind,
+            EntryKind::Motp {
+                period: 10,
+                pin: None,
+            },
+            "an empty mOTP PIN must normalize to None"
+        );
+
+        let empty_yandex = Entry::new(
+            "x".into(),
+            None,
+            "a".into(),
+            sample_secret(),
+            otp::Algorithm::Sha256,
+            otp::Digits::EIGHT,
+            EntryKind::Yandex {
+                period: 30,
+                pin: Some(crate::yaotp::YandexPin::new(String::new())),
+            },
+            String::new(),
+            0,
+            0,
+        )
+        .expect("the remaining fields are valid");
+        assert_eq!(
+            empty_yandex.kind,
+            EntryKind::Yandex {
+                period: 30,
+                pin: None,
+            },
+            "an empty Yandex PIN must normalize to None"
+        );
+
+        let with_pin = Entry::new(
+            "x".into(),
+            None,
+            "a".into(),
+            sample_secret(),
+            otp::Algorithm::Sha1,
+            otp::Digits::SIX,
+            EntryKind::Motp {
+                period: 10,
+                pin: Some(crate::motp::MotpPin::new("1234".to_owned())),
+            },
+            String::new(),
+            0,
+            0,
+        )
+        .expect("the remaining fields are valid");
+        assert_eq!(
+            with_pin.kind.motp_pin().map(crate::motp::MotpPin::len),
+            Some(4),
+            "a real PIN must be kept"
+        );
     }
 
     /// `step_seconds` answers for every kind that changes with time, including the one whose
@@ -796,18 +903,20 @@ mod tests {
         let parsed =
             crate::uri::parse("otpauth://totp/GitHub:alice?secret=JBSWY3DPEHPK3PXP&issuer=GitHub")
                 .expect("valid URI");
-        let entry = entry_from_parsed_uri(&parsed, 1_700_000_000).expect("conversion succeeds");
+        let expected_secret = parsed.secret.to_base32();
+        let entry = entry_from_parsed_uri(parsed, 1_700_000_000).expect("conversion succeeds");
         assert_eq!(entry.issuer.as_deref(), Some("GitHub"));
         assert_eq!(entry.account, "alice");
         assert_eq!(entry.name, "GitHub:alice");
-        assert_eq!(entry.uri_type(), Some(crate::uri::UriType::Totp));
+        assert_eq!(entry.uri_type(), crate::uri::UriType::Totp);
+        assert_eq!(entry.kind, EntryKind::Totp { period: 30 });
         assert!(entry.note.is_empty());
         assert_eq!(entry.created_at, 1_700_000_000);
         assert_eq!(entry.created_at, entry.updated_at);
 
         assert_eq!(
             entry.secret.to_base32(),
-            parsed.secret.to_base32(),
+            expected_secret,
             "the secret changed after conversion"
         );
     }

@@ -1103,7 +1103,7 @@ mod tests {
         let parsed = uri::parse("otpauth://totp/ACME:alice?secret=JBSWY3DPEHPK3PXP&issuer=ACME")
             .expect("the URI should be valid");
         const NOW: Timestamp = 1_700_000_000;
-        let entry = entry_from_parsed_uri(&parsed, NOW).expect("the entry should be built");
+        let entry = entry_from_parsed_uri(parsed, NOW).expect("the entry should be built");
         result
             .vault_mut()
             .vault_mut()

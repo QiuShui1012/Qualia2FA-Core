@@ -1045,7 +1045,11 @@ fn assemble_entry_kind(f: &mut Fields) -> Result<EntryKind> {
             }
             Ok(EntryKind::Motp {
                 period: f.period.ok_or(Error::VaultCorrupt)?,
-                pin: f.motp_pin.take().map(crate::motp::MotpPin::new),
+                pin: f
+                    .motp_pin
+                    .take()
+                    .filter(|text| !text.is_empty())
+                    .map(crate::motp::MotpPin::new),
             })
         }
         tag::KIND_YANDEX => {
@@ -1054,7 +1058,11 @@ fn assemble_entry_kind(f: &mut Fields) -> Result<EntryKind> {
             }
             Ok(EntryKind::Yandex {
                 period: f.period.ok_or(Error::VaultCorrupt)?,
-                pin: f.yandex_pin.take().map(crate::yaotp::YandexPin::new),
+                pin: f
+                    .yandex_pin
+                    .take()
+                    .filter(|text| !text.is_empty())
+                    .map(crate::yaotp::YandexPin::new),
             })
         }
         tag::KIND_STEAM => {
@@ -1359,7 +1367,7 @@ mod tests {
         assert_eq!(restored.kind, EntryKind::Hotp { counter: 42 });
         assert_eq!(
             restored.uri_type(),
-            Some(crate::uri::UriType::Hotp),
+            crate::uri::UriType::Hotp,
             "the restored entry is still HOTP"
         );
     }

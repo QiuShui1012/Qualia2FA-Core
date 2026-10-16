@@ -152,6 +152,8 @@ fn truncate_for_error(value: &str) -> String {
 pub struct Digits(u8);
 
 impl Digits {
+    /// Five characters: the Steam Guard code length (its alphabet is not decimal).
+    pub const FIVE: Self = Self(5);
     /// Six digits: the default, and what almost every service uses.
     pub const SIX: Self = Self(6);
     /// Seven digits (some banks).

@@ -20,9 +20,10 @@ Qualia2FA 的核心库。承载双因素认证（2FA）的全部核心逻辑：T
 | 开发工具链 | `stable`（由 `rust-toolchain.toml` 固定） |
 | 许可证 | `LGPL-3.0-or-later` |
 
-已实现：HOTP（RFC 4226）、TOTP（RFC 6238）、Base32（RFC 4648，宽容与严格两种
-模式）、`otpauth://` 解析与序列化、Steam Guard、加密保险库（本地存储格式）、
-恢复密钥、挑战-应答认证、设备配对、同步载荷与合并，以及传输层协议。
+已实现：HOTP（RFC 4226）、TOTP（RFC 6238）、mOTP、Yandex OTP、Steam Guard、Base32
+（RFC 4648，宽容与严格两种模式）、URI 解析与序列化（`otpauth://` 与 Aegis 的 `motp:`）、
+加密保险库（本地存储格式）、恢复密钥、挑战-应答认证、设备配对、同步载荷与合并，
+以及传输层协议。
 
 ## 用法
 

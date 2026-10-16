@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this library; if not, see <https://www.gnu.org/licenses/>.
 
-//! `otpauth://` URI parsing (Google Authenticator Key URI Format).
+//! `otpauth://` URI parsing (Google Authenticator Key URI Format), plus the `motp:` scheme.
 //!
 //! This is the project's **primary attacker-controlled input surface**: QR code
 //! contents, links typed by the user and clipboard text all end up here. The
@@ -24,40 +24,62 @@
 //! # URI structure
 //!
 //! ```text
-//! otpauth://TYPE/LABEL?PARAMETERS
+//! otpauth://TYPE/LABEL?PARAMETERS      for totp, hotp, motp, yaotp and steam
+//! motp:/LABEL?PARAMETERS               the shape Aegis writes for mOTP
 //! ```
 //!
-//! - `TYPE` is `totp` or `hotp`.
+//! - `TYPE` is `totp`, `hotp`, `motp`, `yaotp` or `steam`.
 //! - `LABEL` is `accountname` or `issuer:accountname`; both parts are
 //!   percent-decoded. **The account name itself must not contain `:`** (see the
 //!   rejection rules below).
 //! - `PARAMETERS` is `key=value&...`, decoded as
 //!   `application/x-www-form-urlencoded`.
 //!
+//! The `motp:` form has no authority component and carries its secret as **Hex**, which is
+//! what the only implementation of that scheme writes. Both mOTP forms are read; `serialize`
+//! writes `motp:`.
+//!
 //! # Supported parameters
 //!
 //! | Parameter | Required | Value | Default |
 //! |---|---|---|---|
-//! | `secret` | **required** | Base32 | — |
-//! | `issuer` | optional | text | — |
-//! | `algorithm` | optional | `SHA1` / `SHA256` / `SHA512` | `SHA1` |
-//! | `digits` | optional | `1` … `9` | `6` |
-//! | `period` | optional | seconds, non-zero | `30` |
+//! | `secret` | **required** | Base32, or Hex for the `motp:` form | — |
+//! | `issuer` | optional | text | `Yandex` for `yaotp` |
+//! | `algorithm` | optional | `SHA1` / `SHA256` / `SHA512` | `SHA1` (`SHA256` for `yaotp`) |
+//! | `digits` | optional | `1` … `9` | `6` (`8` for `yaotp`, `5` for `steam`) |
+//! | `period` | optional | seconds, non-zero | `30` (`10` for `motp`) |
 //! | `counter` | **required for HOTP** | integer | — |
+//! | `pin` | optional | Base32 (decoded to UTF-8) | — |
+//!
+//! `pin` is read for `motp` and `yaotp` only. It is this library's own extension for mOTP: the
+//! reference implementation's URI has no such parameter, so without it an exported entry comes
+//! back without its PIN and every code it produces is wrong.
+//!
+//! # Which parameters mean something, per type
+//!
+//! `algorithm` and `digits` are read back out of the entry for `totp` and `hotp` only, and
+//! `period` for everything except `hotp` (which advances by counter). The other combinations
+//! are **rejected**, not ignored: a value that is silently dropped is a configuration the user
+//! believes in and the code does not implement. `yaotp` additionally accepts only SHA-256,
+//! because its eight-byte truncation would read past the end of a shorter digest.
 //!
 //! # Rejection rules (all covered by tests)
 //!
-//! - the scheme is not `otpauth`, or the type is neither `totp` nor `hotp`
-//! - `secret` is missing, or `secret` cannot be Base32-decoded
+//! - the scheme is neither `otpauth://` nor `motp:`, or the type is not one of the five
+//! - `secret` is missing, or cannot be decoded (Base32, or Hex for the `motp:` form)
+//! - a Yandex secret is neither 16 nor 26 bytes, or 26 bytes with a mismatching checksum
 //! - `algorithm` is unrecognised — **rejected rather than falling back to
 //!   SHA-1**, because a silent fallback gives the user a permanently wrong code
 //!   and leaves nothing to diagnose
 //! - `digits` is not the canonical decimal form of a count from 1 to 9: `0` and `10`
 //!   are rejected with their own reasons (see [`crate::otp::Digits`]) and anything
 //!   non-canonical, such as `06`, is rejected as malformed
-//! - `period` is 0 or cannot be parsed
+//! - `period` is 0 or cannot be parsed, or appears for a type that has none
 //! - `totp` carries a `counter`, or `hotp` lacks a `counter`
 //! - `counter` cannot be parsed as an integer
+//! - a parameter that means nothing for the type is present (`pin` outside `motp`/`yaotp`,
+//!   `algorithm` on `motp`, `period` or `counter` on `steam`, and so on)
+//! - `pin` is not valid Base32, or decodes to bytes that are not UTF-8
 //! - **duplicate parameters** (the same key appearing twice) — implementations
 //!   disagree on whether the first or the last occurrence wins, a classic
 //!   parsing ambiguity, so this is rejected outright
@@ -68,45 +90,132 @@
 //!   not save it either). `serialize` rejects it as well, so both ends agree.
 
 use crate::otp::{Algorithm, Digits, OtpSecret};
-use crate::{Error, Result};
+use crate::vault::EntryKind;
+use crate::{Error, ExposeSecret as _, Result};
 
 /// The type declared by the URI.
+///
+/// Each variant names a **scheme**, not a hash function: `Motp`, `Yandex` and `Steam` fix
+/// their own algorithm and code shape, and only `Totp` / `Hotp` let the URI choose among
+/// SHA-1, SHA-256 and SHA-512.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UriType {
     /// Time-based one-time password (RFC 6238).
     Totp,
     /// Counter-based one-time password (RFC 4226).
     Hotp,
+    /// mOTP: MD5-based, ten-second step, optional PIN ([`crate::motp`]).
+    Motp,
+    /// Yandex OTP: SHA-256 based, eight letters, thirty-second step ([`crate::yaotp`]).
+    Yandex,
+    /// Steam Guard: five characters, fixed thirty-second step ([`crate::otp`]).
+    Steam,
 }
 
 impl UriType {
     /// Parses the URI's authority part.
     ///
-    /// Case-insensitive: the specification writes `totp`/`hotp`, but some
-    /// generators emit upper case.
+    /// Case-insensitive: the Key URI Format writes `totp`/`hotp`, and generators vary in case.
     fn parse(value: &str) -> Result<Self> {
         if value.eq_ignore_ascii_case("totp") {
             Ok(Self::Totp)
         } else if value.eq_ignore_ascii_case("hotp") {
             Ok(Self::Hotp)
+        } else if value.eq_ignore_ascii_case("motp") {
+            Ok(Self::Motp)
+        } else if value.eq_ignore_ascii_case("yaotp") {
+            Ok(Self::Yandex)
+        } else if value.eq_ignore_ascii_case("steam") {
+            Ok(Self::Steam)
         } else {
             Err(Error::UriUnsupportedType {
                 name: truncate(value, 16),
             })
         }
     }
+
+    /// The URI type of an entry kind.
+    #[must_use]
+    pub const fn of(kind: &EntryKind) -> Self {
+        match kind {
+            EntryKind::Totp { .. } => Self::Totp,
+            EntryKind::Hotp { .. } => Self::Hotp,
+            EntryKind::Motp { .. } => Self::Motp,
+            EntryKind::Yandex { .. } => Self::Yandex,
+            EntryKind::Steam => Self::Steam,
+        }
+    }
+
+    /// The authority an `otpauth://` URI writes for this type.
+    const fn authority(self) -> &'static str {
+        match self {
+            Self::Totp => "totp",
+            Self::Hotp => "hotp",
+            Self::Motp => "motp",
+            Self::Yandex => "yaotp",
+            Self::Steam => "steam",
+        }
+    }
+
+    /// The name used in error messages and diagnostics.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Totp => "totp",
+            Self::Hotp => "hotp",
+            Self::Motp => "motp",
+            Self::Yandex => "yaotp",
+            Self::Steam => "steam",
+        }
+    }
+
+    /// The default digit count of this type.
+    ///
+    /// `Totp` / `Hotp` default to six (RFC 4226 §4); mOTP is six hexadecimal characters;
+    /// Yandex OTP is eight **letters**; Steam Guard is five characters from its own alphabet.
+    /// Only the first two read the digit count back out of the entry — for the others the code
+    /// shape is fixed by the scheme, and the stored count is metadata that keeps an imported
+    /// entry faithful to its source.
+    pub const fn default_digits(self) -> Digits {
+        match self {
+            Self::Totp | Self::Hotp | Self::Motp => Digits::SIX,
+            Self::Yandex => Digits::EIGHT,
+            Self::Steam => Digits::FIVE,
+        }
+    }
+
+    /// The time step this type **stores**, and its default.
+    ///
+    /// [`None`] for HOTP (which advances by counter) and for Steam Guard (whose
+    /// [`crate::otp::STEAM_PERIOD`] is fixed by the scheme rather than carried by the entry). The
+    /// distinction is what makes a `period` parameter on those two a rejection rather than a
+    /// value that is read and then dropped: an entry cannot hold it, so honouring it is
+    /// impossible.
+    ///
+    /// Use [`crate::vault::EntryKind::step_seconds`] for the effective refresh interval, which
+    /// answers for Steam Guard as well.
+    pub const fn default_period(self) -> Option<u64> {
+        match self {
+            Self::Totp | Self::Yandex => Some(DEFAULT_PERIOD),
+            Self::Motp => Some(crate::motp::PERIOD),
+            Self::Hotp | Self::Steam => None,
+        }
+    }
 }
 
-/// A parsed `otpauth://` configuration.
+/// A parsed `otpauth://` (or `motp:`) configuration.
 ///
 /// `Debug` is **hand-written** because the struct holds a secret
 /// ([`OtpSecret`]): a derived `Debug` would delegate to each field's `Debug`,
-/// and although `OtpSecret` redacts itself, the hand-written form lets a
+/// and although `OtpSecret` and the PIN types redact themselves, the hand-written form lets a
 /// reviewer confirm at a glance that no field can leak.
 pub struct OtpAuth {
-    /// Whether the entry is TOTP or HOTP.
-    pub uri_type: UriType,
-    /// OTP secret. Validated to be non-empty.
+    /// Which scheme this configuration describes, with the state that belongs to it: the time
+    /// step, the HOTP counter and any PIN.
+    ///
+    /// The same type the entry model stores, so a scanned configuration becomes an entry by
+    /// copying fields rather than by re-deciding what it means.
+    pub kind: EntryKind,
+    /// OTP secret. Validated to be non-empty (and, for Yandex, to carry a valid checksum).
     pub secret: OtpSecret,
     /// Issuer (service name). Taken from the `issuer` parameter or the label
     /// prefix.
@@ -115,17 +224,24 @@ pub struct OtpAuth {
     /// label).
     pub account: String,
     /// Hash algorithm.
+    ///
+    /// Meaningful only for [`UriType::Totp`] and [`UriType::Hotp`]: the other schemes fix their
+    /// algorithm (mOTP is MD5-based, Yandex OTP is SHA-256, Steam Guard is SHA-1), and a URI
+    /// that asks for something else for them is rejected rather than accepted and ignored.
     pub algorithm: Algorithm,
     /// Digit count.
-    pub digits: Digits,
-    /// TOTP time step in seconds.
     ///
-    /// **Invariant**: meaningful only for [`UriType::Totp`]. HOTP advances by
-    /// counter, not by time, so for an HOTP entry this field is always
-    /// [`DEFAULT_PERIOD`]. Parsing normalises it and trusts nothing the URI says.
-    pub period: u64,
-    /// HOTP counter. `None` for TOTP.
-    pub counter: Option<u64>,
+    /// Meaningful only for [`UriType::Totp`] and [`UriType::Hotp`]; see
+    /// [`UriType::default_digits`].
+    pub digits: Digits,
+}
+
+impl OtpAuth {
+    /// The URI type of this configuration.
+    #[must_use]
+    pub const fn uri_type(&self) -> UriType {
+        UriType::of(&self.kind)
+    }
 }
 
 /// Maximum printed length (bytes) of the `issuer` / `account` fields in `Debug`.
@@ -136,12 +252,12 @@ const DEBUG_MAX_FIELD: usize = 64;
 impl core::fmt::Debug for OtpAuth {
     /// Hand-written for two reasons:
     ///
-    /// 1. **It never prints the secret.** `OtpSecret`'s own `Debug` redacts
+    /// 1. **It never prints the secret or the PIN.** `OtpSecret`'s own `Debug` redacts
     ///    itself, but the hand-written form lets a reviewer confirm at a glance
     ///    that no path can carry the secret out.
     /// 2. **It truncates `issuer` / `account`.** Both fields come from an
-    ///    attacker-controlled URI and are unbounded in length; they are **not
-    ///    secret but may be private** (real-world values are commonly
+    ///    attacker-controlled URI and are unbounded in length; they are **not**
+    ///    secret but may be private (real-world values are commonly
     ///    `issuer = "GitHub"`, `account = "alice@example.com"`). Printing them
     ///    unbounded would let a malicious QR code push arbitrary amounts of text
     ///    into logs, and such logs are often attached to issue trackers.
@@ -153,7 +269,7 @@ impl core::fmt::Debug for OtpAuth {
     /// against log amplification and privacy spill.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("OtpAuth")
-            .field("uri_type", &self.uri_type)
+            .field("uri_type", &self.uri_type())
             .field("secret", &"<redacted>")
             .field(
                 "issuer",
@@ -162,8 +278,7 @@ impl core::fmt::Debug for OtpAuth {
             .field("account", &truncate(&self.account, DEBUG_MAX_FIELD))
             .field("algorithm", &self.algorithm)
             .field("digits", &self.digits)
-            .field("period", &self.period)
-            .field("counter", &self.counter)
+            .field("kind", &self.kind)
             .finish()
     }
 }
@@ -186,9 +301,16 @@ fn truncate(value: &str, max: usize) -> String {
     out
 }
 
-/// Parses an `otpauth://` URI.
+/// Parses an OTP configuration URI.
 ///
-/// Rules and rejection conditions are in the [module documentation](self).
+/// Two shapes are accepted:
+///
+/// - `otpauth://<type>/<label>?<parameters>` for every type, with `totp`, `hotp`, `motp`,
+///   `yaotp` and `steam` as the type;
+/// - `motp:/<label>?<parameters>`, the shape Aegis writes for mOTP, whose `secret` is **Hex**
+///   rather than Base32.
+///
+/// The other rules, and every rejection condition, are in the [module documentation](self).
 /// A `#` (fragment) does not exist in this format; if one appears it counts as
 /// part of the query and is rejected while the parameters are parsed, because it
 /// cannot form a valid `key=value`.
@@ -205,78 +327,296 @@ fn truncate(value: &str, max: usize) -> String {
 /// assert_eq!(parsed.account, "alice");
 /// assert_eq!(parsed.digits, Digits::EIGHT);
 /// assert_eq!(parsed.algorithm, Algorithm::Sha1);
+/// assert_eq!(parsed.kind, qualia2fa_core::vault::EntryKind::Totp { period: 30 });
 /// ```
 pub fn parse(input: &str) -> Result<OtpAuth> {
-    // ── 1. Split off the scheme ─────────────────────────────────────────
-    let after_scheme =
-        strip_prefix_ignore_ascii_case(input, "otpauth://").ok_or(Error::UriUnsupportedScheme)?;
-
-    // ── 2. Split off the query ──────────────────────────────────────────
-    let (path_and_authority, query) = match after_scheme.split_once('?') {
+    // ── 1. Split off the scheme and the query ───────────────────────────
+    let (uri_type, secret_form, after_authority) = split_scheme(input)?;
+    let (path, query) = match after_authority.split_once('?') {
         Some((left, right)) => (left, Some(right)),
-        None => (after_scheme, None),
+        None => (after_authority, None),
     };
 
-    // ── 3. Split type and label ─────────────────────────────────────────
-    let (type_part, label_part) = path_and_authority
-        .split_once('/')
-        .ok_or(Error::UriMissingType)?;
-    let uri_type = UriType::parse(type_part)?;
-
-    let label = percent_decode_path(label_part)?;
-
-    // ── 4. Parse the query parameters ───────────────────────────────────
+    // ── 2. Decode the label and parse the query parameters ──────────────
+    let label = percent_decode_path(path)?;
     let params = parse_params(query)?;
 
-    // ── 5. Assemble and validate ────────────────────────────────────────
-    let secret_raw = params.secret.ok_or(Error::UriMissingSecret)?;
-    let secret = OtpSecret::from_base32(&secret_raw)?;
-
-    let algorithm = match &params.algorithm {
-        Some(name) => Algorithm::parse(name)?,
-        None => Algorithm::default(),
+    // ── 3. The secret, whose encoding depends on the scheme ─────────────
+    let secret_raw = params.secret.as_deref().ok_or(Error::UriMissingSecret)?;
+    let decoded = match secret_form {
+        SecretForm::Hex => OtpSecret::from_bytes(decode_hex(secret_raw)?)?,
+        SecretForm::Base32 => OtpSecret::from_base32(secret_raw)?,
+    };
+    let secret = match uri_type {
+        UriType::Yandex => crate::yaotp::normalize_secret(decoded.expose())?,
+        _ => decoded,
     };
 
-    let digits = match &params.digits {
-        Some(value) => Digits::parse(value)?,
-        None => Digits::default(),
-    };
+    // ── 4. Algorithm, digits, step and counter ──────────────────────────
+    let algorithm = resolve_algorithm(uri_type, params.algorithm.as_deref())?;
+    let digits = resolve_digits(uri_type, params.digits.as_deref())?;
+    let period = resolve_period(uri_type, params.period.as_deref())?;
+    let pin = resolve_pin(uri_type, params.pin.as_deref())?;
+    let kind = resolve_kind(uri_type, &params, period, pin)?;
 
-    let period = match &params.period {
-        Some(value) => parse_period(value)?,
-        None => DEFAULT_PERIOD,
-    };
-
-    let counter = match uri_type {
-        UriType::Hotp => Some(parse_counter(
-            params.counter.as_deref().ok_or(Error::UriMissingCounter)?,
-        )?),
-        UriType::Totp => {
-            if params.counter.is_some() {
-                return Err(Error::UriUnexpectedCounter);
-            }
-            None
-        }
-    };
-    let period = if uri_type == UriType::Hotp {
-        DEFAULT_PERIOD
-    } else {
-        period
-    };
-
+    // ── 5. The label, and the issuer default of the scheme ──────────────
     let (label_issuer, account) = split_label(&label)?;
     let issuer = resolve_issuer(label_issuer, params.issuer)?;
+    let issuer = match (uri_type, issuer) {
+        (UriType::Yandex, None) => Some(YANDEX_DEFAULT_ISSUER.to_owned()),
+        (_, issuer) => issuer,
+    };
 
     Ok(OtpAuth {
-        uri_type,
+        kind,
         secret,
         issuer,
         account,
         algorithm,
         digits,
-        period,
-        counter,
     })
+}
+
+/// Issuer a Yandex OTP entry gets when the URI names none.
+///
+/// Without it such an entry appears in a list as a code with no source, which is
+/// indistinguishable from a mis-import.
+const YANDEX_DEFAULT_ISSUER: &str = "Yandex";
+
+/// How the secret of the URI that was read is encoded.
+///
+/// The **form** decides this, not the type: `otpauth://motp/…` follows the Key URI Format and
+/// carries Base32 like every other `otpauth://` URI, while Aegis's `motp:/…` carries Hex. A
+/// single type therefore has two possible encodings, and guessing wrong would silently produce
+/// a different secret - so the spelling that was used is carried along.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretForm {
+    /// Base32, as every `otpauth://` URI writes it.
+    Base32,
+    /// Hexadecimal, as the `motp:` form writes it.
+    Hex,
+}
+
+/// Splits the scheme off and returns the URI type, the secret encoding and the rest of the
+/// input.
+///
+/// `motp:` has no authority component: Aegis writes `motp:/<label>?…`, so any leading
+/// slashes are skipped and the label starts right after them.
+fn split_scheme(input: &str) -> Result<(UriType, SecretForm, &str)> {
+    if let Some(rest) = strip_prefix_ignore_ascii_case(input, "otpauth://") {
+        let (authority, after_authority) = rest.split_once('/').ok_or(Error::UriMissingType)?;
+        return Ok((
+            UriType::parse(authority)?,
+            SecretForm::Base32,
+            after_authority,
+        ));
+    }
+    if let Some(rest) = strip_prefix_ignore_ascii_case(input, "motp:") {
+        return Ok((UriType::Motp, SecretForm::Hex, rest.trim_start_matches('/')));
+    }
+    Err(Error::UriUnsupportedScheme)
+}
+
+/// Resolves the hash algorithm, honouring the schemes that fix their own.
+fn resolve_algorithm(uri_type: UriType, value: Option<&str>) -> Result<Algorithm> {
+    let fixed = match uri_type {
+        UriType::Yandex => Some(Algorithm::Sha256),
+        UriType::Steam => Some(Algorithm::Sha1),
+        UriType::Motp | UriType::Totp | UriType::Hotp => None,
+    };
+
+    let Some(value) = value else {
+        return Ok(fixed.unwrap_or_default());
+    };
+    let requested = Algorithm::parse(value)?;
+
+    match uri_type {
+        UriType::Yandex if requested != Algorithm::Sha256 => {
+            Err(Error::YandexAlgorithmUnsupported {
+                algorithm: algorithm_name(requested),
+            })
+        }
+        UriType::Steam if requested != Algorithm::Sha1 => Err(Error::SteamAlgorithmUnsupported {
+            algorithm: algorithm_name(requested),
+        }),
+        UriType::Motp => Err(Error::UriParameterNotSupported {
+            parameter: "algorithm",
+            uri_type: uri_type.name(),
+        }),
+        _ => Ok(requested),
+    }
+}
+
+/// Resolves the digit count, honouring the schemes that fix their own.
+fn resolve_digits(uri_type: UriType, value: Option<&str>) -> Result<Digits> {
+    let Some(value) = value else {
+        return Ok(uri_type.default_digits());
+    };
+    let digits = Digits::parse(value)?;
+    if uri_type == UriType::Steam && digits != Digits::FIVE {
+        return Err(Error::SteamDigitsUnsupported {
+            digits: digits.as_byte(),
+        });
+    }
+    Ok(digits)
+}
+
+/// Resolves the time step, rejecting it for the schemes that have none.
+fn resolve_period(uri_type: UriType, value: Option<&str>) -> Result<Option<u64>> {
+    let Some(value) = value else {
+        return Ok(uri_type.default_period());
+    };
+    if uri_type.default_period().is_none() {
+        return Err(Error::UriParameterNotSupported {
+            parameter: "period",
+            uri_type: uri_type.name(),
+        });
+    }
+    Ok(Some(parse_period(value)?))
+}
+
+/// Decodes the `pin` parameter, where the scheme has one.
+///
+/// The value is Base32, so any character a user may pick - including `&`, `=` and non-ASCII
+/// text - survives the query string without depending on percent-encoding rules that
+/// implementations disagree about. The decoded bytes must be UTF-8.
+fn resolve_pin(uri_type: UriType, value: Option<&str>) -> Result<Option<String>> {
+    let supports_pin = matches!(uri_type, UriType::Motp | UriType::Yandex);
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !supports_pin {
+        return Err(Error::UriParameterNotSupported {
+            parameter: "pin",
+            uri_type: uri_type.name(),
+        });
+    }
+
+    // An empty value means "no PIN": one state must have one representation, so `pin=` and a
+    // missing `pin` cannot both be stored and later compare unequal.
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    let bytes = crate::base32::decode(value).map_err(|_| Error::UriInvalidPin {
+        reason: "not valid Base32",
+    })?;
+    let text =
+        String::from_utf8(bytes.expose_secret().to_vec()).map_err(|_| Error::UriInvalidPin {
+            reason: "the decoded bytes are not valid UTF-8",
+        })?;
+    Ok(Some(text))
+}
+
+/// Builds the entry kind from the parameters, rejecting what the scheme cannot mean.
+fn resolve_kind(
+    uri_type: UriType,
+    params: &Params,
+    period: Option<u64>,
+    pin: Option<String>,
+) -> Result<EntryKind> {
+    let no_extra = |parameter: &'static str| {
+        Err(Error::UriParameterNotSupported {
+            parameter,
+            uri_type: uri_type.name(),
+        })
+    };
+
+    match uri_type {
+        UriType::Totp => {
+            if params.counter.is_some() {
+                return Err(Error::UriUnexpectedCounter);
+            }
+            Ok(EntryKind::Totp {
+                period: period.ok_or(Error::InvalidPeriod)?,
+            })
+        }
+        UriType::Hotp => {
+            if params.counter.is_none() {
+                return Err(Error::UriMissingCounter);
+            }
+            Ok(EntryKind::Hotp {
+                counter: parse_counter(params.counter.as_deref().ok_or(Error::UriMissingCounter)?)?,
+            })
+        }
+        UriType::Motp => {
+            if params.counter.is_some() {
+                return no_extra("counter");
+            }
+            Ok(EntryKind::Motp {
+                period: period.ok_or(Error::InvalidPeriod)?,
+                pin: pin.map(crate::motp::MotpPin::new),
+            })
+        }
+        UriType::Yandex => {
+            if params.counter.is_some() {
+                return no_extra("counter");
+            }
+            Ok(EntryKind::Yandex {
+                period: period.ok_or(Error::InvalidPeriod)?,
+                pin: pin.map(crate::yaotp::YandexPin::new),
+            })
+        }
+        UriType::Steam => {
+            if params.counter.is_some() {
+                return no_extra("counter");
+            }
+            Ok(EntryKind::Steam)
+        }
+    }
+}
+
+/// The name a URI writes for an algorithm.
+const fn algorithm_name(algorithm: Algorithm) -> &'static str {
+    match algorithm {
+        Algorithm::Sha1 => "SHA1",
+        Algorithm::Sha256 => "SHA256",
+        Algorithm::Sha512 => "SHA512",
+    }
+}
+
+/// Decodes a hexadecimal string, as the `motp:` scheme carries its secret.
+///
+/// Upper and lower case are both accepted; an odd length or a non-hex character is rejected.
+fn decode_hex(input: &str) -> Result<Vec<u8>> {
+    if !input.len().is_multiple_of(2) {
+        return Err(Error::UriInvalidParameter {
+            name: "secret".to_owned(),
+            reason: "hexadecimal text must have an even length".to_owned(),
+        });
+    }
+
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for index in (0..bytes.len()).step_by(2) {
+        let not_hex = || Error::UriInvalidParameter {
+            name: "secret".to_owned(),
+            reason: "not hexadecimal".to_owned(),
+        };
+        let high = bytes
+            .get(index)
+            .and_then(|byte| hex_value(*byte))
+            .ok_or_else(not_hex)?;
+        let low = bytes
+            .get(index + 1)
+            .and_then(|byte| hex_value(*byte))
+            .ok_or_else(not_hex)?;
+        out.push((high << 4) | low);
+    }
+    Ok(out)
+}
+
+/// Encodes bytes as lower-case hexadecimal, the form Aegis writes for mOTP.
+fn encode_hex(bytes: &[u8]) -> String {
+    /// Hexadecimal digits, lower case.
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    out
 }
 
 /// The default TOTP time step in seconds, the value recommended by RFC 6238 §4.1.
@@ -458,6 +798,8 @@ struct Params {
     period: Option<String>,
     /// `counter`: HOTP counter.
     counter: Option<String>,
+    /// `pin`: Base32-encoded PIN, for the schemes that have one.
+    pin: Option<String>,
 }
 
 /// Parses the query string.
@@ -487,6 +829,7 @@ fn parse_params(query: Option<&str>) -> Result<Params> {
             "digits" => &mut params.digits,
             "period" => &mut params.period,
             "counter" => &mut params.counter,
+            "pin" => &mut params.pin,
             _ => continue,
         };
         if slot.is_some() {
@@ -499,7 +842,7 @@ fn parse_params(query: Option<&str>) -> Result<Params> {
     Ok(params)
 }
 
-/// Serialises a parsed configuration back into an `otpauth://` URI.
+/// Serialises a parsed configuration back into a URI.
 ///
 /// Used for export and QR code generation. The output is **not guaranteed to be
 /// byte-identical to the input** (parameter order and whether defaults are
@@ -521,8 +864,22 @@ fn parse_params(query: Option<&str>) -> Result<Params> {
 /// differently from the original — silent data corruption. Returning an error
 /// tells the caller immediately that the configuration cannot be represented.
 ///
-/// Likewise `auth.period` is meaningless for HOTP and is not written out (see
-/// the invariant on [`OtpAuth::period`]).
+/// # The mOTP shape, and the `pin` parameter
+///
+/// mOTP is written as `motp:/<label>?…` with a **Hex** secret, which is the shape Aegis reads;
+/// every other type keeps the `otpauth://` form with a Base32 secret.
+///
+/// A PIN is written as `pin=<Base32>`. That parameter is **this library's extension** for mOTP:
+/// the reference implementation's mOTP URI carries no PIN at all, so an entry exported to it and
+/// read back loses the PIN, after which every code it produces is wrong. The value is Base32
+/// rather than percent-encoded text so that a PIN may contain any character a user picks -
+/// including `&`, `=` and non-ASCII text - without depending on query-encoding rules that
+/// implementations disagree about. For Yandex OTP the same parameter is what the reference
+/// implementation itself writes.
+///
+/// A time step is written only for the types that have one, and an algorithm only for the two
+/// types that let the URI choose: the others fix their own, and writing a value they would
+/// ignore invites the reader to believe it matters.
 pub fn serialize(auth: &OtpAuth) -> Result<String> {
     if auth.account.contains(':') {
         return Err(Error::UriAccountContainsColon {
@@ -530,12 +887,17 @@ pub fn serialize(auth: &OtpAuth) -> Result<String> {
         });
     }
 
-    let mut out = String::from("otpauth://");
-    out.push_str(match auth.uri_type {
-        UriType::Totp => "totp",
-        UriType::Hotp => "hotp",
-    });
-    out.push('/');
+    let uri_type = auth.uri_type();
+    let hex_secret = uri_type == UriType::Motp;
+
+    let mut out = String::new();
+    if hex_secret {
+        out.push_str("motp:/");
+    } else {
+        out.push_str("otpauth://");
+        out.push_str(uri_type.authority());
+        out.push('/');
+    }
 
     if let Some(issuer) = &auth.issuer {
         out.push_str(&percent_encode_path(issuer));
@@ -545,31 +907,41 @@ pub fn serialize(auth: &OtpAuth) -> Result<String> {
 
     out.push('?');
     out.push_str("secret=");
-    out.push_str(&auth.secret.to_base32());
+    if hex_secret {
+        out.push_str(&encode_hex(auth.secret.expose()));
+    } else {
+        out.push_str(&auth.secret.to_base32());
+    }
 
     if let Some(issuer) = &auth.issuer {
         out.push_str("&issuer=");
         out.push_str(&percent_encode_query(issuer));
     }
-    if auth.algorithm != Algorithm::default() {
+    if matches!(uri_type, UriType::Totp | UriType::Hotp) && auth.algorithm != Algorithm::default() {
         out.push_str("&algorithm=");
-        out.push_str(match auth.algorithm {
-            Algorithm::Sha1 => "SHA1",
-            Algorithm::Sha256 => "SHA256",
-            Algorithm::Sha512 => "SHA512",
-        });
+        out.push_str(algorithm_name(auth.algorithm));
     }
-    if auth.digits != Digits::default() {
+    if auth.digits != uri_type.default_digits() {
         out.push_str("&digits=");
         out.push_str(&auth.digits.count().to_string());
     }
-    if auth.uri_type == UriType::Totp && auth.period != DEFAULT_PERIOD {
+    if let Some(period) = auth.kind.period()
+        && Some(period) != uri_type.default_period()
+    {
         out.push_str("&period=");
-        out.push_str(&auth.period.to_string());
+        out.push_str(&period.to_string());
     }
-    if let Some(counter) = auth.counter {
+    if let EntryKind::Hotp { counter } = &auth.kind {
         out.push_str("&counter=");
         out.push_str(&counter.to_string());
+    }
+    if let Some(pin) = auth.kind.motp_pin() {
+        out.push_str("&pin=");
+        out.push_str(&crate::base32::encode(pin.expose().as_bytes()));
+    }
+    if let Some(pin) = auth.kind.yandex_pin() {
+        out.push_str("&pin=");
+        out.push_str(&crate::base32::encode(pin.expose().as_bytes()));
     }
     Ok(out)
 }
@@ -748,14 +1120,14 @@ mod tests {
     #[test]
     fn serialize_rejects_colon_in_account() {
         let auth = OtpAuth {
-            uri_type: UriType::Totp,
+            kind: EntryKind::Totp {
+                period: DEFAULT_PERIOD,
+            },
             secret: OtpSecret::from_bytes(vec![1, 2, 3, 4]).expect("non-empty"),
             issuer: Some("ACME".to_owned()),
             account: "john:8080".to_owned(),
             algorithm: Algorithm::Sha1,
             digits: Digits::SIX,
-            period: DEFAULT_PERIOD,
-            counter: None,
         };
         assert!(matches!(
             serialize(&auth),
@@ -921,5 +1293,324 @@ mod tests {
             "Debug output must be length-limited, actually {} bytes: {text}",
             text.len()
         );
+    }
+
+    /// A valid 16-byte Yandex secret, in Base32.
+    const YANDEX_SECRET: &str = "LA2V6KMCGYMWWVEW64RNP3JA3I";
+
+    /// The `motp:` form Aegis writes: a scheme of its own, no authority, a **Hex** secret.
+    #[test]
+    fn the_motp_scheme_carries_a_hex_secret() {
+        let auth =
+            parse("motp:/ACME:alice?secret=deadbeef&issuer=ACME").expect("the motp form parses");
+
+        assert_eq!(auth.uri_type(), UriType::Motp);
+        assert_eq!(auth.account, "alice");
+        assert_eq!(auth.issuer.as_deref(), Some("ACME"));
+        assert_eq!(
+            auth.kind,
+            EntryKind::Motp {
+                period: crate::motp::PERIOD,
+                pin: None,
+            },
+            "mOTP defaults to its own ten-second step"
+        );
+        assert_eq!(
+            auth.secret.expose().to_vec(),
+            vec![0xde, 0xad, 0xbe, 0xef],
+            "the secret is hexadecimal on this form, not Base32"
+        );
+    }
+
+    /// The `otpauth://motp/` spelling is read too, so an exporter that follows the Key URI
+    /// Format for the authority is not turned away.
+    #[test]
+    fn otpauth_motp_is_accepted_with_a_base32_secret() {
+        let auth = parse("otpauth://motp/ACME:alice?secret=JBSWY3DPEHPK3PXP&issuer=ACME&period=15")
+            .expect("the otpauth spelling parses");
+
+        assert_eq!(auth.uri_type(), UriType::Motp);
+        assert_eq!(
+            auth.kind,
+            EntryKind::Motp {
+                period: 15,
+                pin: None,
+            }
+        );
+        assert_eq!(auth.secret.to_base32(), "JBSWY3DPEHPK3PXP");
+    }
+
+    /// The mOTP PIN survives our own round trip. The reference implementation's mOTP URI has no
+    /// PIN parameter, so this is where an exported entry would otherwise come back unusable.
+    #[test]
+    fn motp_round_trip_keeps_the_pin() {
+        let encoded = crate::base32::encode(b"1234");
+        let auth = parse(&format!(
+            "motp:/ACME:alice?secret=deadbeef&issuer=ACME&pin={encoded}"
+        ))
+        .expect("the motp form parses");
+        assert_eq!(
+            auth.kind,
+            EntryKind::Motp {
+                period: crate::motp::PERIOD,
+                pin: Some(crate::motp::MotpPin::new("1234".to_owned())),
+            },
+            "the PIN travels Base32-encoded and comes back as the text the user typed"
+        );
+
+        let text = serialize(&auth).expect("it serializes");
+        assert!(text.starts_with("motp:/"), "actual {text}");
+        assert!(text.contains("secret=deadbeef"), "actual {text}");
+        assert!(text.contains("pin="), "the PIN must be written: {text}");
+
+        let reparsed = parse(&text).expect("it parses back");
+        assert_eq!(
+            reparsed.kind, auth.kind,
+            "the PIN and the step must survive the round trip"
+        );
+    }
+
+    /// A Yandex URI: `pin` is Base32, the issuer defaults to `Yandex`, the secret is Base32.
+    #[test]
+    fn yaotp_round_trip_keeps_the_pin_and_defaults_the_issuer() {
+        let uri = format!(
+            "otpauth://yaotp/alice?secret={YANDEX_SECRET}&pin={}",
+            crate::base32::encode(b"1234")
+        );
+        let auth = parse(&uri).expect("a yaotp URI parses");
+
+        assert_eq!(auth.uri_type(), UriType::Yandex);
+        assert_eq!(
+            auth.issuer.as_deref(),
+            Some("Yandex"),
+            "an entry with no source is indistinguishable from a mis-import"
+        );
+        assert_eq!(auth.algorithm, Algorithm::Sha256);
+        assert_eq!(
+            auth.digits,
+            Digits::EIGHT,
+            "eight characters, not eight digits"
+        );
+        assert_eq!(
+            auth.kind,
+            EntryKind::Yandex {
+                period: DEFAULT_PERIOD,
+                pin: Some(crate::yaotp::YandexPin::new("1234".to_owned())),
+            }
+        );
+
+        let text = serialize(&auth).expect("it serializes");
+        assert!(text.starts_with("otpauth://yaotp/"), "actual {text}");
+        assert!(text.contains("pin="), "the PIN must be written: {text}");
+        assert!(
+            !text.contains("algorithm="),
+            "the algorithm is fixed by the scheme: {text}"
+        );
+
+        let reparsed = parse(&text).expect("it parses back");
+        assert_eq!(
+            reparsed.kind, auth.kind,
+            "the PIN must survive the round trip"
+        );
+    }
+
+    /// A 26-byte Yandex secret is accepted (and reduced to its first 16 bytes); a 26-byte one
+    /// with a broken checksum is not.
+    #[test]
+    fn yaotp_accepts_the_26_byte_form_and_rejects_a_broken_checksum() {
+        let full = "LA2V6KMCGYMWWVEW64RNP3JA3IAAAAAAHTSG4HRZPI";
+        let pin = crate::base32::encode(b"1234");
+        let auth = parse(&format!("otpauth://yaotp/alice?secret={full}&pin={pin}"))
+            .expect("the 26-byte form parses");
+        assert_eq!(
+            auth.secret.len(),
+            16,
+            "the checksum is verified, then only the first 16 bytes are used"
+        );
+
+        let mut damaged = String::from(full);
+        damaged.replace_range(0..1, "B");
+        let result = parse(&format!("otpauth://yaotp/alice?secret={damaged}&pin={pin}"));
+        assert!(
+            matches!(result, Err(Error::YandexSecretChecksum)),
+            "a damaged 26-byte secret must be rejected, actual ok={}",
+            result.is_ok()
+        );
+    }
+
+    /// Yandex OTP truncates eight bytes, so a shorter digest cannot carry it.
+    #[test]
+    fn yaotp_rejects_another_algorithm() {
+        for name in ["SHA1", "SHA512"] {
+            let uri = format!("otpauth://yaotp/alice?secret={YANDEX_SECRET}&algorithm={name}");
+            let result = parse(&uri);
+            assert!(
+                matches!(result, Err(Error::YandexAlgorithmUnsupported { .. })),
+                "{name} must be rejected, actual ok={}",
+                result.is_ok()
+            );
+        }
+
+        let uri = format!("otpauth://yaotp/alice?secret={YANDEX_SECRET}&algorithm=SHA256");
+        assert!(
+            parse(&uri).is_ok(),
+            "the algorithm the scheme uses is accepted when written out"
+        );
+    }
+
+    /// Steam Guard fixes its algorithm, its code length and its step, so a URI that asks for
+    /// something else is rejected rather than silently trimmed to fit.
+    #[test]
+    fn steam_uri_rejects_parameters_that_mean_nothing() {
+        let auth = parse("otpauth://steam/alice?secret=JBSWY3DPEHPK3PXP").expect("it parses");
+        assert_eq!(auth.uri_type(), UriType::Steam);
+        assert_eq!(auth.kind, EntryKind::Steam);
+        assert_eq!(auth.algorithm, Algorithm::Sha1);
+        assert_eq!(auth.digits, Digits::FIVE);
+
+        let text = serialize(&auth).expect("it serializes");
+        assert!(text.starts_with("otpauth://steam/"), "actual {text}");
+        for absent in ["digits=", "period=", "algorithm=", "counter=", "pin="] {
+            assert!(
+                !text.contains(absent),
+                "{absent} means nothing for Steam Guard: {text}"
+            );
+        }
+        assert_eq!(parse(&text).expect("it parses back").kind, EntryKind::Steam);
+
+        for query in [
+            "algorithm=SHA256",
+            "digits=6",
+            "period=60",
+            "counter=1",
+            "pin=GEZDGNBV",
+        ] {
+            let uri = format!("otpauth://steam/alice?secret=JBSWY3DPEHPK3PXP&{query}");
+            let result = parse(&uri);
+            assert!(
+                result.is_err(),
+                "{query} must be rejected for steam, actual ok={}",
+                result.is_ok()
+            );
+            let message = result.expect_err("it is rejected").to_string();
+            assert!(
+                !message.to_lowercase().contains("internal"),
+                "the rejection must be a real diagnosis: {message}"
+            );
+        }
+
+        // The two that carry a reason of their own rather than "means nothing here".
+        assert!(matches!(
+            parse("otpauth://steam/alice?secret=JBSWY3DPEHPK3PXP&algorithm=SHA256"),
+            Err(Error::SteamAlgorithmUnsupported { .. })
+        ));
+        assert!(matches!(
+            parse("otpauth://steam/alice?secret=JBSWY3DPEHPK3PXP&digits=6"),
+            Err(Error::SteamDigitsUnsupported { .. })
+        ));
+    }
+
+    /// `pin` belongs to the two schemes that have one.
+    #[test]
+    fn a_pin_outside_the_pin_schemes_is_rejected() {
+        for uri in [
+            "otpauth://totp/alice?secret=JBSWY3DPEHPK3PXP&pin=GEZDGNBV",
+            "otpauth://hotp/alice?secret=JBSWY3DPEHPK3PXP&counter=0&pin=GEZDGNBV",
+        ] {
+            let result = parse(uri);
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UriParameterNotSupported {
+                        parameter: "pin",
+                        ..
+                    })
+                ),
+                "{uri} must be rejected, actual ok={}",
+                result.is_ok()
+            );
+        }
+    }
+
+    /// A PIN that is not Base32, or whose bytes are not UTF-8, is rejected without echoing it.
+    #[test]
+    fn an_unusable_pin_is_rejected_without_echoing_it() {
+        let not_base32 = parse("motp:/ACME:alice?secret=deadbeef&pin=1234");
+        assert!(
+            matches!(not_base32, Err(Error::UriInvalidPin { .. })),
+            "a PIN that is not Base32 must be rejected, actual ok={}",
+            not_base32.is_ok()
+        );
+
+        // `0xFF` alone is not valid UTF-8, and `74` is its Base32 encoding.
+        let not_utf8 = parse("motp:/ACME:alice?secret=deadbeef&pin=74");
+        assert!(
+            matches!(not_utf8, Err(Error::UriInvalidPin { .. })),
+            "a PIN whose bytes are not text must be rejected, actual ok={}",
+            not_utf8.is_ok()
+        );
+
+        for uri in [
+            "motp:/ACME:alice?secret=deadbeef&pin=1234",
+            "motp:/ACME:alice?secret=deadbeef&pin=74",
+        ] {
+            let message = parse(uri).expect_err("it is rejected").to_string();
+            assert!(
+                !message.contains("1234") && !message.contains("74"),
+                "the error must not echo the PIN: {message}"
+            );
+        }
+    }
+
+    /// An empty `pin` means "no PIN": one state must have one representation.
+    #[test]
+    fn an_empty_pin_is_no_pin() {
+        let auth = parse("motp:/ACME:alice?secret=deadbeef&pin=").expect("it parses");
+        assert_eq!(
+            auth.kind,
+            EntryKind::Motp {
+                period: crate::motp::PERIOD,
+                pin: None,
+            }
+        );
+    }
+
+    /// `serialize` writes the scheme each type needs, and a `period` only where it means
+    /// something.
+    #[test]
+    fn serialization_writes_the_scheme_of_each_type() {
+        let cases = [
+            (
+                "otpauth://totp/alice?secret=JBSWY3DPEHPK3PXP",
+                "otpauth://totp/",
+            ),
+            (
+                "otpauth://hotp/alice?secret=JBSWY3DPEHPK3PXP&counter=0",
+                "otpauth://hotp/",
+            ),
+            ("motp:/alice?secret=deadbeef", "motp:/"),
+            (
+                "otpauth://yaotp/alice?secret=LA2V6KMCGYMWWVEW64RNP3JA3I",
+                "otpauth://yaotp/",
+            ),
+            (
+                "otpauth://steam/alice?secret=JBSWY3DPEHPK3PXP",
+                "otpauth://steam/",
+            ),
+        ];
+
+        for (uri, expected_prefix) in cases {
+            let auth = parse(uri).expect("the URI parses");
+            let text = serialize(&auth).expect("it serializes");
+            assert!(
+                text.starts_with(expected_prefix),
+                "{uri} must serialize as {expected_prefix}, actual {text}"
+            );
+            assert_eq!(
+                parse(&text).expect("it parses back").kind,
+                auth.kind,
+                "the kind must survive {uri}"
+            );
+        }
     }
 }

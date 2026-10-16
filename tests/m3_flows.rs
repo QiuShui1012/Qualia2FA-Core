@@ -216,10 +216,8 @@ fn registration_produces_a_usable_vault() {
     );
 
     let entry = vault::entry_from_parsed_uri(
-        &qualia2fa_core::uri::parse(
-            "otpauth://totp/ACME:alice?secret=JBSWY3DPEHPK3PXP&issuer=ACME",
-        )
-        .expect("valid URI"),
+        qualia2fa_core::uri::parse("otpauth://totp/ACME:alice?secret=JBSWY3DPEHPK3PXP&issuer=ACME")
+            .expect("valid URI"),
         TEST_NOW,
     )
     .expect("build the entry");
@@ -313,7 +311,7 @@ fn login_lets_the_new_device_open_the_old_vault() {
     let mut old_store = MemoryStore::new(true);
     let mut old = flow::registration(&mut old_keys, &mut old_store, LABEL).expect("register old");
     let entry = vault::entry_from_parsed_uri(
-        &qualia2fa_core::uri::parse("otpauth://totp/Example:bob?secret=JBSWY3DPEHPK3PXP")
+        qualia2fa_core::uri::parse("otpauth://totp/Example:bob?secret=JBSWY3DPEHPK3PXP")
             .expect("valid URI"),
         TEST_NOW,
     )
@@ -399,7 +397,7 @@ fn recovery_restores_the_master_key_from_a_passphrase() {
     let mut store = MemoryStore::new(true);
     let mut registered = flow::registration(&mut keys, &mut store, LABEL).expect("register");
     let entry = vault::entry_from_parsed_uri(
-        &qualia2fa_core::uri::parse("otpauth://totp/Recovery:carol?secret=JBSWY3DPEHPK3PXP")
+        qualia2fa_core::uri::parse("otpauth://totp/Recovery:carol?secret=JBSWY3DPEHPK3PXP")
             .expect("valid URI"),
         TEST_NOW,
     )
@@ -727,7 +725,7 @@ fn a_second_vault_with_the_same_master_key_sees_nothing_until_sync() {
     let mut store = MemoryStore::new(true);
     let mut first = flow::registration(&mut keys, &mut store, LABEL).expect("register");
     let entry = vault::entry_from_parsed_uri(
-        &qualia2fa_core::uri::parse("otpauth://totp/Sync:dave?secret=JBSWY3DPEHPK3PXP")
+        qualia2fa_core::uri::parse("otpauth://totp/Sync:dave?secret=JBSWY3DPEHPK3PXP")
             .expect("valid URI"),
         TEST_NOW,
     )

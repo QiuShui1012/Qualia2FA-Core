@@ -22,10 +22,11 @@ reuse it as an independent project.
 | Development toolchain | `stable` (pinned by `rust-toolchain.toml`) |
 | License | `LGPL-3.0-or-later` |
 
-Implemented: HOTP (RFC 4226), TOTP (RFC 6238), Base32 (RFC 4648, in both lenient and
-strict modes), `otpauth://` parsing and serialization, Steam Guard, the encrypted vault
-(local storage format), recovery keys, challenge-response authentication, device pairing,
-sync payloads and merging, plus the transport-layer protocol.
+Implemented: HOTP (RFC 4226), TOTP (RFC 6238), mOTP, Yandex OTP, Steam Guard, Base32
+(RFC 4648, in both lenient and strict modes), URI parsing and serialization (`otpauth://`
+and Aegis's `motp:` form), the encrypted vault (local storage format), recovery keys,
+challenge-response authentication, device pairing, sync payloads and merging, plus the
+transport-layer protocol.
 
 ## Usage
 

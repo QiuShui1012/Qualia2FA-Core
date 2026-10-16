@@ -216,19 +216,70 @@ pub enum Error {
     #[error("cannot obtain secure random bytes from the operating system")]
     RandomnessUnavailable,
 
-    /// The URI scheme is not `otpauth`.
-    #[error("URI scheme is not otpauth")]
+    /// The URI scheme is not one this library understands.
+    #[error("unsupported URI scheme (expected otpauth:// or motp:)")]
     UriUnsupportedScheme,
 
-    /// The URI has no type component (no `/` after `otpauth://`).
-    #[error("URI is missing its type component (expected totp or hotp)")]
+    /// The URI has no type component (no `/` after the scheme).
+    #[error("URI is missing its type component (expected totp, hotp, motp, yaotp or steam)")]
     UriMissingType,
 
-    /// The URI type is neither `totp` nor `hotp`.
+    /// The URI type is not one of the supported schemes.
     #[error("unsupported URI type: {name}")]
     UriUnsupportedType {
         /// The raw type component, truncated to at most 16 characters.
         name: String,
+    },
+
+    /// A parameter that has no meaning for this type is present.
+    ///
+    /// Rejected rather than ignored, for the reason [`Error::UriUnexpectedCounter`] gives: a
+    /// parameter that is silently dropped is a configuration the user believes in and that the
+    /// code does not implement.
+    #[error("a {uri_type} URI cannot carry {parameter}")]
+    UriParameterNotSupported {
+        /// The parameter name, from this library's own list.
+        parameter: &'static str,
+        /// The URI type, from this library's own list.
+        uri_type: &'static str,
+    },
+
+    /// A `yaotp` URI asked for an algorithm other than SHA-256.
+    ///
+    /// Yandex OTP truncates an **eight-byte** window of the digest, so a shorter digest (SHA-1
+    /// has 20 bytes and the window starts as late as byte 15) would read past its end. The
+    /// scheme is defined for SHA-256 only; honouring the parameter is impossible and ignoring
+    /// it would compute codes that never match.
+    #[error(
+        "Yandex OTP is defined for SHA-256 only, but the URI asked for {algorithm}: the eight-byte truncation reads past the end of a shorter digest"
+    )]
+    YandexAlgorithmUnsupported {
+        /// The algorithm name the URI carried.
+        algorithm: &'static str,
+    },
+
+    /// A `steam` URI asked for an algorithm other than SHA-1.
+    #[error("Steam Guard is defined for SHA-1 only, but the URI asked for {algorithm}")]
+    SteamAlgorithmUnsupported {
+        /// The algorithm name the URI carried.
+        algorithm: &'static str,
+    },
+
+    /// A `steam` URI asked for a code length other than five.
+    #[error("a Steam Guard code is always 5 characters, but the URI asked for {digits}")]
+    SteamDigitsUnsupported {
+        /// The digit count the URI carried.
+        digits: u8,
+    },
+
+    /// A `pin` parameter is not usable.
+    ///
+    /// The pin travels Base32-encoded (so that any character a user may choose survives the
+    /// query string), and the decoded bytes must be UTF-8.
+    #[error("the pin parameter is invalid: {reason}")]
+    UriInvalidPin {
+        /// What was wrong, without echoing the pin itself.
+        reason: &'static str,
     },
 
     /// The URI has no `secret` parameter.
