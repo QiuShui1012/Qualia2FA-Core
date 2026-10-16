@@ -15,7 +15,7 @@ reuse it as an independent project.
 | Item | Value |
 |---|---|
 | Crate name | `qualia2fa-core` |
-| Version | `0.2.0` |
+| Version | `0.2.1` |
 | Type | pure library crate |
 | Edition | 2024 |
 | MSRV | **1.89** |
@@ -26,9 +26,10 @@ Implemented: HOTP (RFC 4226), TOTP (RFC 6238), mOTP, Yandex OTP, Steam Guard, Ba
 (RFC 4648, in both lenient and strict modes), URI parsing and serialization (`otpauth://`
 and Aegis's `motp:` form), the encrypted vault (local storage format), **groups and
 orderings (including their synchronization and conflict adjudication)**, **importing from
-Aegis's JSON / HTML / TEXT exports (encrypted exports included)**, recovery keys,
-challenge-response authentication, device pairing, sync payloads and merging, plus the
-transport-layer protocol.
+Aegis's JSON / HTML / TEXT exports (encrypted exports included)**, **exporting to those
+same four forms (encrypted JSON included)**, recovery keys, challenge-response
+authentication, device pairing, sync payloads and merging, plus the transport-layer
+protocol.
 
 ## Usage
 
@@ -128,9 +129,9 @@ A few things worth knowing:
 
 ## Compatibility
 
-**Vault format version: 3.** 0.2.0 always writes version 3, and still reads version 1 and
-version 2 files (the readable set only grows). An older application reading a version 3 file
-gets a clear "unsupported version" error; **the one exception** is the version 1 parser,
+**Vault format version: 3.** This version always writes version 3, and still reads version 1
+and version 2 files (the readable set only grows). An older application reading a version 3
+file gets a clear "unsupported version" error; **the one exception** is the version 1 parser,
 which reports trailing bytes (the 32-byte master key check value looks like extra content to
 it).
 
@@ -152,6 +153,17 @@ for entry in &report.entries {
 }
 // Compared against the vault: what is new, what is already there, what needs a human
 let matches = import::apply::compare(&report, &vault);
+```
+
+Exporting to one of the same four forms (`Text` / `Json` / `EncryptedJson` / `Html`):
+
+```rust
+use qualia2fa_core::export::{self, ExportFormat};
+
+// Bytes out of bytes in, again: this library does no I/O, and where the file goes is the
+// caller's decision. Only EncryptedJson takes a password; the other three are **plaintext**
+// and as sensitive as the vault itself.
+let bytes = export::export(vault, ExportFormat::EncryptedJson, Some(b"password"))?;
 ```
 
 ## Design conventions

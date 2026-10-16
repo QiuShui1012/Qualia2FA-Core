@@ -49,9 +49,39 @@ what a reader has to hold to:
   `import::mapping::safe_reason`, and it deliberately does not use `Display`, because several of
   this crate's errors quote the value that was wrong.
 
-`tinyjson` reads the JSON export, `aes-gcm` and `scrypt` open an encrypted one. They are used for
-reading only: the vault and the sync payload keep this project's own constructions, and neither
-dependency appears in anything this library writes.
+`tinyjson` reads the JSON export; `aes-gcm` and `scrypt` open an encrypted one. They are used for
+reading only, and none of them takes part in the vault format or in the sync payload, which keep
+this project's own constructions.
+
+## Writing an export
+
+An export is the same data in the other direction, and it is a file the user then carries around.
+A plaintext export holds every secret in the vault as it stands - that is the format's design
+rather than an accident, because the other authenticator has to be able to read it. What this
+library does about it:
+
+- **Only one of the four formats protects anything.** `ExportFormat::EncryptedJson` is that one,
+  and the module documentation and both READMEs say that the other three are as sensitive as the
+  vault itself. The HTML export is the sharpest case: it draws a QR code for every entry, and the
+  code carries the entry's URI with its secret, because moving one account to a phone is what that
+  picture is for.
+- **An empty password is refused** rather than accepted: it is a password anyone can guess by
+  trying nothing at all.
+- **The encrypted form follows the format's own two stages.** scrypt (cost 2^15, block size 8,
+  parallelisation 1, a 32-byte salt) stretches the password into the key that opens one slot, the
+  slot holds a random master key, and AES-256-GCM with that master key encrypts the database; the
+  tags are stored beside the ciphertexts, as the format says.
+- **Every random value comes from the OS CSPRNG** - the salt, the master key and both nonces -
+  and no parameter of the encryption comes from the vault or from the caller. There is no
+  fallback to a user-space generator anywhere in this crate.
+- **The derived key and the master key are erased as soon as they have been used** (`Zeroize`),
+  and neither appears anywhere but inside the ciphertext.
+- **An error names a position, never an entry.** An export that cannot be written reports where it
+  stopped, not what the entry held - the same rule the reader follows.
+
+`aes-gcm` and `scrypt` are therefore used in both directions; the vault format and the sync
+payload still use this project's own constructions (XChaCha20-Poly1305 and HKDF), and `tinyjson`
+remains reading-only.
 
 ## MD5 is used for one thing only
 

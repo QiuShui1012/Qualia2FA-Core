@@ -13,7 +13,7 @@ Qualia2FA 的核心库。承载双因素认证（2FA）的全部核心逻辑：T
 | 项 | 值 |
 |---|---|
 | Crate 名 | `qualia2fa-core` |
-| 版本 | `0.2.0` |
+| 版本 | `0.2.1` |
 | 类型 | 纯 library crate |
 | Edition | 2024 |
 | MSRV | **1.89** |
@@ -23,8 +23,8 @@ Qualia2FA 的核心库。承载双因素认证（2FA）的全部核心逻辑：T
 已实现：HOTP（RFC 4226）、TOTP（RFC 6238）、mOTP、Yandex OTP、Steam Guard、Base32
 （RFC 4648，宽容与严格两种模式）、URI 解析与序列化（`otpauth://` 与 Aegis 的 `motp:`）、
 加密保险库（本地存储格式）、**分组与排序（含同步与冲突裁决）**、**从 Aegis 的
-JSON / HTML / TXT 导出导入（加密导出也能开）**、恢复密钥、挑战-应答认证、设备配对、
-同步载荷与合并，以及传输层协议。
+JSON / HTML / TXT 导出导入（加密导出也能开）**、**导出成同样四种格式（含加密 JSON）**、
+恢复密钥、挑战-应答认证、设备配对、同步载荷与合并，以及传输层协议。
 
 ## 用法
 
@@ -115,7 +115,7 @@ for (id, entry) in file.vault().iter() {
 
 ## 兼容性
 
-**保险库文件格式版本：3。** 0.2.0 一律写版本 3，并且仍然能读版本 1 与版本 2 的文件
+**保险库文件格式版本：3。** 本版本一律写版本 3，并且仍然能读版本 1 与版本 2 的文件
 （可读版本只增不减）。老版本应用读到版本 3 的文件会得到一个明确的「版本不支持」错误；
 **唯一的例外**是版本 1 的解析器，它报的是文件尾部有多余内容（那 32 字节的主密钥检查值
 在它看来就是多余内容）。
@@ -137,6 +137,16 @@ for entry in &report.entries {
 }
 // 与已有保险库比对：哪些是新的、哪些已经有了、哪些要人来定
 let matches = import::apply::compare(&report, &vault);
+```
+
+导出成同样的四种格式之一（`Text` / `Json` / `EncryptedJson` / `Html`）：
+
+```rust
+use qualia2fa_core::export::{self, ExportFormat};
+
+// 同样是字节出、字节进：本库不做 I/O，写到哪里由调用方决定。
+// 只有 EncryptedJson 需要口令；另外三种是**明文**，与保险库本身一样敏感。
+let bytes = export::export(vault, ExportFormat::EncryptedJson, Some(b"password"))?;
 ```
 
 ## 设计约定
