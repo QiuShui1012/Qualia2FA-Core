@@ -15,7 +15,7 @@ reuse it as an independent project.
 | Item | Value |
 |---|---|
 | Crate name | `qualia2fa-core` |
-| Version | `0.2.1` |
+| Version | `0.2.2` |
 | Type | pure library crate |
 | Edition | 2024 |
 | MSRV | **1.89** |
