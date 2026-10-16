@@ -175,7 +175,7 @@ fn sample_entry() -> Entry {
         "alice".into(),
         otp::OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("valid Base32"),
         otp::Algorithm::Sha1,
-        otp::Digits::Six,
+        otp::Digits::SIX,
         30,
         None,
         String::new(),

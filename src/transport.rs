@@ -720,7 +720,7 @@ mod tests {
             "user@example.com".into(),
             OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("valid Base32"),
             Algorithm::Sha1,
-            Digits::Six,
+            Digits::SIX,
             30,
             None,
             String::new(),

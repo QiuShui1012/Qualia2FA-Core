@@ -224,7 +224,7 @@ proptest! {
             Just(Algorithm::Sha256),
             Just(Algorithm::Sha512)
         ],
-        digits in prop_oneof![Just(Digits::Six), Just(Digits::Seven), Just(Digits::Eight)],
+        digits in prop_oneof![Just(Digits::SIX), Just(Digits::SEVEN), Just(Digits::EIGHT)],
     ) {
         let secret = OtpSecret::from_bytes(data)
             .map_err(|e| TestCaseError::fail(format!("a non-empty seed must be accepted: {e}")))?;
@@ -244,7 +244,7 @@ proptest! {
     fn format_code_agrees_with_numeric_value(
         data in prop::collection::vec(any::<u8>(), 1..=64),
         counter in any::<u64>(),
-        digits in prop_oneof![Just(Digits::Six), Just(Digits::Seven), Just(Digits::Eight)],
+        digits in prop_oneof![Just(Digits::SIX), Just(Digits::SEVEN), Just(Digits::EIGHT)],
     ) {
         let secret = OtpSecret::from_bytes(data).expect("non-empty");
         let numeric = otp::hotp(&secret, counter, Algorithm::Sha1, digits);
@@ -269,9 +269,9 @@ proptest! {
         let same_step = base + (offset % period);
         prop_assert_eq!(base / period, same_step / period, "the setup must land in one step");
 
-        let a = otp::totp_code(&secret, base, period, Algorithm::Sha1, Digits::Six)
+        let a = otp::totp_code(&secret, base, period, Algorithm::Sha1, Digits::SIX)
             .expect("period is non-zero");
-        let b = otp::totp_code(&secret, same_step, period, Algorithm::Sha1, Digits::Six)
+        let b = otp::totp_code(&secret, same_step, period, Algorithm::Sha1, Digits::SIX)
             .expect("period is non-zero");
         prop_assert_eq!(a, b);
     }
@@ -284,7 +284,7 @@ proptest! {
         counter in any::<u64>(),
     ) {
         let secret = OtpSecret::from_bytes(data).expect("non-empty");
-        let code = otp::hotp_code(&secret, counter, Algorithm::Sha1, Digits::Six);
+        let code = otp::hotp_code(&secret, counter, Algorithm::Sha1, Digits::SIX);
         prop_assert!(otp::verify_code(&code, &code), "reflexivity failed: {}", code);
         let too_long = format!("{code}0");
         let one_shorter = code[1..].to_owned();
@@ -358,7 +358,7 @@ fn arb_otp_auth() -> impl Strategy<Value = OtpAuth> {
             Just(Algorithm::Sha256),
             Just(Algorithm::Sha512)
         ],
-        prop_oneof![Just(Digits::Six), Just(Digits::Seven), Just(Digits::Eight)],
+        prop_oneof![Just(Digits::SIX), Just(Digits::SEVEN), Just(Digits::EIGHT)],
         1_u64..=604_800,
         any::<bool>(),
         any::<u64>(),
@@ -504,7 +504,7 @@ fn regression_account_with_colon_is_rejected_on_both_ends() {
         issuer: Some("ACME".to_owned()),
         account: "john:8080".to_owned(),
         algorithm: Algorithm::Sha1,
-        digits: Digits::Six,
+        digits: Digits::SIX,
         period: uri::DEFAULT_PERIOD,
         counter: None,
     };

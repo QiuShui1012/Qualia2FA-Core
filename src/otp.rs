@@ -133,57 +133,122 @@ fn truncate_for_error(value: &str) -> String {
     out
 }
 
-/// Supported digit counts. RFC 4226 requires only 6 digits, RFC 6238 allows 8;
-/// 7 digits occur in the real world (some banks), so it is supported as well.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum Digits {
-    /// 6 digits (the default, covering the vast majority of services).
-    #[default]
-    Six,
-    /// 7 digits.
-    Seven,
-    /// 8 digits.
-    Eight,
-}
+/// Number of digits in a code: **1 to 9**.
+///
+/// A validated numeric type rather than an enumeration. RFC 4226 requires 6 digits and
+/// RFC 6238 allows 8, but 7 occurs in the real world, importers meet counts from 1 upwards,
+/// and an enumeration would need a variant per value — with the compiler no longer able to
+/// tell a valid count from an invalid one at the point of use.
+///
+/// # Why 9 is the upper bound
+///
+/// RFC 4226 §5.3 extracts a **31-bit** value from the HMAC (`2^31 = 2_147_483_648`). At nine
+/// digits the modulus `10^9` divides that range into complete, equally likely intervals; at
+/// ten digits `10^10` does not, so about 79% of the range can never be produced and the
+/// remaining values are not uniform. Widening the integer type does not change that: the
+/// constraint is the truncation, not the storage. Ten digits would need a different
+/// truncation, which no existing implementation would agree with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Digits(u8);
 
 impl Digits {
+    /// Six digits: the default, and what almost every service uses.
+    pub const SIX: Self = Self(6);
+    /// Seven digits (some banks).
+    pub const SEVEN: Self = Self(7);
+    /// Eight digits (the maximum RFC 6238 mentions).
+    pub const EIGHT: Self = Self(8);
+    /// Smallest supported digit count.
+    pub const MIN: u8 = 1;
+    /// Largest supported digit count (see the type documentation for why).
+    pub const MAX: u8 = 9;
+
+    /// Validates a digit count.
+    ///
+    /// # Errors
+    ///
+    /// - `0` → [`Error::DigitsZero`]
+    /// - `10` or more → [`Error::DigitsTooMany`], which carries the reason
+    ///
+    /// Deliberately not a `const fn`: the error type is not constructible in a const
+    /// context in a way worth the contortion, and no caller needs it there.
+    pub fn new(count: u8) -> Result<Self> {
+        match count {
+            0 => Err(Error::DigitsZero),
+            Self::MIN..=Self::MAX => Ok(Self(count)),
+            count => Err(Error::DigitsTooMany { count }),
+        }
+    }
+
     /// The digit count itself.
     #[must_use]
     pub const fn count(self) -> u32 {
-        match self {
-            Self::Six => 6,
-            Self::Seven => 7,
-            Self::Eight => 8,
-        }
+        self.0 as u32
+    }
+
+    /// The digit count as the storage byte, which is the count itself.
+    ///
+    /// The vault format stores a digit count as one byte whose value **is** the count, so no
+    /// separate mapping table exists (and none can drift out of step with the type).
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        self.0
     }
 
     /// Parses the `digits` parameter of an `otpauth://` URI.
     ///
     /// # Errors
     ///
-    /// Only 6, 7 and 8 are accepted; any other value returns
-    /// [`Error::UnsupportedDigits`]. This is an **attacker-controlled
-    /// parameter** and must be validated strictly — accepting arbitrary values
-    /// would overflow `10^digits` for large digit counts.
+    /// The value must be the **canonical** decimal form of a supported count: `"6"` is
+    /// accepted, `"06"` is not, and `"six"` is not. This is an **attacker-controlled
+    /// parameter**, and accepting a non-canonical form would mean two different URIs that
+    /// look different to a user compare equal.
+    ///
+    /// - a non-canonical or non-numeric string → [`Error::UnsupportedDigits`]
+    /// - `"0"` → [`Error::DigitsZero`]
+    /// - `"10"` or more → [`Error::DigitsTooMany`]
     pub fn parse(value: &str) -> Result<Self> {
-        match value {
-            "6" => Ok(Self::Six),
-            "7" => Ok(Self::Seven),
-            "8" => Ok(Self::Eight),
-            _ => Err(Error::UnsupportedDigits {
-                value: truncate_for_error(value),
-            }),
+        if let [digit @ b'1'..=b'9'] = value.as_bytes() {
+            return Ok(Self(digit - b'0'));
         }
+        if let Ok(count) = value.parse::<u8>()
+            && count.to_string() == value
+        {
+            return Self::new(count);
+        }
+        Err(Error::UnsupportedDigits {
+            value: truncate_for_error(value),
+        })
     }
 
     /// `10^digits`, used as the modulus.
+    ///
+    /// Fits in a `u32` for every supported count: `10^9 = 1_000_000_000`.
     #[must_use]
-    const fn modulus(self) -> u32 {
-        match self {
-            Self::Six => 1_000_000,
-            Self::Seven => 10_000_000,
-            Self::Eight => 100_000_000,
+    pub const fn modulus(self) -> u32 {
+        let mut value = 1_u32;
+        let mut remaining = self.0;
+        while remaining > 0 {
+            value *= 10;
+            remaining -= 1;
         }
+        value
+    }
+}
+
+impl Default for Digits {
+    /// [`Digits::SIX`], the count nearly every service uses.
+    fn default() -> Self {
+        Self::SIX
+    }
+}
+
+impl TryFrom<u8> for Digits {
+    type Error = Error;
+
+    /// Validates a raw count, as read from a file or received over the wire.
+    fn try_from(count: u8) -> Result<Self> {
+        Self::new(count)
     }
 }
 
@@ -370,7 +435,7 @@ fn hmac_truncate(secret: &OtpSecret, algorithm: Algorithm, message: &[u8]) -> u3
 /// Computes the HOTP value (RFC 4226).
 ///
 /// `counter` is an 8-byte big-endian counter. Returns 0..=999_999 for
-/// [`Digits::Six`].
+/// [`Digits::SIX`].
 ///
 /// Use [`hotp_code`] for a fixed-width string with leading zeros.
 #[must_use]
@@ -441,7 +506,7 @@ pub fn totp_code(
 /// use qualia2fa_core::otp::{self, Algorithm, Digits, OtpSecret};
 ///
 /// let secret = OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("a valid seed");
-/// let code = otp::totp_code(&secret, 1_700_000_000, 30, Algorithm::Sha1, Digits::Six)
+/// let code = otp::totp_code(&secret, 1_700_000_000, 30, Algorithm::Sha1, Digits::SIX)
 ///     .expect("period is non-zero");
 /// assert!(otp::verify_code(&code, &code));
 /// assert!(!otp::verify_code(&code, "000000"));
@@ -618,25 +683,72 @@ mod tests {
     }
 
     #[test]
-    fn digits_parsing_accepts_only_6_7_8() {
-        assert_eq!(Digits::parse("6").expect("6"), Digits::Six);
-        assert_eq!(Digits::parse("7").expect("7"), Digits::Seven);
-        assert_eq!(Digits::parse("8").expect("8"), Digits::Eight);
-        for bad in ["5", "9", "0", "06", "", "six", "99999999999999999999"] {
+    fn digits_parsing_accepts_every_canonical_count_from_1_to_9() {
+        for count in Digits::MIN..=Digits::MAX {
+            let text = count.to_string();
+            let parsed = Digits::parse(&text).expect("a canonical count");
+            assert_eq!(parsed.count(), u32::from(count), "{text}");
+            assert_eq!(Digits::new(count).expect("in range"), parsed, "{text}");
+            assert_eq!(parsed.as_byte(), count, "{text}");
+        }
+        assert_eq!(Digits::parse("6").expect("6"), Digits::SIX);
+        assert_eq!(Digits::parse("7").expect("7"), Digits::SEVEN);
+        assert_eq!(Digits::parse("8").expect("8"), Digits::EIGHT);
+        assert_eq!(Digits::default(), Digits::SIX);
+    }
+
+    /// Out-of-range values carry the reason; malformed values do not pretend to have one.
+    #[test]
+    fn digits_reject_zero_ten_and_malformed_input() {
+        assert!(matches!(Digits::parse("0"), Err(Error::DigitsZero)));
+        assert!(matches!(Digits::new(0), Err(Error::DigitsZero)));
+
+        for too_many in ["10", "11", "99", "255"] {
+            assert!(
+                matches!(Digits::parse(too_many), Err(Error::DigitsTooMany { .. })),
+                "{too_many:?} must be rejected as too many"
+            );
+        }
+        assert!(matches!(
+            Digits::new(10),
+            Err(Error::DigitsTooMany { count: 10 })
+        ));
+
+        for bad in [
+            "06",
+            "007",
+            "",
+            "six",
+            "-6",
+            " 6",
+            "6 ",
+            "99999999999999999999",
+        ] {
             assert!(
                 matches!(Digits::parse(bad), Err(Error::UnsupportedDigits { .. })),
-                "{bad:?} must be rejected"
+                "{bad:?} must be rejected as malformed"
             );
+        }
+    }
+
+    /// The modulus is `10^count` and stays inside a `u32` for every supported count.
+    #[test]
+    fn modulus_is_a_power_of_ten() {
+        let mut expected = 1_u32;
+        for count in Digits::MIN..=Digits::MAX {
+            expected *= 10;
+            let digits = Digits::new(count).expect("in range");
+            assert_eq!(digits.modulus(), expected, "count {count}");
         }
     }
 
     #[test]
     fn format_code_pads_to_exact_width() {
-        assert_eq!(format_code(0, Digits::Six), "000000");
-        assert_eq!(format_code(1, Digits::Six), "000001");
-        assert_eq!(format_code(123_456, Digits::Six), "123456");
-        assert_eq!(format_code(0, Digits::Eight), "00000000");
-        assert_eq!(format_code(99_999_999, Digits::Eight), "99999999");
+        assert_eq!(format_code(0, Digits::SIX), "000000");
+        assert_eq!(format_code(1, Digits::SIX), "000001");
+        assert_eq!(format_code(123_456, Digits::SIX), "123456");
+        assert_eq!(format_code(0, Digits::EIGHT), "00000000");
+        assert_eq!(format_code(99_999_999, Digits::EIGHT), "99999999");
     }
 
     #[test]
@@ -668,11 +780,11 @@ mod tests {
     fn period_zero_is_rejected() {
         let secret = OtpSecret::from_bytes(vec![1, 2, 3]).expect("non-empty");
         assert!(matches!(
-            totp(&secret, 0, 0, Algorithm::Sha1, Digits::Six),
+            totp(&secret, 0, 0, Algorithm::Sha1, Digits::SIX),
             Err(Error::InvalidPeriod)
         ));
         assert!(matches!(
-            totp_code(&secret, 0, 0, Algorithm::Sha1, Digits::Six),
+            totp_code(&secret, 0, 0, Algorithm::Sha1, Digits::SIX),
             Err(Error::InvalidPeriod)
         ));
         assert!(matches!(
@@ -721,8 +833,8 @@ mod tests {
             let target = counter
                 .checked_add_signed(expected_offset)
                 .expect("no overflow");
-            let code = hotp_code(&secret, target, Algorithm::Sha1, Digits::Six);
-            let got = verify_with_drift(&secret, counter, 1, Algorithm::Sha1, Digits::Six, &code);
+            let code = hotp_code(&secret, target, Algorithm::Sha1, Digits::SIX);
+            let got = verify_with_drift(&secret, counter, 1, Algorithm::Sha1, Digits::SIX, &code);
             assert_eq!(got, Some(expected_offset), "offset {expected_offset}");
         }
     }
@@ -732,9 +844,9 @@ mod tests {
         let secret = OtpSecret::from_bytes((0..20).collect::<Vec<u8>>()).expect("non-empty");
         let counter = 1_700_000_000_u64 / 30;
         let far = counter + 5;
-        let code = hotp_code(&secret, far, Algorithm::Sha1, Digits::Six);
+        let code = hotp_code(&secret, far, Algorithm::Sha1, Digits::SIX);
         assert_eq!(
-            verify_with_drift(&secret, counter, 1, Algorithm::Sha1, Digits::Six, &code),
+            verify_with_drift(&secret, counter, 1, Algorithm::Sha1, Digits::SIX, &code),
             None,
             "must not match outside the window"
         );
@@ -745,8 +857,8 @@ mod tests {
     #[test]
     fn drift_window_handles_counter_underflow() {
         let secret = OtpSecret::from_bytes(vec![7_u8; 20]).expect("non-empty");
-        let code = hotp_code(&secret, 0, Algorithm::Sha1, Digits::Six);
-        let got = verify_with_drift(&secret, 0, 3, Algorithm::Sha1, Digits::Six, &code);
+        let code = hotp_code(&secret, 0, Algorithm::Sha1, Digits::SIX);
+        let got = verify_with_drift(&secret, 0, 3, Algorithm::Sha1, Digits::SIX, &code);
         assert_eq!(got, Some(0), "the current step must match");
     }
 

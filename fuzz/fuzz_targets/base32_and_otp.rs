@@ -121,7 +121,7 @@ fuzz_target!(|data: &[u8]| {
         ]);
 
         for algorithm in [Algorithm::Sha1, Algorithm::Sha256, Algorithm::Sha512] {
-            for digits in [Digits::Six, Digits::Seven, Digits::Eight] {
+            for digits in [Digits::SIX, Digits::SEVEN, Digits::EIGHT] {
                 let code = otp::hotp_code(&secret, counter, algorithm, digits);
                 assert_eq!(
                     code.len(),
@@ -145,7 +145,7 @@ fuzz_target!(|data: &[u8]| {
         }
 
         let time = counter;
-        let totp_code = otp::totp_code(&secret, time, 30, Algorithm::Sha1, Digits::Six)
+        let totp_code = otp::totp_code(&secret, time, 30, Algorithm::Sha1, Digits::SIX)
             .expect("period is non-zero");
         assert_eq!(totp_code.len(), 6);
 

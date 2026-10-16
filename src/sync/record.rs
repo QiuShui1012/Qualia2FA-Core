@@ -302,7 +302,7 @@ mod tests {
             "alice@example.com".to_owned(),
             crate::otp::OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("valid secret"),
             crate::otp::Algorithm::Sha1,
-            crate::otp::Digits::Six,
+            crate::otp::Digits::SIX,
             30,
             None,
             "工作账号".to_owned(),

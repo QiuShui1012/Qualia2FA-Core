@@ -73,7 +73,7 @@ fn rfc4226_appendix_d_all_ten_vectors() {
     let secret = OtpSecret::from_bytes(RFC_SECRET_ASCII.to_vec()).expect("the seed is non-empty");
 
     for (counter, expected) in VECTORS {
-        let got = otp::hotp_code(&secret, counter, Algorithm::Sha1, Digits::Six);
+        let got = otp::hotp_code(&secret, counter, Algorithm::Sha1, Digits::SIX);
         assert_eq!(
             got, expected,
             "RFC 4226 Appendix D counter {counter} mismatch: expected {expected}, got {got}"
@@ -102,7 +102,7 @@ fn rfc6238_appendix_b_sha1_vectors() {
     let secret = OtpSecret::from_bytes(seed_of_len(20)).expect("the seed is non-empty");
 
     for (time, expected) in VECTORS {
-        let got = otp::totp_code(&secret, time, 30, Algorithm::Sha1, Digits::Eight)
+        let got = otp::totp_code(&secret, time, 30, Algorithm::Sha1, Digits::EIGHT)
             .expect("period is non-zero");
         assert_eq!(
             got, expected,
@@ -125,7 +125,7 @@ fn rfc6238_appendix_b_sha256_vectors() {
     let secret = OtpSecret::from_bytes(seed_of_len(32)).expect("the seed is non-empty");
 
     for (time, expected) in VECTORS {
-        let got = otp::totp_code(&secret, time, 30, Algorithm::Sha256, Digits::Eight)
+        let got = otp::totp_code(&secret, time, 30, Algorithm::Sha256, Digits::EIGHT)
             .expect("period is non-zero");
         assert_eq!(
             got, expected,
@@ -148,7 +148,7 @@ fn rfc6238_appendix_b_sha512_vectors() {
     let secret = OtpSecret::from_bytes(seed_of_len(64)).expect("the seed is non-empty");
 
     for (time, expected) in VECTORS {
-        let got = otp::totp_code(&secret, time, 30, Algorithm::Sha512, Digits::Eight)
+        let got = otp::totp_code(&secret, time, 30, Algorithm::Sha512, Digits::EIGHT)
             .expect("period is non-zero");
         assert_eq!(
             got, expected,
@@ -191,7 +191,7 @@ fn cross_check_hotp_counter_zero_against_manual_hmac() {
 
     let secret = OtpSecret::from_bytes(RFC_SECRET_ASCII.to_vec()).expect("the seed is non-empty");
     assert_eq!(
-        otp::hotp_code(&secret, 0, Algorithm::Sha1, Digits::Six),
+        otp::hotp_code(&secret, 0, Algorithm::Sha1, Digits::SIX),
         manual
     );
 
@@ -211,8 +211,8 @@ fn digit_count_actually_changes_the_modulus() {
     let secret = OtpSecret::from_bytes(RFC_SECRET_ASCII.to_vec()).expect("the seed is non-empty");
     let counter = 1_u64;
 
-    let six = otp::hotp_code(&secret, counter, Algorithm::Sha1, Digits::Six);
-    let eight = otp::hotp_code(&secret, counter, Algorithm::Sha1, Digits::Eight);
+    let six = otp::hotp_code(&secret, counter, Algorithm::Sha1, Digits::SIX);
+    let eight = otp::hotp_code(&secret, counter, Algorithm::Sha1, Digits::EIGHT);
 
     assert_eq!(six.len(), 6);
     assert_eq!(eight.len(), 8);
@@ -232,8 +232,8 @@ fn digit_count_actually_changes_the_modulus() {
 #[test]
 fn seven_digits_is_self_consistent() {
     let secret = OtpSecret::from_bytes(RFC_SECRET_ASCII.to_vec()).expect("the seed is non-empty");
-    let seven = otp::hotp_code(&secret, 1, Algorithm::Sha1, Digits::Seven);
-    let eight = otp::hotp_code(&secret, 1, Algorithm::Sha1, Digits::Eight);
+    let seven = otp::hotp_code(&secret, 1, Algorithm::Sha1, Digits::SEVEN);
+    let eight = otp::hotp_code(&secret, 1, Algorithm::Sha1, Digits::EIGHT);
 
     assert_eq!(seven.len(), 7);
     assert_eq!(
@@ -257,7 +257,7 @@ fn leading_zeros_are_preserved_in_output() {
 
     let mut found_leading_zero = false;
     for step in 0_u64..200 {
-        let code = otp::totp_code(&secret, step * 30, 30, Algorithm::Sha1, Digits::Six)
+        let code = otp::totp_code(&secret, step * 30, 30, Algorithm::Sha1, Digits::SIX)
             .expect("period is non-zero");
         assert_eq!(code.len(), 6, "must be 6 digits in every case: {code}");
         assert!(
@@ -271,7 +271,7 @@ fn leading_zeros_are_preserved_in_output() {
                 numeric < 100_000,
                 "a code with a leading zero must be below 100000: {code}"
             );
-            assert_eq!(otp::format_code(numeric, Digits::Six), code);
+            assert_eq!(otp::format_code(numeric, Digits::SIX), code);
         }
     }
     assert!(

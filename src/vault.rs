@@ -217,12 +217,8 @@ mod tag {
     /// Value of the algorithm field.
     pub(super) const ALG_SHA512: u8 = 3;
 
-    /// Digit count: 6.
-    pub(super) const DIGITS_SIX: u8 = 6;
-    /// Digit count: 7.
-    pub(super) const DIGITS_SEVEN: u8 = 7;
-    /// Digit count: 8.
-    pub(super) const DIGITS_EIGHT: u8 = 8;
+    // The digit count has no constants of its own: a count from 1 to 9 is stored as the
+    // byte holding that number, so [`otp::Digits::as_byte`] is the whole mapping.
 }
 
 /// A deletion record.
@@ -965,23 +961,20 @@ const fn algorithm_from_byte(byte: u8) -> Option<otp::Algorithm> {
     }
 }
 
-/// Digit count to storage byte.
+/// Digit count to storage byte: the count itself.
+///
+/// No mapping table exists, so none can drift out of step with the type; the vault format
+/// stores a count from 1 to 9 as one byte holding that number.
 const fn digits_to_byte(digits: otp::Digits) -> u8 {
-    match digits {
-        otp::Digits::Six => tag::DIGITS_SIX,
-        otp::Digits::Seven => tag::DIGITS_SEVEN,
-        otp::Digits::Eight => tag::DIGITS_EIGHT,
-    }
+    digits.as_byte()
 }
 
-/// Storage byte to digit count. An unknown value returns `None`.
-const fn digits_from_byte(byte: u8) -> Option<otp::Digits> {
-    match byte {
-        tag::DIGITS_SIX => Some(otp::Digits::Six),
-        tag::DIGITS_SEVEN => Some(otp::Digits::Seven),
-        tag::DIGITS_EIGHT => Some(otp::Digits::Eight),
-        _ => None,
-    }
+/// Storage byte to digit count. A byte outside 1..=9 returns `None`.
+///
+/// There is no fallback to six digits: a silent fallback would give the user permanently
+/// wrong codes with nothing to diagnose.
+fn digits_from_byte(byte: u8) -> Option<otp::Digits> {
+    otp::Digits::try_from(byte).ok()
 }
 
 /// Writes bytes to a file atomically.
@@ -1070,7 +1063,7 @@ mod tests {
             "alice".into(),
             secret(),
             otp::Algorithm::Sha256,
-            otp::Digits::Eight,
+            otp::Digits::EIGHT,
             30,
             None,
             "note".into(),
@@ -1087,7 +1080,7 @@ mod tests {
             "bob".into(),
             secret(),
             otp::Algorithm::Sha1,
-            otp::Digits::Six,
+            otp::Digits::SIX,
             30,
             Some(42),
             String::new(),
@@ -1723,7 +1716,7 @@ mod tests {
         put_node(&mut plaintext, tag::ACCOUNT, b"a");
         put_node(&mut plaintext, tag::SECRET, b"");
         put_node(&mut plaintext, tag::ALGORITHM, &[tag::ALG_SHA1]);
-        put_node(&mut plaintext, tag::DIGITS, &[tag::DIGITS_SIX]);
+        put_node(&mut plaintext, tag::DIGITS, &[otp::Digits::SIX.as_byte()]);
         put_node(&mut plaintext, tag::PERIOD, &30_u64.to_be_bytes());
         put_node(&mut plaintext, tag::CREATED_AT, &0_u64.to_be_bytes());
         let err = decode_entry(&plaintext);
@@ -1738,7 +1731,7 @@ mod tests {
         put_node(&mut plaintext, tag::ACCOUNT, b"a");
         put_node(&mut plaintext, tag::SECRET, b"secret");
         put_node(&mut plaintext, tag::ALGORITHM, &[tag::ALG_SHA1]);
-        put_node(&mut plaintext, tag::DIGITS, &[tag::DIGITS_SIX]);
+        put_node(&mut plaintext, tag::DIGITS, &[otp::Digits::SIX.as_byte()]);
         put_node(&mut plaintext, tag::PERIOD, &30_u64.to_be_bytes());
         put_node(&mut plaintext, tag::CREATED_AT, &0_u64.to_be_bytes());
         let err = decode_entry(&plaintext);
@@ -1759,13 +1752,18 @@ mod tests {
                 Some(algorithm)
             );
         }
-        for digits in [otp::Digits::Six, otp::Digits::Seven, otp::Digits::Eight] {
-            assert_eq!(digits_from_byte(digits_to_byte(digits)), Some(digits));
+        for count in otp::Digits::MIN..=otp::Digits::MAX {
+            let digits = otp::Digits::new(count).expect("1..=9 is the supported range");
+            assert_eq!(
+                digits_from_byte(digits_to_byte(digits)),
+                Some(digits),
+                "count {count}"
+            );
         }
         assert_eq!(algorithm_from_byte(0), None);
         assert_eq!(algorithm_from_byte(99), None);
-        assert_eq!(digits_from_byte(5), None);
-        assert_eq!(digits_from_byte(9), None);
+        assert_eq!(digits_from_byte(0), None);
+        assert_eq!(digits_from_byte(10), None);
     }
 
     /// `None` and `Some("")` for `issuer` normalize across a round trip.

@@ -124,12 +124,37 @@ pub enum Error {
 
     /// The `digits` parameter of an `otpauth://` URI is outside the supported range.
     ///
-    /// Only 6, 7 and 8 are accepted. Validation must be strict — any other value overflows
-    /// `10^digits`.
-    #[error("unsupported digit count: {value} (only 6, 7 and 8 are accepted)")]
+    /// Reported when the value is not a plain decimal digit count in the first place
+    /// (`""`, `"six"`, `"06"`, a number too large for a byte). A well-formed number that is
+    /// merely out of range is reported by [`Error::DigitsZero`] or [`Error::DigitsTooMany`],
+    /// which carry the reason.
+    #[error("unsupported digit count: {value} (a plain decimal count from 1 to 9 is expected)")]
     UnsupportedDigits {
         /// The raw parameter value, truncated to at most 16 characters.
         value: String,
+    },
+
+    /// A code was requested with zero digits.
+    ///
+    /// A zero-width code is not a code: there would be nothing to display and nothing to
+    /// compare, and `10^0 = 1` makes every code identical.
+    #[error("a code must have at least one digit")]
+    DigitsZero,
+
+    /// A code was requested with ten or more digits.
+    ///
+    /// **The limit comes from the truncation, not from the integer width**: RFC 4226 §5.3
+    /// extracts a 31-bit value from the HMAC, so at ten digits the reachable code space is
+    /// only `2^31 / 10^10` (about 21%) of the range — codes above `2^31` can never appear,
+    /// and the ones that can are not uniformly distributed. Widening the integer type does
+    /// not help; supporting ten digits would need a different truncation, which no existing
+    /// implementation would agree with.
+    #[error(
+        "a code cannot have {count} digits: RFC 4226 §5.3 truncates the HMAC to 31 bits, so ten or more digits would be biased (1 to 9 are accepted)"
+    )]
+    DigitsTooMany {
+        /// The requested digit count.
+        count: u8,
     },
 
     /// The TOTP `period` is 0, which would cause a division by zero.

@@ -83,7 +83,7 @@ fn arb_entry() -> impl Strategy<Value = Entry> {
             Just(Algorithm::Sha256),
             Just(Algorithm::Sha512)
         ],
-        prop_oneof![Just(Digits::Six), Just(Digits::Seven), Just(Digits::Eight)],
+        prop_oneof![Just(Digits::SIX), Just(Digits::SEVEN), Just(Digits::EIGHT)],
         1_u64..=604_800,
         prop::option::of(any::<u64>()),
         arb_text(),

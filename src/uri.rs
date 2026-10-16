@@ -41,7 +41,7 @@
 //! | `secret` | **required** | Base32 | — |
 //! | `issuer` | optional | text | — |
 //! | `algorithm` | optional | `SHA1` / `SHA256` / `SHA512` | `SHA1` |
-//! | `digits` | optional | `6` / `7` / `8` | `6` |
+//! | `digits` | optional | `1` … `9` | `6` |
 //! | `period` | optional | seconds, non-zero | `30` |
 //! | `counter` | **required for HOTP** | integer | — |
 //!
@@ -52,8 +52,9 @@
 //! - `algorithm` is unrecognised — **rejected rather than falling back to
 //!   SHA-1**, because a silent fallback gives the user a permanently wrong code
 //!   and leaves nothing to diagnose
-//! - `digits` is outside {6,7,8} — it must be validated strictly, otherwise
-//!   `10^digits` overflows
+//! - `digits` is not the canonical decimal form of a count from 1 to 9: `0` and `10`
+//!   are rejected with their own reasons (see [`crate::otp::Digits`]) and anything
+//!   non-canonical, such as `06`, is rejected as malformed
 //! - `period` is 0 or cannot be parsed
 //! - `totp` carries a `counter`, or `hotp` lacks a `counter`
 //! - `counter` cannot be parsed as an integer
@@ -202,7 +203,7 @@ fn truncate(value: &str, max: usize) -> String {
 /// let parsed = uri::parse(uri).expect("valid URI");
 /// assert_eq!(parsed.issuer.as_deref(), Some("GitHub"));
 /// assert_eq!(parsed.account, "alice");
-/// assert_eq!(parsed.digits, Digits::Eight);
+/// assert_eq!(parsed.digits, Digits::EIGHT);
 /// assert_eq!(parsed.algorithm, Algorithm::Sha1);
 /// ```
 pub fn parse(input: &str) -> Result<OtpAuth> {
@@ -752,7 +753,7 @@ mod tests {
             issuer: Some("ACME".to_owned()),
             account: "john:8080".to_owned(),
             algorithm: Algorithm::Sha1,
-            digits: Digits::Six,
+            digits: Digits::SIX,
             period: DEFAULT_PERIOD,
             counter: None,
         };
