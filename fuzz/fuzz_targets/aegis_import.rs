@@ -42,7 +42,9 @@ fuzz_target!(|data: &[u8]| {
     let _ = ImportFormat::detect(data);
 
     for format in [ImportFormat::Json, ImportFormat::Text, ImportFormat::Html] {
-        if let Ok(report) = import::import(data, format, 1_700_000_000) {
+        // A password is offered on every input: an encrypted export that happens to authenticate
+        // must be covered too, and one that does not is the ordinary path.
+        if let Ok(report) = import::import(data, format, 1_700_000_000, Some(b"test")) {
             assert!(
                 report.entries.len() <= import::MAX_ENTRIES,
                 "the report holds more entries than the limit allows"

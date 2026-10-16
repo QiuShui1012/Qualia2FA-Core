@@ -561,6 +561,17 @@ pub enum Error {
     #[error("the export is encrypted; a password is required")]
     ImportPasswordRequired,
 
+    /// The export is encrypted in a way this reader cannot open.
+    ///
+    /// Distinct from [`Error::ImportPasswordRequired`], which means "give me a password": here a
+    /// password was given and there is no slot it could open - the export is locked to the
+    /// platform key store or to a biometric prompt of the device that wrote it.
+    #[error("the export is encrypted with a method this reader cannot use: {reason}")]
+    ImportEncryptionUnsupported {
+        /// What is missing, in one phrase.
+        reason: &'static str,
+    },
+
     /// The password does not open the encrypted export.
     ///
     /// **One error for every failing slot**: whether the password is wrong or a slot was tampered

@@ -197,6 +197,13 @@ subtle = "2.6"
 # what makes that judgement safe to rely on: a new release would have to be audited again before
 # it is taken.
 tinyjson = "=2.5.1"
+# `aes-gcm` and `scrypt` open another authenticator's **encrypted** export, which uses
+# AES-256-GCM and scrypt. Both are audited dependencies of this crate's own tree already
+# (`chacha20poly1305` shares the same `aead`/`digest` generations, so no second copy of either
+# enters), and neither is used for anything this library writes: the vault and the sync payload
+# keep their own constructions.
+aes-gcm = "0.11.1"
+scrypt = "0.12.0"
 
 # The library's public API uses thiserror for all error types; `anyhow` must not appear
 # in a public signature.

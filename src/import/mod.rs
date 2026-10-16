@@ -38,11 +38,15 @@
 //! log, in a screenshot attached to a bug report, and in a crash dump. The same rule the rest of
 //! the crate follows applies here before the data has even entered the model.
 //!
-//! # What this version does not read
+//! # Encrypted exports
 //!
-//! **Encrypted** exports are recognised and refused with [`Error::ImportPasswordRequired`], so a
-//! caller cannot mistake "not implemented" for "nothing to import".
+//! The JSON export can be encrypted, and is then opened with a password the caller supplies. The
+//! two stages of that unlocking, and the bound every parameter it reads is held to before it
+//! decides how much memory and time to spend, are in the `encrypted` module. Without a password an
+//! encrypted export returns [`Error::ImportPasswordRequired`] rather than an empty report, so a
+//! caller cannot mistake "this needs a password" for "there was nothing to import".
 
+mod encrypted;
 pub mod html;
 pub mod json;
 mod mapping;
@@ -242,16 +246,23 @@ impl ImportReport {
 /// `format` is what the caller believes the file is; [`ImportFormat::detect`] answers that
 /// question from the content when the caller does not know. `now` is the current Unix second
 /// supplied by the caller (this library reads no clock) and becomes the creation and modification
-/// time of every imported entry.
+/// time of every imported entry. `password` is the UTF-8 bytes of the export's password, which
+/// only an encrypted export looks at: the derivation consumes bytes, and hashing text would mean
+/// choosing a normalization the format does not specify.
 ///
 /// # Errors
 ///
 /// A file-level failure: see the module documentation for the split between this and
 /// [`ImportProblem`].
-pub fn import(bytes: &[u8], format: ImportFormat, now: Timestamp) -> Result<ImportReport> {
+pub fn import(
+    bytes: &[u8],
+    format: ImportFormat,
+    now: Timestamp,
+    password: Option<&[u8]>,
+) -> Result<ImportReport> {
     ImportReport::check_size(bytes)?;
     match format {
-        ImportFormat::Json => json::import(bytes, now),
+        ImportFormat::Json => json::import(bytes, now, password),
         ImportFormat::Text => text::import(bytes, now),
         ImportFormat::Html => html::import(bytes, now),
     }
@@ -349,7 +360,7 @@ mod tests {
     #[test]
     fn an_oversized_export_is_refused_before_it_is_read() {
         let bytes = vec![0_u8; MAX_EXPORT_BYTES + 1];
-        let result = import(&bytes, ImportFormat::Json, 0);
+        let result = import(&bytes, ImportFormat::Json, 0, None);
         assert!(
             matches!(result, Err(Error::ImportFileTooLarge { .. })),
             "actual {result:?}"
@@ -363,7 +374,7 @@ mod tests {
         let text = "otpauth://totp/a?secret=JBSWY3DPEHPK3PXP\n\
                     otpauth://totp/a?secret=JBSWY3DPEHPK3PXP\n\
                     otpauth://totp/a?secret=JBSWY3DPEHPK3PXP&digits=8\n";
-        let report = import(text.as_bytes(), ImportFormat::Text, 1_700_000_000)
+        let report = import(text.as_bytes(), ImportFormat::Text, 1_700_000_000, None)
             .expect("the text is valid UTF-8");
 
         assert_eq!(

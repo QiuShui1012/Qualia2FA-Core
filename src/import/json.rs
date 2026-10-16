@@ -56,12 +56,15 @@ use crate::{Error, Result};
 /// ones.
 const SUPPORTED_VERSION: u64 = 1;
 
-/// Reads a JSON export.
+/// Reads a JSON export, encrypted or not.
+///
+/// `password` is only looked at when the export is encrypted: the database of a plaintext export
+/// is an object, and one of an encrypted export is a base64 ciphertext.
 ///
 /// # Errors
 ///
 /// A file-level failure; per-entry failures are in the report.
-pub fn import(bytes: &[u8], now: Timestamp) -> Result<ImportReport> {
+pub fn import(bytes: &[u8], now: Timestamp, password: Option<&[u8]>) -> Result<ImportReport> {
     check_depth(bytes)?;
     let text = decode_utf8(bytes)?;
     let root: JsonValue = text.parse().map_err(|_| Error::ImportMalformed {
@@ -82,14 +85,28 @@ pub fn import(bytes: &[u8], now: Timestamp) -> Result<ImportReport> {
     let database_value = document.get("db").ok_or(Error::ImportMalformed {
         reason: "the document has no database",
     })?;
-    if database_value.get::<String>().is_some() {
-        // An encrypted export carries the database as a base64 ciphertext instead of an object.
-        return Err(Error::ImportPasswordRequired);
-    }
-    let database = object(database_value).ok_or(Error::ImportMalformed {
+    let unlocked = match database_value.get::<String>() {
+        // A plaintext export carries the database as an object.
+        None => database_value.clone(),
+        // An encrypted one carries it as a base64 ciphertext, and the material that opens it sits
+        // in the header beside it.
+        Some(ciphertext) => {
+            let password = password.ok_or(Error::ImportPasswordRequired)?;
+            let header = document.get("header").ok_or(Error::ImportMalformed {
+                reason: "the encrypted export has no header",
+            })?;
+            crate::import::encrypted::unlock(ciphertext, header, password)?
+        }
+    };
+    let database = object(&unlocked).ok_or(Error::ImportMalformed {
         reason: "the database is neither an object nor a ciphertext",
     })?;
 
+    read_database(database, now)
+}
+
+/// Reads the database object of an export, plaintext or after unlocking.
+fn read_database(database: &HashMap<String, JsonValue>, now: Timestamp) -> Result<ImportReport> {
     let groups = read_groups(database.get("groups"));
     let known: HashSet<GroupId> = groups.iter().map(|group| group.id).collect();
 
@@ -432,7 +449,7 @@ mod tests {
     }"#;
 
     fn import_sample(text: &str) -> ImportReport {
-        import(text.as_bytes(), 1_700_000_000).expect("the sample is well formed")
+        import(text.as_bytes(), 1_700_000_000, None).expect("the sample is well formed")
     }
 
     #[test]
@@ -540,6 +557,7 @@ mod tests {
                 .replace(r#""version": 1,"#, r#""version": 2,"#)
                 .as_bytes(),
             0,
+            None,
         );
         assert!(
             matches!(
@@ -557,7 +575,7 @@ mod tests {
     #[test]
     fn an_encrypted_database_asks_for_a_password() {
         let text = r#"{"version":1,"header":{"slots":[],"params":{}},"db":"AAAA"}"#;
-        let result = import(text.as_bytes(), 0);
+        let result = import(text.as_bytes(), 0, None);
         assert!(
             matches!(result, Err(Error::ImportPasswordRequired)),
             "actual {result:?}"
@@ -572,7 +590,7 @@ mod tests {
             (r#"{"version":1}"#, "no database"),
             (r#"{"version":1,"db":{}}"#, "no entries"),
         ] {
-            let result = import(text.as_bytes(), 0);
+            let result = import(text.as_bytes(), 0, None);
             match result {
                 Err(Error::ImportMalformed { reason }) => assert!(
                     reason.contains(expected),
@@ -587,7 +605,7 @@ mod tests {
     fn a_deeply_nested_document_is_refused_before_it_is_parsed() {
         let depth = MAX_JSON_DEPTH + 5;
         let text = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
-        let result = import(text.as_bytes(), 0);
+        let result = import(text.as_bytes(), 0, None);
         assert!(
             matches!(result, Err(Error::ImportTooDeeplyNested { .. })),
             "actual {result:?}"
@@ -599,7 +617,7 @@ mod tests {
             "[".repeat(depth)
         );
         assert!(
-            import(text.as_bytes(), 0).is_ok(),
+            import(text.as_bytes(), 0, None).is_ok(),
             "brackets inside a string are content, not nesting"
         );
     }
