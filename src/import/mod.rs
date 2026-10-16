@@ -57,6 +57,12 @@ mod encrypted;
 pub mod html;
 pub mod json;
 mod mapping;
+mod png;
+
+// The image column of an HTML export is the only place a time step is written down, and reading it
+// is a self-contained job: a PNG in, the text of the code it draws out. It is public because a
+// caller that has the document can do the same thing with one column of it.
+pub use png::{PngError, qr_text_from_png};
 pub mod text;
 
 use crate::vault::Timestamp;
