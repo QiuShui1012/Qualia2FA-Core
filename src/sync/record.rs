@@ -288,8 +288,8 @@ fn open_tombstone(id: &EntryId, plaintext: &[u8]) -> Result<OpenedRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::Timestamp;
     use crate::vault::crypto::RecordKind;
+    use crate::vault::{EntryKind, Timestamp};
 
     fn key() -> [u8; 32] {
         [0x5A; 32]
@@ -303,8 +303,7 @@ mod tests {
             crate::otp::OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("valid secret"),
             crate::otp::Algorithm::Sha1,
             crate::otp::Digits::SIX,
-            30,
-            None,
+            EntryKind::Totp { period: 30 },
             "工作账号".to_owned(),
             Timestamp::from(1_700_000_000_u64),
             Timestamp::from(1_700_000_100_u64),

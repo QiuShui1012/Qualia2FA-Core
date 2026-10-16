@@ -37,8 +37,8 @@ use proptest::prelude::*;
 use qualia2fa_core::ExposeSecret;
 use qualia2fa_core::otp::{Algorithm, Digits, OtpSecret};
 use qualia2fa_core::vault::{
-    self, Entry, EntryId, FORMAT_VERSION, MAGIC, MasterKey, READABLE_VERSIONS, Tombstone, Vault,
-    VaultFile,
+    self, Entry, EntryId, EntryKind, FORMAT_VERSION, MAGIC, MasterKey, READABLE_VERSIONS,
+    Tombstone, Vault, VaultFile,
 };
 
 /// Generates an arbitrary byte secret.
@@ -66,6 +66,31 @@ fn arb_text() -> impl Strategy<Value = String> {
     .prop_map(|codes| codes.into_iter().filter_map(char::from_u32).collect())
 }
 
+/// Generates an arbitrary entry kind, PIN-carrying ones included.
+///
+/// The PIN strategies are deliberately narrow (digits only, bounded length): this property is
+/// about the storage format carrying whatever the model can hold, not about which PINs users
+/// choose.
+fn arb_kind() -> impl Strategy<Value = EntryKind> {
+    prop_oneof![
+        (1_u64..=604_800).prop_map(|period| EntryKind::Totp { period }),
+        any::<u64>().prop_map(|counter| EntryKind::Hotp { counter }),
+        ((1_u64..=3_600), prop::option::of("[0-9]{0,8}")).prop_map(|(period, pin)| {
+            EntryKind::Motp {
+                period,
+                pin: pin.map(qualia2fa_core::motp::MotpPin::new),
+            }
+        }),
+        ((1_u64..=3_600), prop::option::of("[0-9]{0,16}")).prop_map(|(period, pin)| {
+            EntryKind::Yandex {
+                period,
+                pin: pin.map(qualia2fa_core::yaotp::YandexPin::new),
+            }
+        }),
+        prop::bool::ANY.prop_map(|_| EntryKind::Steam),
+    ]
+}
+
 /// Generates an entry that satisfies every invariant.
 ///
 /// [`Entry::new`] rejects an empty secret, `period == 0` and over-long fields; illegal values
@@ -84,8 +109,7 @@ fn arb_entry() -> impl Strategy<Value = Entry> {
             Just(Algorithm::Sha512)
         ],
         prop_oneof![Just(Digits::SIX), Just(Digits::SEVEN), Just(Digits::EIGHT)],
-        1_u64..=604_800,
-        prop::option::of(any::<u64>()),
+        arb_kind(),
         arb_text(),
         any::<u64>(),
         any::<u64>(),
@@ -98,8 +122,7 @@ fn arb_entry() -> impl Strategy<Value = Entry> {
                 secret_bytes,
                 algorithm,
                 digits,
-                period,
-                counter,
+                kind,
                 note,
                 created_at,
                 updated_at,
@@ -111,8 +134,7 @@ fn arb_entry() -> impl Strategy<Value = Entry> {
                     OtpSecret::from_bytes(secret_bytes).expect("the strategy guarantees non-empty"),
                     algorithm,
                     digits,
-                    period,
-                    counter,
+                    kind,
                     note,
                     created_at,
                     updated_at,
@@ -169,8 +191,7 @@ fn assert_entry_eq(a: &Entry, b: &Entry) {
     );
     assert_eq!(a.algorithm, b.algorithm, "algorithm");
     assert_eq!(a.digits, b.digits, "digits");
-    assert_eq!(a.period, b.period, "period");
-    assert_eq!(a.counter, b.counter, "counter");
+    assert_eq!(a.kind, b.kind, "kind");
     assert_eq!(a.note, b.note, "note");
     assert_eq!(a.created_at, b.created_at, "created_at");
     assert_eq!(a.updated_at, b.updated_at, "updated_at");
@@ -236,10 +257,19 @@ proptest! {
         }
     }
 
-    /// **Core property 2**: changing any single byte of the file makes parsing fail.
+    /// **Core property 2**: changing any single byte of the file makes parsing fail, or leaves
+    /// the contents **identical**.
     ///
     /// This is the threat model in which an attacker can read and write the file freely.
-    /// Accepting a file with one changed byte would be silent data corruption.
+    /// Accepting a file with one changed byte and *different* content would be silent data
+    /// corruption.
+    ///
+    /// The "or identical" half is not a loophole: the format version byte is the one byte whose
+    /// change can survive parsing, because versions 2 and 3 have the same layout. For a file
+    /// with records the version takes part in every record's AAD, so such a flip fails
+    /// authentication; for an **empty** vault there is nothing to authenticate, and the result
+    /// is another valid empty vault. Asserting failure there would misreport a correct parse as
+    /// a defect — the same reasoning as core property 3 below.
     #[test]
     fn any_single_byte_flip_is_detected((vault, master, _live) in arb_vault(), flip_seed in any::<prop::sample::Index>()) {
         let mut file = VaultFile::with_master_key(clone_key(&master));
@@ -260,14 +290,22 @@ proptest! {
         let mut tampered = bytes.clone();
         tampered[index] ^= 0x01;
 
-        let result = VaultFile::parse(clone_key(&master), &tampered);
-        prop_assert!(
-            result.is_err(),
-            "byte {} was flipped ({:#04x} -> {:#04x}) yet still accepted",
-            index,
-            bytes[index],
-            tampered[index]
-        );
+        match VaultFile::parse(clone_key(&master), &tampered) {
+            Err(_) => {}
+            Ok(parsed) => {
+                prop_assert!(
+                    parsed.vault().is_empty()
+                        && parsed.vault().tombstone_count() == 0
+                        && vault.is_empty()
+                        && vault.tombstone_count() == 0,
+                    "byte {} was flipped ({:#04x} -> {:#04x}) and the file was still accepted \
+                     with different contents",
+                    index,
+                    bytes[index],
+                    tampered[index]
+                );
+            }
+        }
     }
 
     /// **Core property 3**: truncation must not let **any data** pass verification.
@@ -399,24 +437,11 @@ proptest! {
 
 /// Copies an entry.
 ///
-/// [`OtpSecret`] deliberately does not implement `Clone`, so the entry is rebuilt through
-/// Base32. **Test-only**: on a production path, copying a seed should be an explicit and
-/// justified operation.
+/// `Entry` implements neither `Clone` nor a public way of reading a PIN back out, so the copy
+/// goes through the storage codec, which is the same path the sync merge uses. **Test-only**:
+/// on a production path, copying a seed should be an explicit and justified operation.
 fn clone_entry(entry: &Entry) -> Entry {
-    Entry::new(
-        entry.name.clone(),
-        entry.issuer.clone(),
-        entry.account.clone(),
-        OtpSecret::from_base32(&entry.secret.to_base32()).expect("the original seed is valid"),
-        entry.algorithm,
-        entry.digits,
-        entry.period,
-        entry.counter,
-        entry.note.clone(),
-        entry.created_at,
-        entry.updated_at,
-    )
-    .expect("the rebuilt entry is still valid")
+    entry.duplicate().expect("the entry can be copied")
 }
 
 /// The file header layout is an external contract: these assertions do not drift with the

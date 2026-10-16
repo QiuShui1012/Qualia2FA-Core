@@ -38,7 +38,7 @@ use qualia_dik::device::{DEVICE_ID_LEN, DeviceId};
 use qualia2fa_core::ExposeSecret as _;
 use qualia2fa_core::otp::{Algorithm, Digits, OtpSecret};
 use qualia2fa_core::sync::{self, MergedRecord, Payload, RecordSet, SeenSyncIds};
-use qualia2fa_core::vault::{Entry, MasterKey, Timestamp, Vault};
+use qualia2fa_core::vault::{Entry, EntryKind, MasterKey, Timestamp, Vault};
 
 /// Generates an arbitrary byte secret.
 fn arb_secret_bytes() -> impl Strategy<Value = Vec<u8>> {
@@ -65,6 +65,30 @@ fn arb_text() -> impl Strategy<Value = String> {
     )
 }
 
+/// Generates an arbitrary entry kind, PIN-carrying ones included.
+///
+/// The PIN strategies are deliberately narrow (digits only, bounded length): this property is
+/// about the sync path carrying whatever the model can hold, not about which PINs users choose.
+fn arb_kind() -> impl Strategy<Value = EntryKind> {
+    prop_oneof![
+        (1_u64..=600).prop_map(|period| EntryKind::Totp { period }),
+        any::<u64>().prop_map(|counter| EntryKind::Hotp { counter }),
+        ((1_u64..=600), prop::option::of("[0-9]{0,8}")).prop_map(|(period, pin)| {
+            EntryKind::Motp {
+                period,
+                pin: pin.map(qualia2fa_core::motp::MotpPin::new),
+            }
+        }),
+        ((1_u64..=600), prop::option::of("[0-9]{0,16}")).prop_map(|(period, pin)| {
+            EntryKind::Yandex {
+                period,
+                pin: pin.map(qualia2fa_core::yaotp::YandexPin::new),
+            }
+        }),
+        prop::bool::ANY.prop_map(|_| EntryKind::Steam),
+    ]
+}
+
 /// Generates an arbitrary entry.
 fn arb_entry() -> impl Strategy<Value = Entry> {
     (
@@ -78,8 +102,7 @@ fn arb_entry() -> impl Strategy<Value = Entry> {
             Just(Algorithm::Sha512)
         ],
         prop_oneof![Just(Digits::SIX), Just(Digits::EIGHT)],
-        1_u64..=600,
-        prop::option::of(any::<u64>()),
+        arb_kind(),
         arb_text(),
         1_u64..=2_000_000_000,
         1_u64..=2_000_000_000,
@@ -92,8 +115,7 @@ fn arb_entry() -> impl Strategy<Value = Entry> {
                 secret,
                 algorithm,
                 digits,
-                period,
-                counter,
+                kind,
                 note,
                 created_at,
                 updated_at,
@@ -105,8 +127,7 @@ fn arb_entry() -> impl Strategy<Value = Entry> {
                     OtpSecret::from_bytes(secret).expect("the generator guarantees non-empty"),
                     algorithm,
                     digits,
-                    period,
-                    counter,
+                    kind,
                     note,
                     Timestamp::from(created_at),
                     Timestamp::from(updated_at),
@@ -149,15 +170,14 @@ fn vault_contents(vault: &Vault) -> BTreeMap<String, String> {
         map.insert(
             format!("entry:{id}"),
             format!(
-                "{}\u{1}{:?}\u{1}{}\u{1}{}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{:?}\u{1}{}\u{1}{}\u{1}{}",
+                "{}\u{1}{:?}\u{1}{}\u{1}{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{}\u{1}{}",
                 entry.name,
                 entry.issuer,
                 entry.account,
                 entry.secret.to_base32(),
                 entry.algorithm,
                 entry.digits,
-                entry.period,
-                entry.counter,
+                entry.kind,
                 entry.note,
                 entry.created_at,
                 entry.updated_at,
@@ -273,8 +293,7 @@ proptest! {
             );
             prop_assert_eq!(received.algorithm, original.algorithm, "algorithm");
             prop_assert_eq!(received.digits, original.digits, "digits");
-            prop_assert_eq!(received.period, original.period, "period");
-            prop_assert_eq!(received.counter, original.counter, "counter");
+            prop_assert_eq!(&received.kind, &original.kind, "kind");
             prop_assert_eq!(&received.note, &original.note, "note");
             prop_assert_eq!(received.created_at, original.created_at, "created_at");
             prop_assert_eq!(received.updated_at, original.updated_at, "updated_at");

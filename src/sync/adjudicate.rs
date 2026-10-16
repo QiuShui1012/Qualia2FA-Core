@@ -138,7 +138,7 @@ mod tests {
     use super::*;
     use crate::otp::{Algorithm, Digits, OtpSecret};
     use crate::sync::{MergedRecord, RecordSet, merge_into};
-    use crate::vault::{Entry, EntryId, Timestamp, Tombstone};
+    use crate::vault::{Entry, EntryId, EntryKind, Timestamp, Tombstone};
 
     /// A sample entry whose content is recognisable in an assertion.
     fn sample_entry(name: &str, updated_at: u64) -> Entry {
@@ -149,8 +149,7 @@ mod tests {
             OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("valid Base32"),
             Algorithm::Sha1,
             Digits::SIX,
-            30,
-            None,
+            EntryKind::Totp { period: 30 },
             String::new(),
             Timestamp::from(1_700_000_000_u64),
             Timestamp::from(updated_at),

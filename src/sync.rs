@@ -897,7 +897,9 @@ const _: () = {
 mod tests {
     use super::*;
     use crate::otp::{Algorithm, Digits, OtpSecret};
-    use crate::vault::{Entry as VaultEntry, RecordKind, Timestamp, Vault, master_key_to_bytes};
+    use crate::vault::{
+        Entry as VaultEntry, EntryKind, RecordKind, Timestamp, Vault, master_key_to_bytes,
+    };
 
     const _: () = assert!(LEGACY_FORMAT_VERSION_1 != FORMAT_VERSION);
 
@@ -910,8 +912,7 @@ mod tests {
             OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("valid Base32"),
             Algorithm::Sha1,
             Digits::SIX,
-            30,
-            None,
+            EntryKind::Totp { period: 30 },
             String::new(),
             Timestamp::from(1_700_000_000_u64),
             Timestamp::from(1_700_000_000_u64),

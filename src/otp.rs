@@ -606,6 +606,12 @@ const STEAM_ALPHABET: &[u8; 26] = b"23456789BCDFGHJKMNPQRTVWXY";
 /// The Steam Guard code length is always 5.
 pub const STEAM_DIGITS: usize = 5;
 
+/// Time step of Steam Guard in seconds.
+///
+/// Fixed by the scheme rather than stored per entry: Steam Guard carries no field for it and
+/// no implementation offers a different value.
+pub const STEAM_PERIOD: u64 = 30;
+
 /// Computes a Steam Guard code.
 ///
 /// Steam does not use decimal digits: it repeatedly reduces the 31-bit truncated

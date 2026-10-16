@@ -111,7 +111,7 @@ pub use crypto::{
     KEY_CHECK_LEN, MASTER_KEY_LEN, MasterKey, NONCE_LEN, TAG_LEN, key_check, master_key_to_bytes,
     verify_key_check,
 };
-pub use entry::{Entry, EntryId, Timestamp, entry_from_parsed_uri};
+pub use entry::{Entry, EntryId, EntryKind, Timestamp, entry_from_parsed_uri};
 
 pub(crate) use crypto::RecordKind;
 
@@ -239,6 +239,24 @@ mod tag {
     ///
     /// Reserved for originator-side conflict adjudication; not written yet.
     pub(super) const DELETED_BY: u8 = 0x0D;
+    /// Which scheme the entry uses (TOTP / HOTP / mOTP / Yandex OTP / Steam Guard).
+    ///
+    /// Added in format version 3. A version 1 or 2 file has no such node, and the parser then
+    /// falls back to the older rule: a counter node means HOTP, its absence means TOTP.
+    pub(super) const ENTRY_KIND: u8 = 0x0E;
+    /// mOTP PIN (UTF-8 text).
+    pub(super) const MOTP_PIN: u8 = 0x0F;
+    /// Yandex OTP PIN (UTF-8 text).
+    pub(super) const YANDEX_PIN: u8 = 0x10;
+
+    /// Highest tag this version knows.
+    ///
+    /// A node whose tag is at or below this one is a **known** field, so a repeat is a
+    /// malformed entry rather than forward compatibility; anything above it is skipped, which is
+    /// what lets a newer version add fields. Named here so the duplicate check cannot drift
+    /// away from the tag list above, and kept at 0x10 so it still fits the bitmap of
+    /// [`decode_entry`] without an over-wide shift.
+    pub(super) const KNOWN_TAG_MAX: u8 = YANDEX_PIN;
 
     /// Value of the algorithm field.
     pub(super) const ALG_SHA1: u8 = 1;
@@ -246,6 +264,17 @@ mod tag {
     pub(super) const ALG_SHA256: u8 = 2;
     /// Value of the algorithm field.
     pub(super) const ALG_SHA512: u8 = 3;
+
+    /// Value of the entry kind field: TOTP.
+    pub(super) const KIND_TOTP: u8 = 1;
+    /// Value of the entry kind field: HOTP.
+    pub(super) const KIND_HOTP: u8 = 2;
+    /// Value of the entry kind field: mOTP.
+    pub(super) const KIND_MOTP: u8 = 3;
+    /// Value of the entry kind field: Yandex OTP.
+    pub(super) const KIND_YANDEX: u8 = 4;
+    /// Value of the entry kind field: Steam Guard.
+    pub(super) const KIND_STEAM: u8 = 5;
 
     // The digit count has no constants of its own: a count from 1 to 9 is stored as the
     // byte holding that number, so [`otp::Digits::as_byte`] is the whole mapping.
@@ -759,6 +788,13 @@ fn write_record(
 ///
 /// With the uniform format, skipping an unknown node has one path: read the tag, read the
 /// u32 length, skip that many bytes.
+///
+/// # The step and the counter nodes are still written
+///
+/// [`tag::ENTRY_KIND`] says which scheme the entry uses, but the step (or the counter) keeps
+/// travelling in the node it always travelled in. That is what lets a version 1 or 2 file be
+/// read without a special case: its kind is recovered from exactly those nodes, and a version
+/// 3 file is read through the same code path once the kind node has been seen.
 pub(crate) fn encode_entry(entry: &VaultEntry) -> Result<Vec<u8>> {
     let mut out = Vec::new();
 
@@ -776,9 +812,27 @@ pub(crate) fn encode_entry(entry: &VaultEntry) -> Result<Vec<u8>> {
         &[algorithm_to_byte(entry.algorithm)],
     );
     put_node(&mut out, tag::DIGITS, &[digits_to_byte(entry.digits)]);
-    put_node(&mut out, tag::PERIOD, &entry.period.to_be_bytes());
-    if let Some(counter) = entry.counter {
-        put_node(&mut out, tag::COUNTER, &counter.to_be_bytes());
+    put_node(
+        &mut out,
+        tag::ENTRY_KIND,
+        &[entry_kind_to_byte(&entry.kind)],
+    );
+    match &entry.kind {
+        EntryKind::Totp { period }
+        | EntryKind::Motp { period, .. }
+        | EntryKind::Yandex { period, .. } => {
+            put_node(&mut out, tag::PERIOD, &period.to_be_bytes());
+        }
+        EntryKind::Hotp { counter } => put_node(&mut out, tag::COUNTER, &counter.to_be_bytes()),
+        EntryKind::Steam => {
+            put_node(&mut out, tag::PERIOD, &otp::STEAM_PERIOD.to_be_bytes());
+        }
+    }
+    if let Some(pin) = entry.kind.motp_pin() {
+        put_node(&mut out, tag::MOTP_PIN, pin.expose().as_bytes());
+    }
+    if let Some(pin) = entry.kind.yandex_pin() {
+        put_node(&mut out, tag::YANDEX_PIN, pin.expose().as_bytes());
     }
     put_node(&mut out, tag::NOTE, entry.note.as_bytes());
     put_node(&mut out, tag::CREATED_AT, &entry.created_at.to_be_bytes());
@@ -809,47 +863,64 @@ pub(crate) fn encode_tombstone(tombstone: &Tombstone) -> Vec<u8> {
     out
 }
 
+/// Fields accumulated while parsing an entry's plaintext: each is filled in through an
+/// `Option`, and the required ones are checked at the end.
+///
+/// A module-level type rather than one local to [`decode_entry`] because
+/// [`assemble_entry_kind`], which turns the collected nodes into an [`EntryKind`], needs to see
+/// them.
+#[derive(Default)]
+struct Fields {
+    /// Display name.
+    name: Option<String>,
+    /// Issuer; an empty node is normalized to `None`.
+    issuer: Option<String>,
+    /// Account name.
+    account: Option<String>,
+    /// Secret.
+    secret: Option<Vec<u8>>,
+    /// Algorithm.
+    algorithm: Option<otp::Algorithm>,
+    /// Digits.
+    digits: Option<otp::Digits>,
+    /// Raw entry kind byte, kept as a byte until its state nodes have all been seen.
+    kind: Option<u8>,
+    /// Period.
+    period: Option<u64>,
+    /// Counter.
+    counter: Option<u64>,
+    /// mOTP PIN.
+    motp_pin: Option<String>,
+    /// Yandex OTP PIN.
+    yandex_pin: Option<String>,
+    /// Note.
+    note: String,
+    /// Creation time.
+    created_at: Option<u64>,
+    /// Modification time.
+    updated_at: Option<u64>,
+}
+
 /// Parses the plaintext of an entry.
 ///
-/// A known tag (up to `DELETED_BY`, 0x0D) that appears twice is rejected as
-/// [`Error::VaultDuplicateField`]; unknown tags are skipped by their length, and several
-/// nodes sharing an unknown tag are tolerated, since a newer version may write them
-/// legitimately.
+/// A node whose tag is at or below [`tag::KNOWN_TAG_MAX`] that appears twice is rejected as
+/// [`Error::VaultDuplicateField`]; unknown tags are skipped by their length, and several nodes
+/// sharing an unknown tag are tolerated, since a newer version may write them legitimately.
+///
+/// # How the entry kind is recovered
+///
+/// A version 3 file carries [`tag::ENTRY_KIND`] and that node decides, with the step / counter
+/// and PIN nodes supplying the state it needs. A version 1 or 2 file has no such node, and the
+/// older rule applies unchanged: a counter node means HOTP, its absence means TOTP. An unknown
+/// kind byte is [`Error::VaultCorrupt`] rather than a guess — a guess would produce codes that
+/// never work.
 ///
 /// The node loop is bounded by the input length, so a file of pure garbage cannot spin
 /// it.
 pub(crate) fn decode_entry(data: &[u8]) -> Result<VaultEntry> {
-    /// Fields accumulated during parsing: each is filled in through an `Option`, and the
-    /// required ones are checked at the end.
-    #[derive(Default)]
-    struct Fields {
-        /// Display name.
-        name: Option<String>,
-        /// Issuer; an empty node is normalized to `None`.
-        issuer: Option<String>,
-        /// Account name.
-        account: Option<String>,
-        /// Secret.
-        secret: Option<Vec<u8>>,
-        /// Algorithm.
-        algorithm: Option<otp::Algorithm>,
-        /// Digits.
-        digits: Option<otp::Digits>,
-        /// Period.
-        period: Option<u64>,
-        /// Counter.
-        counter: Option<u64>,
-        /// Note.
-        note: String,
-        /// Creation time.
-        created_at: Option<u64>,
-        /// Modification time.
-        updated_at: Option<u64>,
-    }
-
     let mut reader = Reader::new(data);
     let mut f = Fields::default();
-    let mut seen: u16 = 0;
+    let mut seen: u32 = 0;
 
     let mut guard = data.len() + 1;
     while !reader.is_empty() {
@@ -865,8 +936,8 @@ pub(crate) fn decode_entry(data: &[u8]) -> Result<VaultEntry> {
         }
         let payload = reader.take(len).ok_or(Error::VaultTruncated)?;
 
-        if node_tag <= tag::DELETED_BY {
-            let bit = 1_u16 << node_tag;
+        if node_tag <= tag::KNOWN_TAG_MAX {
+            let bit = 1_u32 << node_tag;
             if seen & bit != 0 {
                 return Err(Error::VaultDuplicateField { tag: node_tag });
             }
@@ -891,8 +962,18 @@ pub(crate) fn decode_entry(data: &[u8]) -> Result<VaultEntry> {
                 f.digits =
                     Some(digits_from_byte(single_byte(payload)?).ok_or(Error::VaultCorrupt)?);
             }
+            tag::ENTRY_KIND => {
+                let byte = single_byte(payload)?;
+                if entry_kind_byte_is_known(byte) {
+                    f.kind = Some(byte);
+                } else {
+                    return Err(Error::VaultCorrupt);
+                }
+            }
             tag::PERIOD => f.period = Some(u64_from(payload)?),
             tag::COUNTER => f.counter = Some(u64_from(payload)?),
+            tag::MOTP_PIN => f.motp_pin = Some(utf8(payload)?),
+            tag::YANDEX_PIN => f.yandex_pin = Some(utf8(payload)?),
             tag::NOTE => f.note = utf8(payload)?,
             tag::CREATED_AT => f.created_at = Some(u64_from(payload)?),
             tag::UPDATED_AT => f.updated_at = Some(u64_from(payload)?),
@@ -900,6 +981,7 @@ pub(crate) fn decode_entry(data: &[u8]) -> Result<VaultEntry> {
         }
     }
 
+    let kind = assemble_entry_kind(&mut f)?;
     let created_at = f.created_at.ok_or(Error::VaultCorrupt)?;
     Entry::new(
         f.name.ok_or(Error::VaultCorrupt)?,
@@ -908,12 +990,81 @@ pub(crate) fn decode_entry(data: &[u8]) -> Result<VaultEntry> {
         otp::OtpSecret::from_bytes(f.secret.ok_or(Error::VaultCorrupt)?)?,
         f.algorithm.ok_or(Error::VaultCorrupt)?,
         f.digits.ok_or(Error::VaultCorrupt)?,
-        f.period.ok_or(Error::VaultCorrupt)?,
-        f.counter,
+        kind,
         f.note,
         created_at,
         f.updated_at.unwrap_or(created_at),
     )
+}
+
+/// Assembles the entry kind from the parsed nodes.
+///
+/// The three cases differ in where the scheme comes from, and all three end in the same place:
+///
+/// - **A kind node is present** (format version 3): it decides, and the nodes it needs must be
+///   there. A PIN node on a scheme without a PIN, or a missing step, is a malformed entry.
+/// - **No kind node** (format versions 1 and 2): the old rule decides — a counter node means
+///   HOTP, its absence means TOTP — and a PIN node cannot appear, because those versions had
+///   no such field.
+fn assemble_entry_kind(f: &mut Fields) -> Result<EntryKind> {
+    let pin_fields_are_empty = f.motp_pin.is_none() && f.yandex_pin.is_none();
+
+    let Some(byte) = f.kind else {
+        if !pin_fields_are_empty {
+            return Err(Error::VaultCorrupt);
+        }
+        return match f.counter {
+            Some(counter) => Ok(EntryKind::Hotp { counter }),
+            None => Ok(EntryKind::Totp {
+                period: f.period.ok_or(Error::VaultCorrupt)?,
+            }),
+        };
+    };
+
+    let pin_only_where_meaningful = |pin: &Option<String>| pin.is_some();
+    match byte {
+        tag::KIND_TOTP => {
+            if !pin_fields_are_empty {
+                return Err(Error::VaultCorrupt);
+            }
+            Ok(EntryKind::Totp {
+                period: f.period.ok_or(Error::VaultCorrupt)?,
+            })
+        }
+        tag::KIND_HOTP => {
+            if !pin_fields_are_empty {
+                return Err(Error::VaultCorrupt);
+            }
+            Ok(EntryKind::Hotp {
+                counter: f.counter.ok_or(Error::VaultCorrupt)?,
+            })
+        }
+        tag::KIND_MOTP => {
+            if pin_only_where_meaningful(&f.yandex_pin) {
+                return Err(Error::VaultCorrupt);
+            }
+            Ok(EntryKind::Motp {
+                period: f.period.ok_or(Error::VaultCorrupt)?,
+                pin: f.motp_pin.take().map(crate::motp::MotpPin::new),
+            })
+        }
+        tag::KIND_YANDEX => {
+            if pin_only_where_meaningful(&f.motp_pin) {
+                return Err(Error::VaultCorrupt);
+            }
+            Ok(EntryKind::Yandex {
+                period: f.period.ok_or(Error::VaultCorrupt)?,
+                pin: f.yandex_pin.take().map(crate::yaotp::YandexPin::new),
+            })
+        }
+        tag::KIND_STEAM => {
+            if !pin_fields_are_empty {
+                return Err(Error::VaultCorrupt);
+            }
+            Ok(EntryKind::Steam)
+        }
+        _ => Err(Error::VaultCorrupt),
+    }
 }
 
 /// Parses the plaintext of a tombstone.
@@ -1007,6 +1158,32 @@ fn digits_from_byte(byte: u8) -> Option<otp::Digits> {
     otp::Digits::try_from(byte).ok()
 }
 
+/// Entry kind to storage byte.
+///
+/// Only the **scheme** is stored here; the step, the counter and the PINs travel in nodes of
+/// their own, so that a version 1 or 2 file (which has no kind node) can be reconstructed from
+/// the same nodes.
+const fn entry_kind_to_byte(kind: &EntryKind) -> u8 {
+    match kind {
+        EntryKind::Totp { .. } => tag::KIND_TOTP,
+        EntryKind::Hotp { .. } => tag::KIND_HOTP,
+        EntryKind::Motp { .. } => tag::KIND_MOTP,
+        EntryKind::Yandex { .. } => tag::KIND_YANDEX,
+        EntryKind::Steam => tag::KIND_STEAM,
+    }
+}
+
+/// Whether a kind byte names a scheme this build knows.
+///
+/// A byte from a newer version is **rejected rather than guessed**: reading an unknown scheme
+/// as TOTP would produce an entry whose codes never work, and nothing in the UI would say why.
+const fn entry_kind_byte_is_known(byte: u8) -> bool {
+    matches!(
+        byte,
+        tag::KIND_TOTP | tag::KIND_HOTP | tag::KIND_MOTP | tag::KIND_YANDEX | tag::KIND_STEAM
+    )
+}
+
 /// Writes bytes to a file atomically.
 ///
 /// "Write a file" is not one operation at the OS level: the target is truncated and then
@@ -1094,8 +1271,7 @@ mod tests {
             secret(),
             otp::Algorithm::Sha256,
             otp::Digits::EIGHT,
-            30,
-            None,
+            EntryKind::Totp { period: 30 },
             "note".into(),
             1_700_000_000,
             1_700_000_123,
@@ -1111,8 +1287,7 @@ mod tests {
             secret(),
             otp::Algorithm::Sha1,
             otp::Digits::SIX,
-            30,
-            Some(42),
+            EntryKind::Hotp { counter: 42 },
             String::new(),
             1_700_000_000,
             1_700_000_000,
@@ -1131,8 +1306,7 @@ mod tests {
         assert_eq!(a.secret.to_base32(), b.secret.to_base32(), "secret");
         assert_eq!(a.algorithm, b.algorithm, "algorithm");
         assert_eq!(a.digits, b.digits, "digits");
-        assert_eq!(a.period, b.period, "period");
-        assert_eq!(a.counter, b.counter, "counter");
+        assert_eq!(a.kind, b.kind, "kind");
         assert_eq!(a.note, b.note, "note");
         assert_eq!(a.created_at, b.created_at, "created_at");
         assert_eq!(a.updated_at, b.updated_at, "updated_at");
@@ -1182,8 +1356,12 @@ mod tests {
         )
         .expect("parsing succeeds");
         let restored = reopened.vault().get(&id).expect("the entry must exist");
-        assert_eq!(restored.counter, Some(42));
-        assert_eq!(restored.uri_type(), crate::uri::UriType::Hotp);
+        assert_eq!(restored.kind, EntryKind::Hotp { counter: 42 });
+        assert_eq!(
+            restored.uri_type(),
+            Some(crate::uri::UriType::Hotp),
+            "the restored entry is still HOTP"
+        );
     }
 
     /// Tombstones survive a round trip and do **not** turn into live entries.
@@ -1596,15 +1774,54 @@ mod tests {
         );
     }
 
+    /// Builds a valid entry of the given kind, for codec round trips.
+    fn entry_with_kind(kind: EntryKind) -> VaultEntry {
+        Entry::new(
+            "kind".into(),
+            Some("Example".into()),
+            "alice".into(),
+            secret(),
+            otp::Algorithm::Sha1,
+            otp::Digits::SIX,
+            kind,
+            String::new(),
+            1_700_000_000,
+            1_700_000_000,
+        )
+        .expect("valid entry")
+    }
+
+    /// Builds an entry plaintext the way **format version 2** wrote it: no kind node.
+    ///
+    /// Written by hand rather than through [`encode_entry`], which always writes a kind node
+    /// now. A round trip through the current encoder therefore cannot stand in for a version 2
+    /// file: it would prove only that this build agrees with itself.
+    fn version_2_plaintext(with_counter: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_node(&mut out, tag::NAME, b"legacy");
+        put_node(&mut out, tag::ACCOUNT, b"alice");
+        put_node(&mut out, tag::SECRET, b"JBSWY3DPEHPK3PXP");
+        put_node(&mut out, tag::ALGORITHM, &[tag::ALG_SHA1]);
+        put_node(&mut out, tag::DIGITS, &[otp::Digits::SIX.as_byte()]);
+        put_node(&mut out, tag::PERIOD, &30_u64.to_be_bytes());
+        if with_counter {
+            put_node(&mut out, tag::COUNTER, &7_u64.to_be_bytes());
+        }
+        put_node(&mut out, tag::NOTE, b"");
+        put_node(&mut out, tag::CREATED_AT, &0_u64.to_be_bytes());
+        put_node(&mut out, tag::UPDATED_AT, &0_u64.to_be_bytes());
+        out
+    }
+
     /// A version 2 file is still readable: version byte 2, the trailing master key check
-    /// value, record AAD version 2. Built by hand because serialization always writes the
-    /// current version now; the property pinned here is the byte layout itself.
+    /// value, record AAD version 2, and a plaintext without a kind node. Built by hand because
+    /// serialization always writes the current version now; the property pinned here is the
+    /// byte layout itself.
     #[test]
     fn version_2_files_are_still_readable() {
         let master = MasterKey::generate().expect("OS randomness available");
         let id = EntryId::generate().expect("OS randomness available");
-        let entry = sample_entry("version-2-format");
-        let plaintext = encode_entry(&entry).expect("encoding succeeds");
+        let plaintext = version_2_plaintext(false);
         let (nonce, ciphertext) =
             crypto::seal(&master, RecordKind::Entry, &id, 2, &plaintext).expect("sealing succeeds");
 
@@ -1629,9 +1846,13 @@ mod tests {
         )
         .expect("a version 2 file must still parse");
         assert_eq!(reopened.vault().len(), 1, "the entry must be read back");
+        let (restored_id, restored) = reopened.vault().iter().next().expect("one entry");
+        assert_eq!(*restored_id, id, "the identifier survives");
+        assert_eq!(restored.name, "legacy");
         assert_eq!(
-            reopened.vault().iter().next().expect("one entry").1.name,
-            "version-2-format"
+            restored.kind,
+            EntryKind::Totp { period: 30 },
+            "a version 2 plaintext has no kind node, so the old rule decides"
         );
 
         // Unlike version 1, the check value refuses a wrong key before any record is read.
@@ -1640,6 +1861,162 @@ mod tests {
             VaultFile::parse(wrong, &out).is_err(),
             "a version 2 file must fail under the wrong key"
         );
+    }
+
+    /// A plaintext with no kind node is read by the **older rule**: a counter node means HOTP,
+    /// its absence means TOTP.
+    ///
+    /// Asserted on the decoded plaintext rather than through a round trip; the round trip would
+    /// only prove that the encoder and decoder agree with each other.
+    #[test]
+    fn a_plaintext_without_a_kind_node_falls_back_to_the_old_rule() {
+        let totp = decode_entry(&version_2_plaintext(false)).expect("a version 2 plaintext parses");
+        assert_eq!(totp.kind, EntryKind::Totp { period: 30 });
+
+        let hotp = decode_entry(&version_2_plaintext(true)).expect("a version 2 plaintext parses");
+        assert_eq!(hotp.kind, EntryKind::Hotp { counter: 7 });
+    }
+
+    /// Every kind survives the codec, PINs and steps included.
+    ///
+    /// The kinds are listed one by one rather than derived from a list of constants, so adding
+    /// a variant without teaching the codec about it fails here.
+    #[test]
+    fn every_entry_kind_round_trips() {
+        let kinds = [
+            EntryKind::Totp { period: 45 },
+            EntryKind::Hotp { counter: 9_999 },
+            EntryKind::Motp {
+                period: 10,
+                pin: Some(crate::motp::MotpPin::new("1234".to_owned())),
+            },
+            EntryKind::Motp {
+                period: 10,
+                pin: None,
+            },
+            EntryKind::Yandex {
+                period: 30,
+                pin: Some(crate::yaotp::YandexPin::new("7586".to_owned())),
+            },
+            EntryKind::Yandex {
+                period: 60,
+                pin: None,
+            },
+            EntryKind::Steam,
+        ];
+
+        for kind in kinds {
+            let entry = entry_with_kind(kind);
+            let encoded = encode_entry(&entry).expect("encoding succeeds");
+            let decoded = decode_entry(&encoded).expect("the encoded entry must decode");
+            assert_entry_eq(&entry, &decoded);
+        }
+    }
+
+    /// A PIN node is rejected on a scheme that has no PIN.
+    #[test]
+    fn a_pin_node_on_a_scheme_without_a_pin_is_rejected() {
+        for kind in [tag::KIND_TOTP, tag::KIND_HOTP, tag::KIND_STEAM] {
+            let mut plaintext = Vec::new();
+            put_node(&mut plaintext, tag::NAME, b"n");
+            put_node(&mut plaintext, tag::ACCOUNT, b"a");
+            put_node(&mut plaintext, tag::SECRET, b"secret");
+            put_node(&mut plaintext, tag::ALGORITHM, &[tag::ALG_SHA1]);
+            put_node(&mut plaintext, tag::DIGITS, &[otp::Digits::SIX.as_byte()]);
+            put_node(&mut plaintext, tag::ENTRY_KIND, &[kind]);
+            put_node(&mut plaintext, tag::PERIOD, &30_u64.to_be_bytes());
+            put_node(&mut plaintext, tag::MOTP_PIN, b"1234");
+            put_node(&mut plaintext, tag::CREATED_AT, &0_u64.to_be_bytes());
+            assert!(
+                matches!(decode_entry(&plaintext), Err(Error::VaultCorrupt)),
+                "a PIN on a scheme without one must be rejected"
+            );
+        }
+    }
+
+    /// A scheme's step must be present, and an unknown kind byte is never guessed.
+    #[test]
+    fn an_unknown_or_incomplete_kind_is_rejected() {
+        let base = |kind: Option<u8>, period: bool| {
+            let mut plaintext = Vec::new();
+            put_node(&mut plaintext, tag::NAME, b"n");
+            put_node(&mut plaintext, tag::ACCOUNT, b"a");
+            put_node(&mut plaintext, tag::SECRET, b"secret");
+            put_node(&mut plaintext, tag::ALGORITHM, &[tag::ALG_SHA1]);
+            put_node(&mut plaintext, tag::DIGITS, &[otp::Digits::SIX.as_byte()]);
+            if let Some(kind) = kind {
+                put_node(&mut plaintext, tag::ENTRY_KIND, &[kind]);
+            }
+            if period {
+                put_node(&mut plaintext, tag::PERIOD, &30_u64.to_be_bytes());
+            }
+            put_node(&mut plaintext, tag::CREATED_AT, &0_u64.to_be_bytes());
+            plaintext
+        };
+
+        assert!(
+            matches!(decode_entry(&base(Some(0), true)), Err(Error::VaultCorrupt)),
+            "kind byte 0 is not a scheme"
+        );
+        assert!(
+            matches!(
+                decode_entry(&base(Some(tag::KIND_STEAM + 1), true)),
+                Err(Error::VaultCorrupt)
+            ),
+            "a kind byte from a newer version must be rejected, not guessed"
+        );
+        assert!(
+            matches!(
+                decode_entry(&base(Some(tag::KIND_MOTP), false)),
+                Err(Error::VaultCorrupt)
+            ),
+            "a kind carrying a step must have one"
+        );
+        assert!(
+            matches!(
+                decode_entry(&base(Some(tag::KIND_HOTP), true)),
+                Err(Error::VaultCorrupt)
+            ),
+            "HOTP needs a counter, not a step"
+        );
+        assert!(
+            decode_entry(&base(Some(tag::KIND_TOTP), true)).is_ok(),
+            "a complete TOTP entry is accepted"
+        );
+    }
+
+    /// A repeated node is rejected for the **new** tags too.
+    ///
+    /// The duplicate check keeps one bit per known tag, so it has to cover the tags added with
+    /// the entry kind: a bitmap that stopped at the older tag range would let a second kind
+    /// node, or a second PIN node, slip through and be decided by whichever came last.
+    #[test]
+    fn duplicate_nodes_are_rejected_for_the_new_tags_too() {
+        for duplicated in [tag::ENTRY_KIND, tag::MOTP_PIN, tag::YANDEX_PIN] {
+            let mut plaintext = Vec::new();
+            put_node(&mut plaintext, tag::NAME, b"n");
+            put_node(&mut plaintext, tag::ACCOUNT, b"a");
+            put_node(&mut plaintext, tag::SECRET, b"secret");
+            put_node(&mut plaintext, tag::ALGORITHM, &[tag::ALG_SHA1]);
+            put_node(&mut plaintext, tag::DIGITS, &[otp::Digits::SIX.as_byte()]);
+            put_node(&mut plaintext, tag::PERIOD, &30_u64.to_be_bytes());
+            put_node(&mut plaintext, tag::CREATED_AT, &0_u64.to_be_bytes());
+            for _ in 0..2 {
+                let payload: &[u8] = match duplicated {
+                    tag::ENTRY_KIND => &[tag::KIND_TOTP],
+                    _ => b"1234",
+                };
+                put_node(&mut plaintext, duplicated, payload);
+            }
+
+            match decode_entry(&plaintext) {
+                Err(Error::VaultDuplicateField { tag }) => assert_eq!(tag, duplicated),
+                other => panic!(
+                    "tag {duplicated:#04x} appearing twice must be rejected, actual {}",
+                    if other.is_ok() { "ok" } else { "another error" }
+                ),
+            }
+        }
     }
 
     /// The "old files stay readable" promise, pinned against the list itself.

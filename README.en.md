@@ -41,7 +41,7 @@ use qualia2fa_core::otp::{self, Algorithm, Digits, OtpSecret};
 
 let secret = OtpSecret::from_base32("JBSWY3DPEHPK3PXP")?;
 // The current time is passed in by the caller — this library does not read the clock
-let code = otp::totp_code(&secret, 1_700_000_000, 30, Algorithm::Sha1, Digits::Six)?;
+let code = otp::totp_code(&secret, 1_700_000_000, 30, Algorithm::Sha1, Digits::SIX)?;
 assert_eq!(code.len(), 6);
 ```
 

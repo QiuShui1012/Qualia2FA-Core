@@ -18,8 +18,8 @@
 //! # What the plaintext holds
 //!
 //! After decryption a 2FA entry is carried by [`Entry`]: display name, issuer, account,
-//! secret, algorithm, digits, period or counter, note, and the creation and modification
-//! timestamps.
+//! secret, algorithm, digits, the entry kind (with the time step, the HOTP counter and any PIN
+//! the scheme needs), note, and the creation and modification timestamps.
 //!
 //! # What the plaintext does not hold
 //!
@@ -110,6 +110,107 @@ impl core::fmt::Display for EntryId {
 /// require synchronized clocks - and the clock of an offline device is not trustworthy.
 pub type Timestamp = u64;
 
+/// What kind of one-time-password entry this is.
+///
+/// # Why the kind is a field of its own
+///
+/// The earlier model decided between TOTP and HOTP from `counter: Option<u64>`. That has room
+/// for exactly two schemes and nowhere to put a PIN, so every additional scheme (mOTP, Yandex
+/// OTP, Steam Guard) would have needed another field — and a parser that does not know a field
+/// skips it by length, after which the entry looks like a plain TOTP entry whose code never
+/// works. One tagged field makes the scheme explicit, and the file format version was raised
+/// so that an older parser refuses such a file instead of guessing.
+///
+/// # What each variant carries
+///
+/// The time step lives in the variant that uses it, so "HOTP with a period" and "TOTP with a
+/// counter" are not representable. Steam Guard's step is fixed by the scheme
+/// ([`otp::STEAM_PERIOD`]) and is therefore not stored.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EntryKind {
+    /// TOTP (RFC 6238): time-based, with the step in seconds.
+    Totp {
+        /// Time step in seconds. Never 0.
+        period: u64,
+    },
+    /// HOTP (RFC 4226): counter-based, with the next counter value.
+    Hotp {
+        /// Next counter value. The caller advances it after a successful use.
+        counter: u64,
+    },
+    /// mOTP: MD5-based, ten-second step, optional PIN.
+    ///
+    /// See [`crate::motp`]. A missing PIN is not a default: generating a code fails with
+    /// [`Error::PinRequired`] rather than computing one from an empty string.
+    Motp {
+        /// Time step in seconds. Never 0.
+        period: u64,
+        /// User-entered PIN, mixed into the hash.
+        pin: Option<crate::motp::MotpPin>,
+    },
+    /// Yandex OTP: SHA-256 based, eight letters, thirty-second step, optional PIN.
+    ///
+    /// See [`crate::yaotp`]. As with mOTP, a missing PIN fails code generation.
+    Yandex {
+        /// Time step in seconds. Never 0.
+        period: u64,
+        /// User-entered PIN, hashed together with the secret.
+        pin: Option<crate::yaotp::YandexPin>,
+    },
+    /// Steam Guard: five characters from the Steam alphabet, fixed 30-second step.
+    Steam,
+}
+
+impl EntryKind {
+    /// The stored time step, where the variant has one.
+    ///
+    /// `None` for HOTP (counter-based) and Steam Guard (fixed step; see
+    /// [`EntryKind::step_seconds`] for the effective value).
+    #[must_use]
+    pub const fn period(&self) -> Option<u64> {
+        match self {
+            Self::Totp { period } | Self::Motp { period, .. } | Self::Yandex { period, .. } => {
+                Some(*period)
+            }
+            Self::Hotp { .. } | Self::Steam => None,
+        }
+    }
+
+    /// Seconds between code changes, as a user interface needs it to know when to refresh.
+    ///
+    /// Unlike [`EntryKind::period`] this answers for every variant that has a time component:
+    /// Steam Guard changes every [`otp::STEAM_PERIOD`] seconds even though the step is not
+    /// stored. HOTP is the one variant with none, and it returns `None`.
+    #[must_use]
+    pub const fn step_seconds(&self) -> Option<u64> {
+        match self {
+            Self::Totp { period } | Self::Motp { period, .. } | Self::Yandex { period, .. } => {
+                Some(*period)
+            }
+            Self::Steam => Some(otp::STEAM_PERIOD),
+            Self::Hotp { .. } => None,
+        }
+    }
+
+    /// The mOTP PIN, for a variant that has one.
+    #[must_use]
+    pub const fn motp_pin(&self) -> Option<&crate::motp::MotpPin> {
+        match self {
+            Self::Motp { pin, .. } => pin.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The Yandex OTP PIN, for a variant that has one.
+    #[must_use]
+    pub const fn yandex_pin(&self) -> Option<&crate::yaotp::YandexPin> {
+        match self {
+            Self::Yandex { pin, .. } => pin.as_ref(),
+            _ => None,
+        }
+    }
+}
+
 /// One decrypted 2FA entry.
 ///
 /// Every field is public. This is a plain data carrier with no invariant that
@@ -153,10 +254,11 @@ pub struct Entry {
     pub algorithm: otp::Algorithm,
     /// Number of digits in a code.
     pub digits: otp::Digits,
-    /// Time step of TOTP (seconds). An HOTP entry ignores this field.
-    pub period: u64,
-    /// Counter of HOTP. `None` for a TOTP entry.
-    pub counter: Option<u64>,
+    /// Which scheme this entry uses, and the state that belongs to it.
+    ///
+    /// The time step, the HOTP counter and the PINs live here rather than in fields of their
+    /// own, so an entry cannot be "TOTP with a counter" or "mOTP without a step".
+    pub kind: EntryKind,
     /// Note from the user. May be empty.
     pub note: String,
     /// Creation time (Unix seconds).
@@ -185,8 +287,7 @@ impl PartialEq for Entry {
             && self.updated_at == other.updated_at
             && self.algorithm == other.algorithm
             && self.digits == other.digits
-            && self.period == other.period
-            && self.counter == other.counter
+            && self.kind == other.kind
             && self.secret == other.secret
     }
 }
@@ -255,23 +356,24 @@ impl Entry {
     /// - Empty secret -> [`Error::SecretEmpty`] (an empty secret is meaningless and would
     ///   make every code identical)
     /// - Any field longer than [`Entry::MAX_FIELD_LEN`] -> [`Error::FieldTooLong`]
-    /// - `period` of 0 -> [`Error::InvalidPeriod`] (would divide by zero)
+    /// - A time step of 0 in a kind that carries one -> [`Error::InvalidPeriod`] (would
+    ///   divide by zero)
     ///
     /// A secret shorter than the recommended length is **not** checked: short secrets exist
     /// in the real world and that is a warning rather than a refusal, see
     /// [`otp::recommended_min_secret_len`].
     ///
-    /// # The entry type follows `counter`
+    /// # The kind is a value, not a pair of fields
     ///
-    /// `Some` means HOTP and `None` means TOTP (see [`Entry::uri_type`]). There is no
-    /// separate requirement that an HOTP entry supply a counter: `None` already reads as
-    /// TOTP, so "HOTP without a counter" is not a state.
+    /// [`EntryKind`] carries the scheme together with the state that belongs to it, so
+    /// "HOTP without a counter" and "TOTP with a counter" are not representable, and a PIN
+    /// cannot end up on a scheme that has no place for it.
     ///
-    /// # Eleven parameters
+    /// # Ten parameters
     ///
-    /// All eleven are mandatory fields of the entry and none can be omitted or derived. A
+    /// All ten are mandatory fields of the entry and none can be omitted or derived. A
     /// builder would turn "forgot to set a field" from a compile error into a runtime one,
-    /// on cryptographic data where a silent default (`period` 0, an empty secret) is very
+    /// on cryptographic data where a silent default (a step of 0, an empty secret) is very
     /// hard to diagnose. The parameter list makes the type system enforce that every field
     /// is supplied.
     ///
@@ -289,8 +391,7 @@ impl Entry {
         secret: otp::OtpSecret,
         algorithm: otp::Algorithm,
         digits: otp::Digits,
-        period: u64,
-        counter: Option<u64>,
+        kind: EntryKind,
         note: String,
         created_at: Timestamp,
         updated_at: Timestamp,
@@ -298,7 +399,7 @@ impl Entry {
         if secret.len() == 0 {
             return Err(Error::SecretEmpty);
         }
-        if period == 0 {
+        if kind.period() == Some(0) {
             return Err(Error::InvalidPeriod);
         }
         for (field, value) in [
@@ -324,25 +425,25 @@ impl Entry {
             secret,
             algorithm,
             digits,
-            period,
-            counter,
+            kind,
             note,
             created_at,
             updated_at,
         })
     }
 
-    /// Whether the entry is HOTP or TOTP.
+    /// The `otpauth://` type that can express this entry, if any.
     ///
-    /// The presence of `counter` decides it, that being the **structural** difference
-    /// between the two: TOTP derives its counter from time, while an HOTP counter must come
-    /// from the user or from sync state.
+    /// [`None`] means the scheme has no URI representation in this library **yet** (mOTP,
+    /// Yandex OTP and Steam Guard are stored and computed, but their URI forms are not
+    /// implemented). Returning an option rather than a default keeps a caller from silently
+    /// writing an mOTP entry out as TOTP, which is a code that never works.
     #[must_use]
-    pub const fn uri_type(&self) -> crate::uri::UriType {
-        if self.counter.is_some() {
-            crate::uri::UriType::Hotp
-        } else {
-            crate::uri::UriType::Totp
+    pub const fn uri_type(&self) -> Option<crate::uri::UriType> {
+        match self.kind {
+            EntryKind::Totp { .. } => Some(crate::uri::UriType::Totp),
+            EntryKind::Hotp { .. } => Some(crate::uri::UriType::Hotp),
+            EntryKind::Motp { .. } | EntryKind::Yandex { .. } | EntryKind::Steam => None,
         }
     }
 }
@@ -371,8 +472,14 @@ pub fn entry_from_parsed_uri(parsed: &crate::uri::OtpAuth, now: Timestamp) -> Re
         secret,
         parsed.algorithm,
         parsed.digits,
-        parsed.period,
-        parsed.counter,
+        match parsed.uri_type {
+            crate::uri::UriType::Totp => EntryKind::Totp {
+                period: parsed.period,
+            },
+            crate::uri::UriType::Hotp => EntryKind::Hotp {
+                counter: parsed.counter.ok_or(Error::UriMissingCounter)?,
+            },
+        },
         String::new(),
         now,
         now,
@@ -395,8 +502,7 @@ mod tests {
             sample_secret(),
             otp::Algorithm::Sha1,
             otp::Digits::SIX,
-            30,
-            None,
+            EntryKind::Totp { period: 30 },
             String::new(),
             1_700_000_000,
             1_700_000_000,
@@ -432,20 +538,34 @@ mod tests {
 
     #[test]
     fn rejects_zero_period() {
-        let err = Entry::new(
-            "x".into(),
-            None,
-            "a".into(),
-            sample_secret(),
-            otp::Algorithm::Sha1,
-            otp::Digits::SIX,
-            0,
-            None,
-            String::new(),
-            0,
-            0,
-        );
-        assert!(matches!(err, Err(Error::InvalidPeriod)));
+        for kind in [
+            EntryKind::Totp { period: 0 },
+            EntryKind::Motp {
+                period: 0,
+                pin: None,
+            },
+            EntryKind::Yandex {
+                period: 0,
+                pin: None,
+            },
+        ] {
+            let err = Entry::new(
+                "x".into(),
+                None,
+                "a".into(),
+                sample_secret(),
+                otp::Algorithm::Sha1,
+                otp::Digits::SIX,
+                kind,
+                String::new(),
+                0,
+                0,
+            );
+            assert!(
+                matches!(err, Err(Error::InvalidPeriod)),
+                "a zero step must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -457,8 +577,7 @@ mod tests {
             sample_secret(),
             otp::Algorithm::Sha1,
             otp::Digits::SIX,
-            30,
-            None,
+            EntryKind::Totp { period: 30 },
             String::new(),
             0,
             0,
@@ -480,8 +599,7 @@ mod tests {
             sample_secret(),
             otp::Algorithm::Sha1,
             otp::Digits::SIX,
-            30,
-            None,
+            EntryKind::Totp { period: 30 },
             String::new(),
             0,
             0,
@@ -496,8 +614,7 @@ mod tests {
             sample_secret(),
             otp::Algorithm::Sha1,
             otp::Digits::SIX,
-            30,
-            None,
+            EntryKind::Totp { period: 30 },
             String::new(),
             0,
             0,
@@ -506,10 +623,15 @@ mod tests {
         assert_eq!(blank.issuer.as_deref(), Some("   "));
     }
 
+    /// Every kind whose scheme has an `otpauth://` form maps to it; the others report `None`
+    /// rather than silently claiming to be TOTP.
     #[test]
-    fn uri_type_follows_counter_presence() {
-        let totp = sample_entry();
-        assert_eq!(totp.uri_type(), crate::uri::UriType::Totp);
+    fn uri_type_covers_totp_and_hotp_only() {
+        assert_eq!(
+            sample_entry().uri_type(),
+            Some(crate::uri::UriType::Totp),
+            "a TOTP entry"
+        );
 
         let hotp = Entry::new(
             "h".into(),
@@ -518,15 +640,130 @@ mod tests {
             sample_secret(),
             otp::Algorithm::Sha1,
             otp::Digits::SIX,
-            30,
-            Some(7),
+            EntryKind::Hotp { counter: 7 },
             String::new(),
             0,
             0,
         )
         .expect("valid entry");
-        assert_eq!(hotp.uri_type(), crate::uri::UriType::Hotp);
-        assert_eq!(hotp.counter, Some(7));
+        assert_eq!(hotp.uri_type(), Some(crate::uri::UriType::Hotp));
+        assert_eq!(hotp.kind, EntryKind::Hotp { counter: 7 });
+
+        for kind in [
+            EntryKind::Motp {
+                period: 10,
+                pin: None,
+            },
+            EntryKind::Yandex {
+                period: 30,
+                pin: None,
+            },
+            EntryKind::Steam,
+        ] {
+            let entry = Entry::new(
+                "k".into(),
+                None,
+                "a".into(),
+                sample_secret(),
+                otp::Algorithm::Sha1,
+                otp::Digits::SIX,
+                kind,
+                String::new(),
+                0,
+                0,
+            )
+            .expect("valid entry");
+            assert_eq!(
+                entry.uri_type(),
+                None,
+                "this scheme has no URI form yet, and must not claim TOTP"
+            );
+        }
+    }
+
+    /// `step_seconds` answers for every kind that changes with time, including the one whose
+    /// step is fixed by the scheme rather than stored.
+    #[test]
+    fn step_seconds_covers_every_kind() {
+        assert_eq!(EntryKind::Totp { period: 45 }.step_seconds(), Some(45));
+        assert_eq!(
+            EntryKind::Motp {
+                period: 10,
+                pin: None
+            }
+            .step_seconds(),
+            Some(10)
+        );
+        assert_eq!(
+            EntryKind::Yandex {
+                period: 30,
+                pin: None
+            }
+            .step_seconds(),
+            Some(30)
+        );
+        assert_eq!(EntryKind::Steam.step_seconds(), Some(otp::STEAM_PERIOD));
+        assert_eq!(EntryKind::Hotp { counter: 0 }.step_seconds(), None);
+
+        // `period` reports only what is stored, so Steam Guard answers `None` here.
+        assert_eq!(EntryKind::Steam.period(), None);
+        assert_eq!(EntryKind::Hotp { counter: 3 }.period(), None);
+    }
+
+    /// The PINs are reachable through the kind, and only through the variant that has one.
+    #[test]
+    fn pins_are_reachable_through_the_kind() {
+        let motp = EntryKind::Motp {
+            period: 10,
+            pin: Some(crate::motp::MotpPin::new("1234".to_owned())),
+        };
+        let yandex = EntryKind::Yandex {
+            period: 30,
+            pin: Some(crate::yaotp::YandexPin::new("7586".to_owned())),
+        };
+        assert_eq!(motp.motp_pin().map(crate::motp::MotpPin::len), Some(4));
+        assert_eq!(motp.yandex_pin(), None);
+        assert_eq!(
+            yandex.yandex_pin().map(crate::yaotp::YandexPin::len),
+            Some(4)
+        );
+        assert_eq!(yandex.motp_pin(), None);
+        assert_eq!(EntryKind::Steam.motp_pin(), None);
+        assert_eq!(EntryKind::Steam.yandex_pin(), None);
+    }
+
+    /// Two entries that differ only in their PIN or their step are different entries, which
+    /// is what the sync merge compares.
+    #[test]
+    fn kind_equality_distinguishes_state_that_affects_the_code() {
+        let base = EntryKind::Motp {
+            period: 10,
+            pin: Some(crate::motp::MotpPin::new("1234".to_owned())),
+        };
+        let other_pin = EntryKind::Motp {
+            period: 10,
+            pin: Some(crate::motp::MotpPin::new("1235".to_owned())),
+        };
+        let no_pin = EntryKind::Motp {
+            period: 10,
+            pin: None,
+        };
+        let other_period = EntryKind::Motp {
+            period: 20,
+            pin: Some(crate::motp::MotpPin::new("1234".to_owned())),
+        };
+
+        assert_eq!(
+            base,
+            EntryKind::Motp {
+                period: 10,
+                pin: Some(crate::motp::MotpPin::new("1234".to_owned())),
+            }
+        );
+        assert_ne!(base, other_pin);
+        assert_ne!(base, no_pin);
+        assert_ne!(base, other_period);
+        assert_ne!(base, EntryKind::Hotp { counter: 10 });
     }
 
     /// `Debug` must not contain the secret.
@@ -563,7 +800,7 @@ mod tests {
         assert_eq!(entry.issuer.as_deref(), Some("GitHub"));
         assert_eq!(entry.account, "alice");
         assert_eq!(entry.name, "GitHub:alice");
-        assert_eq!(entry.uri_type(), crate::uri::UriType::Totp);
+        assert_eq!(entry.uri_type(), Some(crate::uri::UriType::Totp));
         assert!(entry.note.is_empty());
         assert_eq!(entry.created_at, 1_700_000_000);
         assert_eq!(entry.created_at, entry.updated_at);

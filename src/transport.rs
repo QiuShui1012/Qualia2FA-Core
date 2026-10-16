@@ -599,7 +599,7 @@ mod tests {
     use super::*;
     use crate::otp::{Algorithm, Digits, OtpSecret};
     use crate::sync::{RecordSet, merge_into};
-    use crate::vault::{Entry, EntryId, Timestamp, Vault as VaultAlias};
+    use crate::vault::{Entry, EntryId, EntryKind, Timestamp, Vault as VaultAlias};
 
     /// An in-memory channel used to exercise the protocol without a network.
     ///
@@ -721,8 +721,7 @@ mod tests {
             OtpSecret::from_base32("JBSWY3DPEHPK3PXP").expect("valid Base32"),
             Algorithm::Sha1,
             Digits::SIX,
-            30,
-            None,
+            EntryKind::Totp { period: 30 },
             String::new(),
             Timestamp::from(1_700_000_000_u64),
             Timestamp::from(updated_at),
