@@ -71,6 +71,16 @@ test = false
 doc = false
 bench = false
 
+# Attacker-controlled input surface: an export file the user picked. It was written by another
+# program and can be truncated, half-copied or hostile; every format is tried on every input,
+# and the report must not quote what it read.
+[[bin]]
+name = "aegis_import"
+path = "fuzz_targets/aegis_import.rs"
+test = false
+doc = false
+bench = false
+
 # Attacker-controlled input surface: the sync payload. It is wider than a vault file —
 # **any device on the same LAN** can push bytes at it without the user doing anything.
 # The target covers the outer envelope, the decompression limit and the variable-length

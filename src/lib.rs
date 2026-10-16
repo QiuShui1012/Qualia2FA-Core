@@ -61,6 +61,7 @@ pub mod auth;
 pub mod base32;
 mod error;
 pub mod flow;
+pub mod import;
 pub mod motp;
 pub mod otp;
 pub mod pairing;

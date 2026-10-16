@@ -507,6 +507,96 @@ pub enum Error {
     #[error("an entry appears twice in the same ordering")]
     VaultGroupDuplicateEntry,
 
+    /// The export names a format this library cannot read yet.
+    #[error("the export names a format this library cannot read yet: {format}")]
+    ImportFormatUnsupported {
+        /// The format, from this library's own list.
+        format: &'static str,
+    },
+
+    /// The export is larger than this library reads.
+    ///
+    /// Compared **before** anything is allocated or parsed: the size comes from the file, and a
+    /// small header claiming gigabytes must not turn into an allocation.
+    #[error("the export is {actual} bytes; at most {limit} are read")]
+    ImportFileTooLarge {
+        /// The limit.
+        limit: usize,
+        /// The size of the input.
+        actual: usize,
+    },
+
+    /// The export holds more entries than this library reads.
+    #[error("the export holds {actual} entries; at most {limit} are read")]
+    ImportTooManyEntries {
+        /// The limit.
+        limit: usize,
+        /// How many the export holds.
+        actual: usize,
+    },
+
+    /// The export nests more deeply than this library reads.
+    ///
+    /// Checked by scanning the bytes **before** they reach the JSON parser: that parser recurses,
+    /// so a deeply nested document would exhaust the stack, and a stack overflow is not a
+    /// catchable error - it takes the process down, which is exactly what "no input may cause a
+    /// panic" forbids.
+    #[error("the export nests more than {limit} levels deep")]
+    ImportTooDeeplyNested {
+        /// The limit.
+        limit: usize,
+    },
+
+    /// The export is structurally wrong: not the expected format, a missing field, a value of the
+    /// wrong kind.
+    #[error("the export is malformed: {reason}")]
+    ImportMalformed {
+        /// What is wrong, in one phrase. Never carries export content.
+        reason: &'static str,
+    },
+
+    /// The export declares a version this library does not read.
+    #[error("the export declares version {version}; at most {supported} is read")]
+    ImportUnsupportedVersion {
+        /// The version in the file.
+        version: u64,
+        /// The highest version this library reads.
+        supported: u64,
+    },
+
+    /// The export is encrypted and this call carried no password.
+    #[error("the export is encrypted; a password is required")]
+    ImportPasswordRequired,
+
+    /// The password does not open the encrypted export.
+    ///
+    /// **One error for every failing slot**: whether the password is wrong or a slot was tampered
+    /// with is not something the reader can tell apart, and a message that guessed would be wrong
+    /// half the time.
+    #[error("the password does not open this export")]
+    ImportWrongPassword,
+
+    /// The export decrypted but its contents do not open.
+    ///
+    /// Distinct from [`Error::ImportWrongPassword`] on purpose, because it means something else
+    /// to the user: the password was accepted (a slot authenticated), so the **database** is
+    /// damaged or was modified after it was written.
+    #[error(
+        "the export was decrypted but its contents do not open: the file is damaged or was modified"
+    )]
+    ImportCorrupted,
+
+    /// The key derivation parameters of an encrypted export are outside the accepted range.
+    ///
+    /// Refused **before** the derivation runs: those numbers come from the file, they decide how
+    /// much memory and time the derivation costs, and the reference implementation does not bound
+    /// them.
+    #[error("the export's key derivation parameters are out of range: {reason}")]
+    ImportInvalidKdfParameters {
+        /// Which parameter, and why it is refused.
+        reason: &'static str,
+    },
+
     /// The plaintext structure of a vault entry contains a duplicated field node.
     ///
     /// Implementations disagree on whether the first or the last occurrence wins: a classic

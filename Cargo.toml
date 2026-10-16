@@ -189,6 +189,14 @@ sha2 = "0.11"
 # `const-oid` (verified when the dependency was audited).
 md-5 = "0.11.0"
 subtle = "2.6"
+# `tinyjson` reads another authenticator's JSON export. It is **pinned exactly**: its last
+# release is 2022-12-31, and the reason it was chosen over `serde_json` is that it is the only
+# candidate that forbids `unsafe` in the language (`#![forbid(unsafe_code)]`, not `deny`), has
+# **no** direct dependencies, and is ~1.5k lines in four files. A zero-dependency, thousand-line,
+# general-purpose JSON parser belongs to the "stable is finished" kind, but a pinned version is
+# what makes that judgement safe to rely on: a new release would have to be audited again before
+# it is taken.
+tinyjson = "=2.5.1"
 
 # The library's public API uses thiserror for all error types; `anyhow` must not appear
 # in a public signature.

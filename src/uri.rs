@@ -158,7 +158,8 @@ impl UriType {
     }
 
     /// The name used in error messages and diagnostics.
-    const fn name(self) -> &'static str {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Totp => "totp",
             Self::Hotp => "hotp",
