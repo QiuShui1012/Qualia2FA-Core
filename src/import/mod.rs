@@ -40,10 +40,10 @@
 //!
 //! # What this version does not read
 //!
-//! The **HTML** format and **encrypted** exports are recognised by [`ImportFormat::detect`] and
-//! refused with [`Error::ImportFormatUnsupported`], so a caller cannot mistake "not implemented"
-//! for "nothing to import".
+//! **Encrypted** exports are recognised and refused with [`Error::ImportPasswordRequired`], so a
+//! caller cannot mistake "not implemented" for "nothing to import".
 
+pub mod html;
 pub mod json;
 mod mapping;
 pub mod text;
@@ -253,7 +253,7 @@ pub fn import(bytes: &[u8], format: ImportFormat, now: Timestamp) -> Result<Impo
     match format {
         ImportFormat::Json => json::import(bytes, now),
         ImportFormat::Text => text::import(bytes, now),
-        ImportFormat::Html => Err(Error::ImportFormatUnsupported { format: "HTML" }),
+        ImportFormat::Html => html::import(bytes, now),
     }
 }
 
@@ -352,15 +352,6 @@ mod tests {
         let result = import(&bytes, ImportFormat::Json, 0);
         assert!(
             matches!(result, Err(Error::ImportFileTooLarge { .. })),
-            "actual {result:?}"
-        );
-    }
-
-    #[test]
-    fn the_html_format_is_refused_rather_than_read_as_something_else() {
-        let result = import(b"<html></html>", ImportFormat::Html, 0);
-        assert!(
-            matches!(result, Err(Error::ImportFormatUnsupported { .. })),
             "actual {result:?}"
         );
     }

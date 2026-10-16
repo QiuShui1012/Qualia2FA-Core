@@ -507,13 +507,6 @@ pub enum Error {
     #[error("an entry appears twice in the same ordering")]
     VaultGroupDuplicateEntry,
 
-    /// The export names a format this library cannot read yet.
-    #[error("the export names a format this library cannot read yet: {format}")]
-    ImportFormatUnsupported {
-        /// The format, from this library's own list.
-        format: &'static str,
-    },
-
     /// The export is larger than this library reads.
     ///
     /// Compared **before** anything is allocated or parsed: the size comes from the file, and a
