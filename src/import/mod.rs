@@ -38,6 +38,12 @@
 //! log, in a screenshot attached to a bug report, and in a crash dump. The same rule the rest of
 //! the crate follows applies here before the data has even entered the model.
 //!
+//! # The second half of an import
+//!
+//! Reading a file is only half of it: what the entries mean for the vault already there - which
+//! are new, which the vault holds, and which need a human to decide - is the `apply` module, which
+//! is the only part of this module tree that needs a vault.
+//!
 //! # Encrypted exports
 //!
 //! The JSON export can be encrypted, and is then opened with a password the caller supplies. The
@@ -46,6 +52,7 @@
 //! encrypted export returns [`Error::ImportPasswordRequired`] rather than an empty report, so a
 //! caller cannot mistake "this needs a password" for "there was nothing to import".
 
+pub mod apply;
 mod encrypted;
 pub mod html;
 pub mod json;

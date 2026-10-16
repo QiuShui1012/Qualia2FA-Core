@@ -679,6 +679,26 @@ impl Vault {
         Ok(id)
     }
 
+    /// Creates a named group **with an identifier the caller supplies**.
+    ///
+    /// Used by the importer: a group's identifier has to be the one the export used, so that two
+    /// devices importing the same file agree on which group is which. Everything else - where the
+    /// group sits in the order, and the rules on its name - is what [`Vault::create_group`] does.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::VaultDuplicateGroupId`] when a group with that identifier already exists, and
+    /// [`Error::FieldTooLong`] when the name is longer than [`Entry::MAX_FIELD_LEN`].
+    pub fn create_group_with_id(&mut self, id: GroupId, name: String) -> Result<()> {
+        if id.is_top() || self.groups.contains_key(&id) {
+            return Err(Error::VaultDuplicateGroupId);
+        }
+        let order = self.next_group_order();
+        let group = Group::new(name, order, Vec::new())?;
+        self.groups.insert(id, group);
+        Ok(())
+    }
+
     /// Renames a group.
     ///
     /// # Errors
