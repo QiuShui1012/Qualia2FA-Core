@@ -292,6 +292,40 @@ fn every_format_describes_the_same_entries() {
     assert_eq!(from_text, from_plain, "text");
 }
 
+/// The spellings this crate's own HTML export uses are the ones in this file.
+///
+/// Three of them were **wrong here before this file existed**, because they had been read out of
+/// the format documentation rather than out of a file the implementation wrote: the type is
+/// upper case (`TOTP`, not `totp`), the favourite column is the word (`false`, not `0`), and a
+/// field with no value is an **empty cell** while a field that does not apply to the entry's type
+/// is the dash. This test is what keeps the writer tied to the evidence: sanitizing or
+/// re-formatting the sample makes it fail.
+#[test]
+fn the_html_sample_spells_what_this_crates_writer_writes() {
+    let html = core::str::from_utf8(HTML).expect("the sample is text");
+
+    assert!(
+        html.contains("<td>TOTP</td>"),
+        "the type column is upper case in a real export"
+    );
+    assert!(
+        html.contains("<td>false</td>"),
+        "the favourite column is the word, not a digit"
+    );
+    assert!(
+        html.contains("<td></td>"),
+        "a field nobody filled in is left empty"
+    );
+    assert!(
+        html.contains("<td>-</td>"),
+        "a field that does not apply to the type is the dash"
+    );
+    assert!(
+        !html.contains("<!DOCTYPE"),
+        "a real export carries no doctype, and this reader must not depend on one"
+    );
+}
+
 /// Every `data:` URL in a document, with its wrapper removed.
 fn data_urls(html: &str) -> Vec<String> {
     const PREFIX: &str = "data:image/png;base64,";

@@ -89,10 +89,13 @@ const COLUMNS: [&str; 12] = [
     "Counter", "PIN",
 ];
 
-/// The cell written for a field the entry does not have.
+/// The cell written for a field that **does not apply** to the entry's type.
 ///
-/// A dash rather than an empty cell: the format writes one, and a reader that distinguishes "no
-/// counter" from "a counter that happens to be blank" has something to read.
+/// A dash, not an empty cell, and the difference is the format's: a real export leaves a field
+/// that simply has no value empty (a note nobody wrote) and writes this dash where the field has
+/// no meaning for the entry (`Counter` on a time-based entry, `PIN` on anything but mOTP and
+/// Yandex OTP). A reader that distinguishes "no counter" from "a counter that is blank" reads
+/// the two apart, which is exactly what the format gives it.
 const EMPTY_CELL: &str = "-";
 
 /// Writes the vault as an HTML export.
@@ -128,29 +131,26 @@ pub fn write(vault: &Vault) -> Result<String> {
         out.push_str("<tr>");
         cell(&mut out, entry.issuer.as_deref().unwrap_or_default());
         cell(&mut out, &entry.name);
-        cell(&mut out, type_name(&entry.kind));
+        type_cell(&mut out, &entry.kind);
         out.push_str("<td class='qr'><img src=\"");
         out.push_str(&qr_data_url(&uri, item.position)?);
         out.push_str("\"></td>");
         cell(&mut out, &uuid_text(item.id.as_bytes()));
         cell(&mut out, &entry.note);
-        // This application has no favourites; see the JSON writer for the same note.
-        cell(&mut out, "0");
+        // This application has no favourites; see the JSON writer for the same note. The word is
+        // the one the reference implementation writes in this format.
+        cell(&mut out, "false");
         cell(&mut out, algorithm_name(&entry.kind, entry.algorithm));
         cell(&mut out, &entry.digits.count().to_string());
         cell(&mut out, &secret_text(entry));
         match &entry.kind {
             EntryKind::Hotp { counter } => cell(&mut out, &counter.to_string()),
-            _ => cell(&mut out, EMPTY_CELL),
+            _ => not_applicable(&mut out),
         }
         match &entry.kind {
-            EntryKind::Motp { pin, .. } => {
-                cell(&mut out, pin.as_ref().map_or(EMPTY_CELL, |p| p.expose()))
-            }
-            EntryKind::Yandex { pin, .. } => {
-                cell(&mut out, pin.as_ref().map_or(EMPTY_CELL, |p| p.expose()))
-            }
-            _ => cell(&mut out, EMPTY_CELL),
+            EntryKind::Motp { pin: Some(pin), .. } => cell(&mut out, pin.expose()),
+            EntryKind::Yandex { pin: Some(pin), .. } => cell(&mut out, pin.expose()),
+            _ => not_applicable(&mut out),
         }
         out.push_str("</tr>\n");
     }
@@ -171,15 +171,31 @@ fn secret_text(entry: &Entry) -> String {
     }
 }
 
-/// Writes one text cell, or the empty marker.
+/// Writes one text cell.
+///
+/// A value that is not there is written as **nothing**: see [`EMPTY_CELL`] for the dash, which
+/// belongs to a field that does not apply rather than to one that happens to be empty.
 fn cell(out: &mut String, value: &str) {
     out.push_str("<td>");
-    if value.is_empty() {
-        out.push_str(EMPTY_CELL);
-    } else {
-        escape_into(out, value);
-    }
+    escape_into(out, value);
     out.push_str("</td>");
+}
+
+/// Writes the dash for a field that does not apply to this entry.
+fn not_applicable(out: &mut String) {
+    out.push_str("<td>");
+    out.push_str(EMPTY_CELL);
+    out.push_str("</td>");
+}
+
+/// Writes the type cell.
+///
+/// The two JSON forms spell a scheme in lower case (`totp`) while this format spells it in upper
+/// case (`TOTP`): both spellings are what the reference implementation writes, each confirmed by
+/// a real export of that format (`tests/data/aegis`). The reader accepts either, since it folds
+/// the case before it compares.
+fn type_cell(out: &mut String, kind: &EntryKind) {
+    cell(out, &type_name(kind).to_ascii_uppercase());
 }
 
 /// Escapes the five characters that mean something inside HTML text.
@@ -443,18 +459,51 @@ mod tests {
         assert_eq!(report.entries[0].entry.name, "名字");
     }
 
-    /// An entry without an issuer writes an empty cell as the format's dash.
+    /// An absent value is written as an empty cell, and a field that does not apply as a dash.
+    ///
+    /// The two are different things and the format writes them differently: a real export leaves
+    /// a note nobody wrote empty and puts the dash where the field has no meaning for the entry's
+    /// type. A reader that conflated them would still import both, which is why this is asserted
+    /// on the bytes rather than through a round trip.
     #[test]
-    fn an_absent_field_is_written_as_a_dash() {
+    fn an_absent_value_is_empty_and_a_field_that_does_not_apply_is_a_dash() {
         let mut vault = Vault::new();
         let mut built = entry(URIS[1], 0);
         built.issuer = None;
-        built.kind = EntryKind::Hotp { counter: 7 };
+        built.note = String::new();
         vault.insert(built).expect("the vault is empty");
 
         let text = write(&vault).expect("the export is written");
-        assert!(text.contains("<td>-</td>"), "actual {text}");
-        assert!(text.contains("<td>7</td>"), "the counter is written");
+        // The row is taken by its tags rather than by `lines()`: the base64 of the drawn code is
+        // wrapped, so a row spans several physical lines.
+        let start = text.find("<tr><td>").expect("there is a data row");
+        let end = start + text[start..].find("</tr>").expect("the row ends");
+        let row = &text[start..end];
+
+        assert!(
+            row.starts_with("<tr><td></td>"),
+            "an entry with no issuer leaves the cell empty: {row}"
+        );
+        assert!(row.contains("<td>7</td>"), "the counter is written: {row}");
+        assert_eq!(
+            row.matches("<td>-</td>").count(),
+            1,
+            "only the PIN, which does not apply to an HOTP entry, is a dash: {row}"
+        );
+        assert!(
+            row.contains("<td>HOTP</td>"),
+            "this format spells the type in upper case: {row}"
+        );
+        assert!(
+            row.contains("<td>false</td>"),
+            "the favourite column is written as the word: {row}"
+        );
+
+        // The reader reads the row back as the same entry: neither spelling is a value.
+        let report = import(text.as_bytes(), ImportFormat::Html, 0, None).expect("it reads back");
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].entry.issuer, None);
+        assert!(report.entries[0].entry.note.is_empty());
     }
 
     /// Standard base64, decoded by the test rather than by the writer.
