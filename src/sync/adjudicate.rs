@@ -69,6 +69,8 @@ pub enum Adjudicated {
     DeletionApplied,
     /// The entry came back: the local tombstone was dropped in favour of the peer's entry.
     Restored,
+    /// The peer's ordering replaced the local one.
+    TookIncomingOrdering,
 }
 
 /// Applies one user decision to the vault.
@@ -80,6 +82,7 @@ pub enum Adjudicated {
 /// | [`ConflictKind::EntryMismatch`] | the local entry stays | the peer's entry replaces it |
 /// | [`ConflictKind::DeletionConflict`] with `local: None` — the peer deleted it | the local entry stays | the entry is deleted and the tombstone recorded |
 /// | [`ConflictKind::DeletionConflict`] with `local: Some(..)` — this device deleted it | it stays deleted | the peer's entry is restored and the local tombstone dropped |
+/// | [`ConflictKind::OrderingMismatch`] | the local arrangement stays | the peer's whole arrangement replaces it |
 ///
 /// The two [`ConflictKind::DeletionConflict`] directions are told apart by `local`, which is
 /// the convention [`crate::sync::merge_into`] documents: the peer's record is the one that is
@@ -115,6 +118,19 @@ pub fn adjudicate(
                 Ok(Adjudicated::TookIncomingEntry)
             }
         },
+        ConflictKind::OrderingMismatch { incoming, .. } => match decision {
+            Decision::KeepLocal => Ok(Adjudicated::KeptLocal),
+            Decision::TakeIncoming => {
+                let group_id = conflict
+                    .group_id()
+                    .ok_or(crate::Error::VaultGroupNotFound)?;
+                let group = vault
+                    .group_mut(&group_id)
+                    .ok_or(crate::Error::VaultGroupNotFound)?;
+                *group = incoming.as_ref().clone();
+                Ok(Adjudicated::TookIncomingOrdering)
+            }
+        },
         ConflictKind::DeletionConflict {
             local, incoming, ..
         } => match (decision, local) {
@@ -138,7 +154,7 @@ mod tests {
     use super::*;
     use crate::otp::{Algorithm, Digits, OtpSecret};
     use crate::sync::{MergedRecord, RecordSet, merge_into};
-    use crate::vault::{Entry, EntryId, EntryKind, Timestamp, Tombstone};
+    use crate::vault::{Entry, EntryId, EntryKind, Group, GroupId, Timestamp, Tombstone};
 
     /// A sample entry whose content is recognisable in an assertion.
     fn sample_entry(name: &str, updated_at: u64) -> Entry {
@@ -415,5 +431,176 @@ mod tests {
             "actual {result:?}"
         );
         assert_eq!(vault.len(), 0, "a refused decision must write nothing");
+    }
+
+    /// A vault holding `ids` in the top group, in the order given.
+    fn vault_with_ordering(ids: &[EntryId]) -> Vault {
+        let mut vault = Vault::new();
+        for (index, id) in ids.iter().enumerate() {
+            vault
+                .insert_with_id(*id, sample_entry(&format!("entry {index}"), 1_700_000_000))
+                .expect("the vault is empty");
+        }
+        vault
+            .set_ordering(&GroupId::TOP, ids.to_vec())
+            .expect("the identifiers exist");
+        vault
+    }
+
+    /// A group record from a peer, filed under the top group's identifier.
+    fn incoming_top_group(entry_ids: Vec<EntryId>) -> MergedRecord {
+        MergedRecord::Group {
+            id: GroupId::TOP,
+            group: Box::new(Group::top(entry_ids).expect("the list is valid")),
+        }
+    }
+
+    /// A group the peer has and this device does not becomes a group here.
+    #[test]
+    fn a_group_only_the_peer_has_is_added() {
+        let mut vault = Vault::new();
+        let work = GroupId::generate().expect("OS randomness available");
+
+        let outcome = merge_into(
+            &mut vault,
+            &[MergedRecord::Group {
+                id: work,
+                group: Box::new(
+                    Group::new("Work".to_owned(), 0, Vec::new()).expect("the group is valid"),
+                ),
+            }],
+        )
+        .expect("merging a group cannot fail");
+
+        assert_eq!(outcome.groups_added, 1);
+        assert!(outcome.conflicts.is_empty());
+        assert_eq!(
+            vault.group(&work).map(|group| group.name.as_str()),
+            Some("Work")
+        );
+    }
+
+    /// Two arrangements that only differ in **which entries they mention** are not a
+    /// disagreement: neither device can have placed an entry it has never seen.
+    ///
+    /// This is the shape every first sync between two devices has - each appended its own entries
+    /// to the top group - and reporting it would make the user adjudicate something no one
+    /// disagrees about.
+    #[test]
+    fn orderings_that_differ_only_in_their_entries_agree() {
+        let shared = entry_id(20);
+        let mut vault = vault_with_ordering(&[shared, entry_id(21)]);
+
+        let outcome = merge_into(&mut vault, &[incoming_top_group(vec![shared])])
+            .expect("merging cannot fail");
+
+        assert!(
+            outcome.conflicts.is_empty(),
+            "the peer lists a subset of what this device has, in the same relative order"
+        );
+        assert_eq!(outcome.unchanged, 1);
+    }
+
+    /// The peer's arrangement of the entries it sends is reproduced, not overridden by the order
+    /// the records happened to arrive in.
+    #[test]
+    fn arriving_entries_are_placed_in_the_peer_order() {
+        let first = entry_id(30);
+        let second = entry_id(31);
+        let mut vault = Vault::new();
+
+        let outcome = merge_into(
+            &mut vault,
+            &[
+                MergedRecord::Entry {
+                    id: first,
+                    entry: Box::new(sample_entry("first", 1_700_000_000)),
+                },
+                MergedRecord::Entry {
+                    id: second,
+                    entry: Box::new(sample_entry("second", 1_700_000_000)),
+                },
+                // The peer's ordering puts the *second* identifier first; the identifiers sort
+                // the other way, so an implementation that followed the record order would fail
+                // here.
+                incoming_top_group(vec![second, first]),
+            ],
+        )
+        .expect("merging cannot fail");
+
+        assert_eq!(outcome.added, 2);
+        assert!(outcome.conflicts.is_empty(), "actual {outcome:?}");
+        assert_eq!(
+            vault.ordering(&GroupId::TOP),
+            Some([second, first].as_slice()),
+            "the arrangement is the peer's"
+        );
+    }
+
+    /// Two arrangements that disagree about the relative order of a shared entry are a conflict,
+    /// and the user's choice replaces the whole ordering.
+    #[test]
+    fn a_disagreeing_ordering_is_adjudicated_as_a_whole() {
+        let first = entry_id(40);
+        let second = entry_id(41);
+        let mut vault = vault_with_ordering(&[first, second]);
+
+        let outcome = merge_into(&mut vault, &[incoming_top_group(vec![second, first])])
+            .expect("merging cannot fail");
+
+        let conflict = outcome
+            .conflicts
+            .first()
+            .expect("the two arrangements disagree");
+        assert_eq!(conflict.group_id(), Some(GroupId::TOP));
+        assert!(
+            matches!(conflict.kind, ConflictKind::OrderingMismatch { .. }),
+            "actual {:?}",
+            conflict.kind
+        );
+        assert_eq!(
+            vault.ordering(&GroupId::TOP),
+            Some([first, second].as_slice()),
+            "a conflict writes nothing until it is adjudicated"
+        );
+
+        assert_eq!(
+            adjudicate(&mut vault, conflict, Decision::KeepLocal).expect("keeping cannot fail"),
+            Adjudicated::KeptLocal
+        );
+        assert_eq!(
+            vault.ordering(&GroupId::TOP),
+            Some([first, second].as_slice())
+        );
+
+        assert_eq!(
+            adjudicate(&mut vault, conflict, Decision::TakeIncoming)
+                .expect("taking the peer's arrangement cannot fail"),
+            Adjudicated::TookIncomingOrdering
+        );
+        assert_eq!(
+            vault.ordering(&GroupId::TOP),
+            Some([second, first].as_slice()),
+            "the whole arrangement was replaced"
+        );
+    }
+
+    /// The same merge applied twice changes nothing the second time.
+    #[test]
+    fn merging_the_same_group_twice_changes_nothing() {
+        let first = entry_id(50);
+        let second = entry_id(51);
+        let mut vault = vault_with_ordering(&[first, second]);
+        let records = [incoming_top_group(vec![first, second])];
+
+        let outcome = merge_into(&mut vault, &records).expect("merging cannot fail");
+        assert_eq!(outcome.unchanged, 1);
+        assert!(outcome.made_no_change());
+
+        let again = merge_into(&mut vault, &records).expect("merging cannot fail");
+        assert!(
+            again.made_no_change(),
+            "the second merge reports changes: {again:?}"
+        );
     }
 }

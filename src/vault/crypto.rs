@@ -397,6 +397,8 @@ pub(crate) enum RecordKind {
     SyncEntry,
     /// A tombstone, found in a **sync payload**.
     SyncTombstone,
+    /// A group with its ordering, found in a **sync payload**.
+    SyncGroup,
 }
 
 impl RecordKind {
@@ -411,6 +413,7 @@ impl RecordKind {
             Self::Group => 0x03,
             Self::SyncEntry => 0x81,
             Self::SyncTombstone => 0x82,
+            Self::SyncGroup => 0x83,
         }
     }
 
@@ -455,6 +458,7 @@ impl RecordKind {
         match byte {
             0x81 => Some(Self::SyncEntry),
             0x82 => Some(Self::SyncTombstone),
+            0x83 => Some(Self::SyncGroup),
             _ => None,
         }
     }

@@ -458,6 +458,9 @@ impl Payload {
         for (_, tombstone) in vault.iter_tombstones() {
             records.insert(record::seal_tombstone(&record_key, tombstone)?);
         }
+        for (id, group) in vault.groups() {
+            records.insert(record::seal_group(&record_key, id, group)?);
+        }
         Ok(Self {
             sync_id: Self::new_sync_id()?,
             sender,
@@ -891,6 +894,7 @@ pub(crate) use crate::vault::RecordKind as InnerRecordKind;
 const _: () = {
     assert!(InnerRecordKind::SyncEntry.as_byte() != InnerRecordKind::Entry.as_byte());
     assert!(InnerRecordKind::SyncTombstone.as_byte() != InnerRecordKind::Tombstone.as_byte());
+    assert!(InnerRecordKind::SyncGroup.as_byte() != InnerRecordKind::Group.as_byte());
 };
 
 #[cfg(test)]
@@ -937,14 +941,18 @@ mod tests {
     /// both. Whether a given live entry was sent is answered only by decrypting and looking at
     /// the kind, and the returned identifiers let a test assert which record was sent rather
     /// than merely how many were.
+    /// **Group records are skipped**: they are neither entries nor tombstones, and folding them
+    /// into either list would make every assertion about that list depend on how many groups the
+    /// vault happens to have.
     fn opened_kinds(payload: &Payload, master: &MasterKey) -> Vec<(EntryId, bool)> {
         payload
             .open_records(master)
             .expect("opening record by record")
             .into_iter()
-            .map(|record| match record {
-                OpenedRecord::Entry { id, .. } => (id, true),
-                OpenedRecord::Tombstone(tombstone) => (tombstone.entry_id, false),
+            .filter_map(|record| match record {
+                OpenedRecord::Entry { id, .. } => Some((id, true)),
+                OpenedRecord::Tombstone(tombstone) => Some((tombstone.entry_id, false)),
+                OpenedRecord::Group { .. } => None,
             })
             .collect()
     }
@@ -1028,8 +1036,8 @@ mod tests {
         assert_eq!(frames.len(), payload.len(), "record count mismatch");
         assert_eq!(
             frames.len(),
-            vault.len() + vault.tombstone_count(),
-            "the record count in the payload must equal entries plus tombstones"
+            vault.len() + vault.tombstone_count() + vault.group_count(),
+            "the record count in the payload must equal entries plus tombstones plus groups"
         );
 
         for (id_bytes, nonce, len) in &frames {
@@ -1075,17 +1083,22 @@ mod tests {
         let sealed = payload.seal(&master).expect("sealing succeeds");
         let plaintext = plaintext_of(&sealed, &master);
 
+        // The count, then the frames back to back: a kind byte anywhere would show up as a gap
+        // between the two totals.
+        let frames = parse_record_frames(&plaintext);
+        let expected = 4 + frames
+            .iter()
+            .map(|(_, _, len)| EntryId::LEN + NONCE_LEN + 4 + len)
+            .sum::<usize>();
         assert_eq!(
             plaintext.len(),
-            4 + EntryId::LEN + NONCE_LEN + 4 + {
-                let frames = parse_record_frames(&plaintext);
-                frames[0].2
-            }
+            expected,
+            "the plaintext must be the header plus the frames, with no kind byte anywhere"
         );
         assert_eq!(
             &plaintext[4..4 + EntryId::LEN],
-            id.as_bytes(),
-            "the identifier must follow the record count immediately, with no kind byte"
+            frames[0].0.as_slice(),
+            "the first identifier must follow the record count immediately, with no kind byte"
         );
 
         assert_ne!(
@@ -1427,8 +1440,8 @@ mod tests {
         let payload = Payload::from_vault(&master, sender, &vault).expect("packing succeeds");
         assert_eq!(
             payload.len(),
-            2,
-            "there must be exactly two records: the kept entry plus the tombstone"
+            3,
+            "there must be exactly three records: the kept entry, the tombstone, and the top group"
         );
         assert!(
             payload.records.get(&kept).is_some(),

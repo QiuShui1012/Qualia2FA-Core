@@ -128,7 +128,15 @@ impl core::fmt::Debug for GroupId {
 /// The list **is** the order: the entry at index `i` comes after the entry at index `i - 1` and
 /// before the one at index `i + 1`. See the module documentation for why the sequence number is
 /// not stored on the entry.
-#[derive(Debug, PartialEq, Eq)]
+///
+/// # Why this one does implement `Clone`
+///
+/// A group holds a name, a position and identifiers - **no secret material**, and no key
+/// material of any kind. Copying it is free in the sense that matters here, and both a conflict
+/// (which must show the two orderings side by side) and the merge that reports it need copies.
+/// Compare [`crate::vault::Entry`], which deliberately has no `Clone`: copying an entry means
+/// copying a seed, so that path goes through an explicit [`crate::vault::Entry::duplicate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Group {
     /// User-visible name. Empty for the top group, which is not nameable.
     pub name: String,

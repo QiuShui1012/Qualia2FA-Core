@@ -257,6 +257,7 @@ proptest! {
 
         let mut got_entries = BTreeMap::new();
         let mut got_tombstones = BTreeMap::new();
+        let mut got_groups = BTreeMap::new();
         for record in records {
             match record {
                 sync::OpenedRecord::Entry { id, entry } => {
@@ -271,7 +272,37 @@ proptest! {
                         "the same identifier appeared as two tombstones"
                     );
                 }
+                sync::OpenedRecord::Group { id, group } => {
+                    prop_assert!(
+                        got_groups.insert(id, *group).is_none(),
+                        "the same identifier appeared as two groups"
+                    );
+                }
             }
+        }
+
+        prop_assert_eq!(
+            got_groups.len(),
+            vault.group_count(),
+            "the group counts do not match"
+        );
+        for (id, group) in vault.groups() {
+            let received = got_groups.get(id).expect("every group must arrive");
+            prop_assert_eq!(
+                &received.name,
+                &group.name,
+                "a group name changed in transit"
+            );
+            prop_assert_eq!(
+                received.group_order,
+                group.group_order,
+                "a group position changed in transit"
+            );
+            prop_assert_eq!(
+                &received.entry_ids,
+                &group.entry_ids,
+                "an ordering changed in transit"
+            );
         }
 
         prop_assert_eq!(got_entries.len(), vault.len(), "the entry counts do not match");
@@ -328,11 +359,12 @@ proptest! {
 
         prop_assert!(
             second.made_no_change(),
-            "the second merge reports changes: added={} tombstones={} deletions={} conflicts={}",
+            "the second merge reports changes: added={} tombstones={} deletions={} groups={} conflicts={:?}",
             second.added,
             second.tombstones_added,
             second.deletions_applied,
-            second.conflicts.len()
+            second.groups_added,
+            second.conflicts
         );
         prop_assert_eq!(after_first, after_second, "the second merge changed the vault content");
     }

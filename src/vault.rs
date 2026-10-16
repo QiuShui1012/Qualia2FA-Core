@@ -101,11 +101,22 @@
 //! file written before groups existed still reads as a definite order (the order its entry
 //! records appear in).
 //!
-//! **Synchronization does not transport group records yet.** Payloads carry entries and
-//! tombstones, so a peer receiving a vault receives the entries and puts them in its own top
-//! group: the grouping and the order stay local to the device that has them. Two devices
-//! therefore converge on **content** and not on arrangement, which the interface must not
-//! present as agreement.
+//! # What synchronization does with groups
+//!
+//! Payloads carry group records as well, and the merge takes the union of the **group set** the
+//! same way it takes the union of entries: a group only the peer has is added, and a group both
+//! sides have is compared. They disagree when their names, positions or the **relative order of
+//! the entries they both list** differ, and that disagreement is handed to the user, who picks
+//! one whole arrangement (see the `sync::merge` module).
+//!
+//! Two things are **not** transported, and the interface must not present them as agreed:
+//!
+//! - **Deleting a group.** A group removed on one device is still in the peer's payload, so the
+//!   union brings it back. Entries are never lost by this - they return to the top group - but
+//!   the group reappears.
+//! - **The placement of entries only one side had.** Each device keeps its own arrangement of the
+//!   entries the other never saw, which is the price of not turning every first sync into a
+//!   conflict to adjudicate.
 //!
 //! # Where the key comes from
 //!
@@ -445,7 +456,7 @@ impl Vault {
     /// For the parser only: the group records may come after the entry records in the file, so
     /// the orderings are decided once everything has been read (see
     /// `reconcile_groups`); a membership built here would only be undone there.
-    fn insert_parsed(&mut self, id: EntryId, entry: VaultEntry) -> Result<()> {
+    pub(crate) fn insert_parsed(&mut self, id: EntryId, entry: VaultEntry) -> Result<()> {
         if self.entries.contains_key(&id) {
             return Err(Error::VaultDuplicateEntryId);
         }
@@ -607,6 +618,15 @@ impl Vault {
         self.groups.get(id)
     }
 
+    /// Returns a mutable reference to a group.
+    ///
+    /// Used by conflict adjudication, which writes a **whole** group at once: the user chose one
+    /// of two arrangements, so replacing the value is the operation, not editing its parts.
+    #[must_use]
+    pub fn group_mut(&mut self, id: &GroupId) -> Option<&mut Group> {
+        self.groups.get_mut(id)
+    }
+
     /// Returns the top group, when the vault has one.
     ///
     /// An empty vault has none: the group is created by the first insertion or by parsing a
@@ -750,6 +770,9 @@ impl Vault {
 
     /// Replaces the ordering of a group.
     ///
+    /// Entries the new ordering drops return to the **top group** unless another group claims
+    /// them: "belongs to no group" is not a state an entry can be in.
+    ///
     /// The list **is** the order: index 0 comes first. Identifiers that already belong to
     /// another group are **moved** out of it, and identifiers missing from that other group's
     /// list are appended to its end, so that the membership invariant survives any caller.
@@ -772,10 +795,23 @@ impl Vault {
         }
         let replacement = Group::new(String::new(), 0, entry_ids)?.entry_ids;
 
+        let dropped: Vec<EntryId> = self
+            .groups
+            .get(id)
+            .expect("checked above")
+            .entry_ids
+            .iter()
+            .filter(|entry_id| !replacement.contains(entry_id))
+            .copied()
+            .collect();
+
         for entry_id in &replacement {
             self.detach_from_other_groups(entry_id, id);
         }
         self.groups.get_mut(id).expect("checked above").entry_ids = replacement;
+        // An entry this ordering no longer names must not end up in no group at all: it returns
+        // to the top group, keeping its relative order.
+        self.adopt_unclaimed_entries(&dropped);
         Ok(())
     }
 
@@ -805,6 +841,23 @@ impl Vault {
             .entry_ids
             .push(*entry);
         Ok(())
+    }
+
+    /// Appends every live entry of `order` that no group lists to the **top group**.
+    ///
+    /// This is the "every entry is somewhere" rule in its one reusable form: the file parser
+    /// runs it after reading the group records, and the sync merge runs it after applying a
+    /// payload. An entry nothing claims is not "in no group" - it belongs to the entries that
+    /// belong to no named group, which is what the top group is.
+    ///
+    /// The order is preserved, and entries that are already in a group (including the top one)
+    /// are left alone, so running it twice changes nothing.
+    pub fn adopt_unclaimed_entries(&mut self, order: &[EntryId]) {
+        for entry_id in order {
+            if self.entries.contains_key(entry_id) && self.group_of(entry_id).is_none() {
+                self.top_group_mut().entry_ids.push(*entry_id);
+            }
+        }
     }
 
     /// Drops every reference to an entry, so nothing points at an entry that is gone.
@@ -897,11 +950,8 @@ impl Vault {
             }
         }
 
-        for entry_id in file_entry_order {
-            if !claimed.contains(entry_id) {
-                self.top_group_mut().entry_ids.push(*entry_id);
-            }
-        }
+        let _ = claimed;
+        self.adopt_unclaimed_entries(file_entry_order);
     }
 }
 
@@ -1157,7 +1207,7 @@ impl VaultFile {
                     vault.insert_group_with_id(group_id, group)?;
                     file_group_order.push(group_id);
                 }
-                RecordKind::SyncEntry | RecordKind::SyncTombstone => {
+                RecordKind::SyncEntry | RecordKind::SyncTombstone | RecordKind::SyncGroup => {
                     return Err(Error::VaultUnknownRecordKind { value: kind_byte });
                 }
             }

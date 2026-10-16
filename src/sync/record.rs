@@ -32,20 +32,20 @@
 //! byte for byte, the ciphertexts remain mutually undecryptable. See
 //! [`crate::sync::HKDF_SALT_SYNC`].
 //!
-//! # The kind is inside the ciphertext, so decryption tries twice
+//! # The kind is inside the ciphertext, so decryption tries each kind
 //!
-//! A record's **kind** (live entry or tombstone) is part of the AAD, and the AAD must be known
-//! before decryption — so keeping the kind out of the plaintext creates a chicken-and-egg problem.
-//! Putting the kind into the plaintext under a key that does not depend on it would instead make
-//! "move an entry's ciphertext into a tombstone's slot" invisible to the AEAD, wasting the
-//! per-record authentication.
+//! A record's **kind** (live entry, tombstone or group) is part of the AAD, and the AAD must be
+//! known before decryption — so keeping the kind out of the plaintext creates a chicken-and-egg
+//! problem. Putting the kind into the plaintext under a key that does not depend on it would
+//! instead make "move an entry's ciphertext into a tombstone's slot" invisible to the AEAD,
+//! wasting the per-record authentication.
 //!
-//! The resolution is to try both kinds: `SyncEntry` first, then `SyncTombstone`, and take the one
-//! that authenticates. This introduces **no ambiguity** — the two kinds have different AADs, so one
-//! ciphertext cannot pass both authentications (probability on the order of 2^-128). The cost is
-//! one extra Poly1305 computation on a failed attempt, and failure only happens in two situations:
-//! a wrong key (the very first record of the payload fails) or a tampered payload (the whole sync
-//! is void). On the normal path each kind is tried once.
+//! The resolution is to try each kind in turn — `SyncEntry`, `SyncTombstone`, `SyncGroup` — and
+//! take the one that authenticates. This introduces **no ambiguity**: the kinds have different
+//! AADs, so one ciphertext cannot pass two authentications (probability on the order of 2^-128).
+//! The cost is one extra Poly1305 computation per failed attempt, and failure only happens in two
+//! situations: a wrong key (the very first record of the payload fails) or a tampered payload (the
+//! whole sync is void). On the normal path each record authenticates on its first or second try.
 //!
 //! What it buys is that an attacker cannot see how many deletions this sync carries. That
 //! information has limited value in itself, but it is **free** here — and it can only be got right
@@ -54,7 +54,7 @@
 
 use crate::sync::{FORMAT_VERSION, InnerRecordKind, Record};
 use crate::vault::crypto;
-use crate::vault::{Entry as VaultEntry, EntryId, Tombstone};
+use crate::vault::{Entry as VaultEntry, EntryId, Group, GroupId, Tombstone};
 use crate::{Error, Result};
 
 /// Length of the entry plaintext header: magic 4 + id 16 + length 2.
@@ -68,6 +68,13 @@ const ENTRY_HEADER_LEN: usize = 4 + EntryId::LEN + 2;
 /// different semantics. On the normal path the AAD already binds kind + entry ID + version, so any
 /// plaintext that arrives does match.
 const ENTRY_MAGIC: &[u8; 4] = b"Q2FE";
+
+/// Magic number of the group plaintext header.
+///
+/// A second magic for the same reason the entry encoding has one: an entry body fed to the group
+/// decoder (or the reverse) is caught here rather than being half-parsed into a group with a
+/// nonsense name.
+const GROUP_MAGIC: &[u8; 4] = b"Q2FG";
 
 /// A record that has been decrypted and parsed.
 ///
@@ -85,15 +92,38 @@ pub enum OpenedRecord {
     },
     /// A tombstone.
     Tombstone(Box<Tombstone>),
+    /// A group with its ordering.
+    Group {
+        /// Identifier of the group. The payload carries it in the same 16-byte field an entry
+        /// identifier uses, and the record kind is what tells the two apart.
+        id: GroupId,
+        /// The group, including the ordering of its entries.
+        group: Box<Group>,
+    },
 }
 
 impl OpenedRecord {
-    /// Which entry this record is about.
+    /// The 16-byte key this record is filed under in the payload.
+    ///
+    /// For an entry or a tombstone that is the entry identifier; for a group it is the **group**
+    /// identifier, reinterpreted: the payload layer keys its records by 16 opaque bytes and only
+    /// the vault knows that one of them names a group. Use [`OpenedRecord::group_id`] when the
+    /// distinction matters.
     #[must_use]
     pub fn entry_id(&self) -> EntryId {
         match self {
             Self::Entry { id, .. } => *id,
             Self::Tombstone(tombstone) => tombstone.entry_id,
+            Self::Group { id, .. } => EntryId::from_bytes(*id.as_bytes()),
+        }
+    }
+
+    /// The group identifier, for a group record.
+    #[must_use]
+    pub fn group_id(&self) -> Option<GroupId> {
+        match self {
+            Self::Group { id, .. } => Some(*id),
+            _ => None,
         }
     }
 
@@ -103,6 +133,7 @@ impl OpenedRecord {
         match self {
             Self::Entry { id, entry } => crate::sync::MergedRecord::Entry { id, entry },
             Self::Tombstone(tombstone) => crate::sync::MergedRecord::Tombstone(tombstone),
+            Self::Group { id, group } => crate::sync::MergedRecord::Group { id, group },
         }
     }
 }
@@ -146,6 +177,30 @@ pub fn seal_tombstone(key: &[u8; 32], tombstone: &Tombstone) -> Result<Record> {
         &tombstone.entry_id,
         &plaintext,
     )
+}
+
+/// Encrypts a group into a record of the payload.
+///
+/// The ordering travels with the group: it is what the user arranged, and on its own it means
+/// nothing without the entries, which the same payload carries.
+///
+/// # Errors
+///
+/// - [`Error::SyncMalformed`]: the group encoding exceeds 65535 bytes.
+/// - [`Error::RandomnessUnavailable`]: the random source is unavailable.
+pub fn seal_group(key: &[u8; 32], id: &GroupId, group: &Group) -> Result<Record> {
+    let body = crate::vault::encode_group(group)?;
+    let mut plaintext = Vec::with_capacity(ENTRY_HEADER_LEN + body.len());
+    plaintext.extend_from_slice(GROUP_MAGIC);
+    plaintext.extend_from_slice(id.as_bytes());
+    let len = u16::try_from(body.len()).map_err(|_| Error::SyncMalformed {
+        reason: "a single group encodes to more than 65535 bytes",
+    })?;
+    plaintext.extend_from_slice(&len.to_be_bytes());
+    plaintext.extend_from_slice(&body);
+
+    let record_id = EntryId::from_bytes(*id.as_bytes());
+    seal_plaintext(key, InnerRecordKind::SyncGroup, &record_id, &plaintext)
 }
 
 /// Seals a plaintext into a record with an already-derived subkey.
@@ -204,16 +259,16 @@ fn seal_plaintext(
 ///   older version and read by a newer one), so the specific diagnosis is kept instead of folding
 ///   it into `SyncMalformed`.
 pub fn open(key: &[u8; 32], record: &Record) -> Result<OpenedRecord> {
-    let mut last_error = None;
-    for kind in [InnerRecordKind::SyncEntry, InnerRecordKind::SyncTombstone] {
-        match try_open_as(key, kind, record) {
-            Ok(opened) => return Ok(opened),
-            Err(err) => last_error = Some(err),
+    for kind in [
+        InnerRecordKind::SyncEntry,
+        InnerRecordKind::SyncTombstone,
+        InnerRecordKind::SyncGroup,
+    ] {
+        if let Ok(opened) = try_open_as(key, kind, record) {
+            return Ok(opened);
         }
     }
-    Err(last_error.map_or(Error::SyncAuthenticationFailed, |_| {
-        Error::SyncAuthenticationFailed
-    }))
+    Err(Error::SyncAuthenticationFailed)
 }
 
 /// Tries to decrypt a record under a **specified** kind.
@@ -232,6 +287,7 @@ fn try_open_as(key: &[u8; 32], kind: InnerRecordKind, record: &Record) -> Result
     match kind {
         InnerRecordKind::SyncEntry => open_entry(&record.entry_id, &plaintext),
         InnerRecordKind::SyncTombstone => open_tombstone(&record.entry_id, &plaintext),
+        InnerRecordKind::SyncGroup => open_group(&record.entry_id, &plaintext),
         _ => Err(Error::SyncMalformed {
             reason: "the decoding path received a non-sync record kind",
         }),
@@ -284,6 +340,46 @@ fn open_entry(id: &EntryId, plaintext: &[u8]) -> Result<OpenedRecord> {
 fn open_tombstone(id: &EntryId, plaintext: &[u8]) -> Result<OpenedRecord> {
     let tombstone = crate::vault::decode_tombstone(*id, plaintext)?;
     Ok(OpenedRecord::Tombstone(Box::new(tombstone)))
+}
+
+/// Parses a **group** plaintext that has already been decrypted and authenticated.
+///
+/// Same header layout as an entry, with its own magic: the identifier inside must equal the one
+/// the record was filed under, which is what stops a group's ciphertext from being replayed under
+/// another group's identifier.
+fn open_group(id: &EntryId, plaintext: &[u8]) -> Result<OpenedRecord> {
+    if plaintext.len() < ENTRY_HEADER_LEN {
+        return Err(Error::SyncTruncated);
+    }
+    if &plaintext[..4] != GROUP_MAGIC {
+        return Err(Error::SyncMalformed {
+            reason: "the group plaintext is missing its magic",
+        });
+    }
+    let embedded: [u8; GroupId::LEN] = plaintext[4..4 + GroupId::LEN]
+        .try_into()
+        .map_err(|_| Error::SyncTruncated)?;
+    if &embedded != id.as_bytes() {
+        return Err(Error::SyncMalformed {
+            reason: "the identifier in the group plaintext differs from the record identifier",
+        });
+    }
+    let len_bytes: [u8; 2] = plaintext[4 + GroupId::LEN..ENTRY_HEADER_LEN]
+        .try_into()
+        .map_err(|_| Error::SyncTruncated)?;
+    let declared = usize::from(u16::from_be_bytes(len_bytes));
+    let body = plaintext
+        .get(ENTRY_HEADER_LEN..ENTRY_HEADER_LEN + declared)
+        .ok_or(Error::SyncTruncated)?;
+    if plaintext.len() != ENTRY_HEADER_LEN + declared {
+        return Err(Error::SyncMalformed {
+            reason: "the group plaintext holds content beyond its declared length",
+        });
+    }
+    Ok(OpenedRecord::Group {
+        id: GroupId::from_bytes(embedded),
+        group: Box::new(crate::vault::decode_group(body)?),
+    })
 }
 
 #[cfg(test)]

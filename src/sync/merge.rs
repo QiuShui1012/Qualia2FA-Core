@@ -29,6 +29,9 @@
 //! | entry | tombstone with the same ID, local entry **modified since** | **conflict** |
 //! | entry | nothing | local entry kept (the peer simply does not have it) |
 //! | nothing | entry / tombstone | accepted |
+//! | group | nothing | accepted |
+//! | group | group with the same ID, same name, position and shared relative order | nothing to do |
+//! | group | group with the same ID that arranges a shared entry differently | **conflict**: the user picks one whole arrangement |
 //!
 //! The tombstone is what makes a deletion synchronizable: in a plain union "this entry does
 //! not exist here" and "this entry was deleted" are the **same observation**, both showing
@@ -57,7 +60,7 @@
 use std::collections::BTreeMap;
 
 use crate::Result;
-use crate::vault::{Entry as VaultEntry, EntryId, Tombstone, Vault};
+use crate::vault::{Entry as VaultEntry, EntryId, Group, GroupId, Tombstone, Vault};
 
 /// A record received from a peer, together with its identifier.
 ///
@@ -87,15 +90,30 @@ pub enum MergedRecord {
     },
     /// A tombstone (deletion record).
     Tombstone(Box<Tombstone>),
+    /// A group with its ordering.
+    ///
+    /// The granularity is the **whole group**: its name, its position and the order of its
+    /// entries travel as one value, because that is what the user arranged and what the
+    /// adjudication screen shows side by side.
+    Group {
+        /// The identifier of the group.
+        id: GroupId,
+        /// The group itself.
+        group: Box<Group>,
+    },
 }
 
 impl MergedRecord {
-    /// Which entry this record is about.
+    /// The 16-byte key this record is filed under.
+    ///
+    /// For a group that is its identifier reinterpreted, since the payload keys its records by 16
+    /// opaque bytes and does not distinguish the kinds (see [`RecordSet`]).
     #[must_use]
     pub fn entry_id(&self) -> EntryId {
         match self {
             Self::Entry { id, .. } => *id,
             Self::Tombstone(tombstone) => tombstone.entry_id,
+            Self::Group { id, .. } => EntryId::from_bytes(*id.as_bytes()),
         }
     }
 }
@@ -117,6 +135,23 @@ pub struct Conflict {
     pub kind: ConflictKind,
 }
 
+impl Conflict {
+    /// The group this conflict is about.
+    ///
+    /// An ordering conflict carries its identifier in [`Conflict::entry_id`] - the same 16-byte
+    /// field every payload record is filed under, since the payload does not distinguish the
+    /// kinds - and this recovers it with its meaning attached.
+    #[must_use]
+    pub fn group_id(&self) -> Option<GroupId> {
+        match self.kind {
+            ConflictKind::OrderingMismatch { .. } => {
+                Some(GroupId::from_bytes(*self.entry_id.as_bytes()))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// The kind of disagreement.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConflictKind {
@@ -130,6 +165,18 @@ pub enum ConflictKind {
         local: Box<VaultEntry>,
         /// The version received from the peer. **Not yet** written to the local vault.
         incoming: Box<VaultEntry>,
+    },
+    /// Both sides have the group, and they differ in the name, the position or the ordering.
+    ///
+    /// **The ordering is not merged element by element.** Two devices that arranged the same
+    /// entries differently hold two different sequences, and interleaving them would produce a
+    /// third arrangement that neither user asked for; the user picks one of the two whole
+    /// orderings (see [`crate::sync::adjudicate`]).
+    OrderingMismatch {
+        /// The local group.
+        local: Box<Group>,
+        /// The version received from the peer. **Not yet** written to the local vault.
+        incoming: Box<Group>,
     },
     /// One side deleted the entry while the other still has it and it **was modified**.
     ///
@@ -175,6 +222,9 @@ pub struct MergeOutcome {
     pub tombstones_added: usize,
     /// Number of deletions accepted (a local entry replaced by a tombstone).
     pub deletions_applied: usize,
+    /// Number of groups added. **Not** including the case where the local vault already had that
+    /// group with the same content.
+    pub groups_added: usize,
     /// Number of records whose content was completely identical, so nothing was done.
     pub unchanged: usize,
     /// Disagreements that need a human to adjudicate.
@@ -234,16 +284,122 @@ pub fn merge_into<'a>(
 ) -> Result<MergeOutcome> {
     let mut outcome = MergeOutcome::default();
 
-    for record in records {
+    // Entries and tombstones first, groups after: a group's ordering is compared against the
+    // entries this device holds **once the batch has been applied**, so a group that names an
+    // entry arriving in the same payload is not reported as a difference just because the two
+    // records happened to be ordered that way.
+    let all_records: Vec<&MergedRecord> = records.into_iter().collect();
+    let mut groups: Vec<&MergedRecord> = Vec::new();
+    let mut arrived: Vec<EntryId> = Vec::new();
+    for record in &all_records {
         match record {
-            MergedRecord::Entry { id, entry } => merge_entry(vault, id, entry, &mut outcome)?,
+            MergedRecord::Entry { id, entry } => {
+                let existed = vault.get(id).is_some() || vault.get_tombstone(id).is_some();
+                merge_entry(vault, id, entry, &mut outcome)?;
+                if !existed {
+                    arrived.push(*id);
+                }
+            }
             MergedRecord::Tombstone(tombstone) => {
                 merge_tombstone(vault, tombstone, &mut outcome);
             }
+            MergedRecord::Group { .. } => groups.push(*record),
         }
     }
+    for record in groups {
+        if let MergedRecord::Group { id, group } = record {
+            merge_group(vault, id, group, &mut outcome);
+        }
+    }
+    // The same rule the file parser applies: an entry no group claims belongs to the top group.
+    // Without it an entry arriving in a payload that carries no group record - or whose group
+    // record lost the id - would exist in the vault and appear nowhere.
+    //
+    // The order is the peer's: its top group lists the entries it sent in the arrangement it
+    // wants, and appending them in the order the *records* happened to appear would put them
+    // somewhere else - which the next sync would then report as a disagreement this merge itself
+    // created. Whatever the top group does not mention follows in payload order.
+    let mut claim_order: Vec<EntryId> = Vec::new();
+    for record in &all_records {
+        if let MergedRecord::Group { id, group } = record
+            && id.is_top()
+        {
+            claim_order.extend(group.entry_ids.iter().copied());
+        }
+    }
+    for entry_id in &arrived {
+        if !claim_order.contains(entry_id) {
+            claim_order.push(*entry_id);
+        }
+    }
+    vault.adopt_unclaimed_entries(&claim_order);
 
     Ok(outcome)
+}
+
+/// Merges one group.
+///
+/// Three cases: the local vault has no such group, so it is inserted; it has one with the same
+/// **visible** content, so nothing is done; or the two differ, which is a
+/// [`ConflictKind::OrderingMismatch`] for the user.
+///
+/// # What counts as a disagreement
+///
+/// The name and the position must match, and so must the **relative order of the entries both
+/// sides hold**. An entry only one side lists says nothing about the other's arrangement - it
+/// cannot have been placed there by the other device - so it is not a disagreement: the merge
+/// keeps the local arrangement and the arriving entry is appended to the top group (see
+/// [`crate::vault::Vault::adopt_unclaimed_entries`]).
+///
+/// The stricter rule "the lists must be identical" was tried first and made **every** first sync
+/// between two devices a conflict: each device has appended its own entries to the top group, so
+/// the two lists differ by exactly the entries the other side had never seen. What the user can
+/// actually disagree about is where an entry goes **relative to the others they both have**, and
+/// that is what is compared here.
+///
+/// The consequence, stated rather than hidden: two devices that each had private entries keep
+/// their own placement of those. They converge on the entries they share, which is the part
+/// either of them could have an opinion about.
+///
+/// Returns no `Result`: a group holds no secret material, so nothing here can fail.
+fn merge_group(vault: &mut Vault, id: &GroupId, incoming: &Group, outcome: &mut MergeOutcome) {
+    let Some(local) = vault.group(id) else {
+        // A failure here means the identifier is already taken, which the `get` above ruled out.
+        if vault.insert_group_with_id(*id, incoming.clone()).is_ok() {
+            outcome.groups_added += 1;
+        }
+        return;
+    };
+
+    if local.name == incoming.name
+        && local.group_order == incoming.group_order
+        && !orderings_disagree(&local.entry_ids, &incoming.entry_ids)
+    {
+        outcome.unchanged += 1;
+        return;
+    }
+    outcome.conflicts.push(Conflict {
+        entry_id: EntryId::from_bytes(*id.as_bytes()),
+        kind: ConflictKind::OrderingMismatch {
+            local: Box::new(local.clone()),
+            incoming: Box::new(incoming.clone()),
+        },
+    });
+}
+
+/// Whether two orderings place the entries they **both** list differently.
+///
+/// Both lists are reduced to the identifiers they have in common - the only ones either side can
+/// have an opinion about - and the two reductions are compared. One entry alone is always "in the
+/// same order as itself", so a difference in the set of entries is never reported here.
+fn orderings_disagree(local: &[EntryId], incoming: &[EntryId]) -> bool {
+    let shared = |list: &[EntryId]| -> Vec<EntryId> {
+        list.iter()
+            .filter(|entry_id| incoming.contains(entry_id))
+            .copied()
+            .collect()
+    };
+    shared(local) != shared(incoming)
 }
 
 /// Merges one live entry.
@@ -292,7 +448,11 @@ fn merge_entry(
         return Ok(());
     }
 
-    if vault.insert_with_id(*id, entry.duplicate()?).is_ok() {
+    // Inserted **without** touching an ordering: the payload's group records decide the
+    // arrangement, and an entry appended to the top group here would make the local top group
+    // differ from the peer's copy of it, reporting a conflict that is really this insertion.
+    // `merge_into` adopts whatever no group claims once everything has been applied.
+    if vault.insert_parsed(*id, entry.duplicate()?).is_ok() {
         outcome.added += 1;
     }
     Ok(())
@@ -488,6 +648,7 @@ impl HasEntryId for MergedRecord {
         match self {
             Self::Entry { id, .. } => *id,
             Self::Tombstone(tombstone) => tombstone.entry_id,
+            Self::Group { id, .. } => EntryId::from_bytes(*id.as_bytes()),
         }
     }
 }
