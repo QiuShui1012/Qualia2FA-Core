@@ -68,7 +68,7 @@ pub enum PngError {
     /// A feature outside what an export produces: sixteen-bit samples, a palette, interlacing.
     Unsupported,
 
-    /// The image is larger than [`MAX_PIXELS`].
+    /// The image is larger than this reader accepts; the bound is `MAX_PIXELS`.
     TooLarge,
 
     /// The compressed data is not a valid stream, or does not decode to the stated size.
