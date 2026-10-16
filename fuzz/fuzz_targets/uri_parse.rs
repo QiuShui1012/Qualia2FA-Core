@@ -66,6 +66,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use qualia2fa_core::uri;
+use qualia2fa_core::vault;
 
 /// The valid prefixes to cover. Covers `totp`/`hotp`, with and without issuer, with
 /// and without query.
@@ -128,11 +129,33 @@ fn check(text: &str) {
     }
 
     assert!(parsed.secret.len() > 0, "the parsed seed is empty");
-    match parsed.uri_type {
-        uri::UriType::Totp => assert!(parsed.counter.is_none(), "TOTP must not carry a counter"),
-        uri::UriType::Hotp => assert!(parsed.counter.is_some(), "HOTP must carry a counter"),
+    if let Some(period) = parsed.kind.period() {
+        assert!(period > 0, "a stored time step must not be 0");
     }
-    assert!(parsed.period > 0, "period must not be 0");
+    if let uri::UriType::Hotp = parsed.uri_type() {
+        assert!(
+            matches!(parsed.kind, vault::EntryKind::Hotp { .. }),
+            "HOTP must carry a counter"
+        );
+    }
+
+    // The type must agree with the spelling `serialize` writes: that text is what a peer or a
+    // QR code reader sees, so a type that disagreed with it would be a configuration filed
+    // under one scheme and exported as another.
+    if let Ok(text) = uri::serialize(&parsed) {
+        let expected = match parsed.uri_type() {
+            uri::UriType::Totp => "otpauth://totp/",
+            uri::UriType::Hotp => "otpauth://hotp/",
+            uri::UriType::Motp => "motp:/",
+            uri::UriType::Yandex => "otpauth://yaotp/",
+            uri::UriType::Steam => "otpauth://steam/",
+        };
+        assert!(
+            text.starts_with(expected),
+            "a {:?} configuration was written as {text}",
+            parsed.uri_type()
+        );
+    }
 
     if let Ok(roundtrip) = uri::serialize(&parsed) {
         if let Ok(reparsed) = uri::parse(&roundtrip) {
