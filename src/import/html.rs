@@ -25,22 +25,28 @@
 //!
 //! # What the format does not carry
 //!
-//! - **No time step.** The step only exists inside the QR code that sits in one of the columns,
-//!   and this reader does not decode images: for the schemes that have a step, the default is
-//!   used and every such entry is marked with [`ImportNote::PeriodAssumed`]. An entry whose step
-//!   is not the default would otherwise produce codes that never match, with nothing on screen to
-//!   say why.
 //! - **No groups.** The export has no grouping at all, so every imported entry belongs to the top
 //!   group.
 //! - **An mOTP secret is written as hexadecimal here**, while the JSON export writes Base32. The
 //!   reader converts it, so the mapping sees one encoding.
 //!
-//! # The image column is skipped, and nothing else is decoded
+//! # The time step lives inside the drawing
 //!
-//! One column holds a QR code as a `data:` image, and this reader ignores it in the simplest
-//! possible way: only the **text** of a cell is looked at, and an image contributes none. Its
-//! content is the same configuration the neighbouring columns already spell out, so decoding
-//! images would mean pulling in a decoder for information that is already here in plain text.
+//! There is no period column. The step is written down in exactly one place - the QR code in a
+//! column of its own, which holds the entry's whole `otpauth://` URI - so this reader decodes
+//! the image to get it (see [`crate::import::qr_text_from_png`]).
+//!
+//! What the URI says is what the entry gets: a `period` parameter when it carries one, and
+//! `otpauth://`'s own default of 30 seconds when it does not. Neither is an assumption - the
+//! code was read, and the default is part of what the URI means.
+//! [`ImportNote::PeriodAssumed`] is therefore left for the case it names: the image could not be
+//! read at all (not a PNG, no code in it, a code that is not a URI this library understands).
+//! The entry is still imported with the scheme's default, and the note is what keeps a wrong
+//! step from being silent.
+//!
+//! The image is read for the step and for nothing else. Its code holds the secret too, and so do
+//! the neighbouring columns; taking the secret from the columns keeps one encoding rule (hex for
+//! mOTP, Base32 elsewhere) instead of two.
 //!
 //! # The document is not well-formed, and that is fine
 //!
@@ -117,12 +123,23 @@ struct Read {
     notes: Vec<ImportNote>,
 }
 
+/// One cell of a row.
+///
+/// The text is what the columns are read for; the image is read for the one thing no column
+/// carries, which is the time step inside the QR code.
+struct Cell {
+    /// The cell's text: tags removed, entities decoded.
+    text: String,
+    /// The base64 payload of the `data:` PNG the cell embeds, when it embeds one.
+    png: Option<String>,
+}
+
 /// One row of cells, with the heading names beside it.
 struct Table {
     /// Column name (lower case, trimmed) to column number.
     columns: HashMap<String, usize>,
     /// The data rows, still as raw cell text.
-    rows: Vec<Vec<String>>,
+    rows: Vec<Vec<Cell>>,
     /// How far the reader has got.
     next: usize,
 }
@@ -147,7 +164,7 @@ impl Table {
             }
             if is_heading && !heading_seen {
                 for (index, cell) in cells.iter().enumerate() {
-                    let name = cell.trim().to_ascii_lowercase();
+                    let name = cell.text.trim().to_ascii_lowercase();
                     if !name.is_empty() {
                         columns.entry(name).or_insert(index);
                     }
@@ -173,23 +190,26 @@ impl Table {
         })
     }
 
-    /// The next data row.
-    fn next_row(&mut self) -> Option<Vec<String>> {
-        let row = self.rows.get(self.next)?;
+    /// The next data row, taken out of the table.
+    ///
+    /// Taken rather than copied: a row carries the base64 of its image, and the reader walks the
+    /// table exactly once.
+    fn next_row(&mut self) -> Option<Vec<Cell>> {
+        let row = self.rows.get_mut(self.next)?;
         self.next += 1;
-        Some(row.clone())
+        Some(std::mem::take(row))
     }
 }
 
 /// Reads one row into an entry, or `None` when the row holds nothing to import.
 fn read_row(
     columns: &HashMap<String, usize>,
-    row: &[String],
+    row: &[Cell],
     now: Timestamp,
 ) -> Result<Option<Read>> {
+    let named = |name: &str| -> Option<&Cell> { row.get(*columns.get(name)?) };
     let cell = |name: &str| -> Option<&str> {
-        let index = *columns.get(name)?;
-        let value = row.get(index)?.trim();
+        let value = named(name)?.text.trim();
         if value.is_empty() || value == "-" {
             None
         } else {
@@ -206,8 +226,11 @@ fn read_row(
         return Err(malformed("a row has no secret"));
     };
 
+    // The step is the one field the table does not carry; it is inside the code.
+    let period = period_from_code(named("qr code"));
+
     let kind = match type_name.to_ascii_lowercase().as_str() {
-        "totp" => RawKind::Totp { period: None },
+        "totp" => RawKind::Totp { period },
         "hotp" => RawKind::Hotp {
             counter: cell("counter")
                 .and_then(|text| text.parse::<u64>().ok())
@@ -215,11 +238,11 @@ fn read_row(
         },
         "steam" => RawKind::Steam,
         "motp" => RawKind::Motp {
-            period: None,
+            period,
             pin: cell("pin").map(str::to_owned),
         },
         "yandex" => RawKind::Yandex {
-            period: None,
+            period,
             pin: cell("pin").map(str::to_owned),
         },
         _ => return Err(malformed("a row has a type this library does not know")),
@@ -259,11 +282,14 @@ fn read_row(
     };
     let (entry, mut notes) = entry.into_entry(now)?;
 
-    // The step is not in the document at all; say so rather than letting the default pass for
-    // something the file declared.
-    if let Some(period) = entry.kind.period() {
+    // A step that was not in the code stands in as the scheme's default, and the note is what
+    // keeps that from being silent: an entry whose real step is not the default would otherwise
+    // produce codes that never match, with nothing on screen to say why.
+    if period.is_none()
+        && let Some(seconds) = entry.kind.period()
+    {
         let text = std::mem::take(&mut notes);
-        notes = vec![ImportNote::PeriodAssumed { seconds: period }];
+        notes = vec![ImportNote::PeriodAssumed { seconds }];
         notes.extend(text);
     }
 
@@ -272,6 +298,109 @@ fn read_row(
         favorite,
         notes,
     }))
+}
+
+/// The time step carried by the QR code of one row, when it can be read.
+///
+/// `None` means the step is not knowable from this document: there is no image cell, the image
+/// is not a PNG, no code was found in it, or the text in the code is not a configuration this
+/// library understands. Every one of those is a fact about the file rather than an error - the
+/// row's own columns are still read - so the caller turns it into a note rather than a problem.
+///
+/// The code is expected to hold the entry's `otpauth://` URI, which is what the reference
+/// implementation draws. A URI with no `period` parameter is not a missing answer: the scheme's
+/// own default is what such an entry has.
+fn period_from_code(cell: Option<&Cell>) -> Option<u64> {
+    let png = decode_base64(cell?.png.as_deref()?)?;
+    let text = crate::import::qr_text_from_png(&png).ok()?;
+    crate::uri::parse(&text).ok()?.kind.period()
+}
+
+/// The base64 payload of the PNG a fragment embeds, when it embeds one.
+///
+/// A `data:` URL is the only way an image travels inside a document, and the only image this
+/// reader looks at is a PNG. The scan stops at the first character that cannot be part of the
+/// payload, which is the closing quote of the attribute - values are never searched for past
+/// the end of the string they were found in.
+fn embedded_png(fragment: &str) -> Option<String> {
+    /// The prefix of a PNG `data:` URL, lower case.
+    const PREFIX: &str = "data:image/png;base64,";
+
+    // The prefix is ASCII, and `to_ascii_lowercase` changes no byte count, so an offset found
+    // in the folded copy is an offset in the original.
+    let start = fragment.to_ascii_lowercase().find(PREFIX)? + PREFIX.len();
+    let mut payload = String::new();
+    for character in fragment[start..].chars() {
+        if character.is_ascii_alphanumeric()
+            || matches!(character, '+' | '/' | '=' | '\n' | '\r' | ' ' | '\t')
+        {
+            payload.push(character);
+        } else {
+            break;
+        }
+    }
+    (!payload.is_empty()).then_some(payload)
+}
+
+/// Decodes standard base64, skipping the line breaks the format wraps it with.
+///
+/// Whitespace is skipped rather than refused, because the line width is part of how the format
+/// writes the image; anything else outside the alphabet is refused, since a decoder that
+/// tolerates stray characters turns a modified file into a shorter one.
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    /// The value of one base64 character.
+    const fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut chunk = [0_u8; 4];
+    let mut held = 0_usize;
+    let mut padding = 0_usize;
+
+    for byte in text.bytes() {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        if byte == b'=' {
+            padding += 1;
+            chunk[held] = 0;
+        } else {
+            if padding > 0 {
+                // A character after padding means the padding is not at the end.
+                return None;
+            }
+            chunk[held] = value(byte)?;
+        }
+        held += 1;
+        if held == 4 {
+            let bits = (u32::from(chunk[0]) << 18)
+                | (u32::from(chunk[1]) << 12)
+                | (u32::from(chunk[2]) << 6)
+                | u32::from(chunk[3]);
+            out.push((bits >> 16) as u8);
+            if padding < 2 {
+                out.push((bits >> 8) as u8);
+            }
+            if padding == 0 {
+                out.push(bits as u8);
+            }
+            held = 0;
+        }
+    }
+
+    if held != 0 || padding > 2 {
+        // A trailing fragment is not a whole group, so the text was not base64.
+        return None;
+    }
+    Some(out)
 }
 
 /// Whether the row describes mOTP, whose secret this format writes in hexadecimal.
@@ -362,12 +491,13 @@ fn split_rows(html: &str) -> Vec<&str> {
     rows
 }
 
-/// Splits a row into cell texts, and says whether the row was a heading row.
+/// Splits a row into cells, and says whether the row was a heading row.
 ///
-/// Only the text of a cell is kept: nested markup (an image, a line break) is dropped, and the
-/// five entities an exporter may write are decoded. Everything else is left as it stands, which
-/// matters for a note that contains an ampersand.
-fn split_cells(row: &str) -> (Vec<String>, bool) {
+/// A cell keeps its **text** (nested markup other than an image is dropped, and the five
+/// entities an exporter may write are decoded) and the base64 of the PNG it draws, if it draws
+/// one. Everything else is left as it stands, which matters for a note that contains an
+/// ampersand.
+fn split_cells(row: &str) -> (Vec<Cell>, bool) {
     let mut cells = Vec::new();
     let mut is_heading = false;
     let mut rest = row;
@@ -395,7 +525,11 @@ fn split_cells(row: &str) -> (Vec<String>, bool) {
             .or_else(|| find_tag(after, "td"))
             .or_else(|| find_tag(after, "th"))
             .unwrap_or(after.len());
-        cells.push(text_of(&after[..end]));
+        let fragment = &after[..end];
+        cells.push(Cell {
+            text: text_of(fragment),
+            png: embedded_png(fragment),
+        });
         rest = &after[end..];
     }
 
@@ -573,6 +707,105 @@ mod tests {
             "HOTP has no step to assume"
         );
         assert!(report.entries[2].notes.is_empty(), "nor has Steam Guard");
+    }
+
+    /// The step comes from the code and the secret from the column, and they may disagree.
+    ///
+    /// A hand-edited row, or one whose image belongs to another entry, can hold a code that says
+    /// something other than the columns do. The columns are what this reader reads: taking the
+    /// secret from the code as well would mean a second encoding rule (hex for mOTP, Base32
+    /// elsewhere) decided by an image, and the two could contradict each other with no way to
+    /// tell which was meant.
+    #[test]
+    fn the_secret_comes_from_the_column_and_only_the_step_from_the_code() {
+        use qualia_transport::qr::{self, EcLevel};
+
+        /// The secret the code carries, which is not the one the column does.
+        const IN_THE_CODE: &str = "KRSXG5CTMVRXEZLU";
+        /// The secret the column carries.
+        const IN_THE_COLUMN: &str = "JBSWY3DPEHPK3PXP";
+
+        let uri = format!("otpauth://totp/Elsewhere:someone?secret={IN_THE_CODE}&period=90");
+        let symbol = qr::encode_text(&uri, EcLevel::Low, 40).expect("the URI fits a code");
+        let drawn = symbol.render(4, 4).expect("the render geometry is legal");
+        let document = format!(
+            "<table>\
+             <tr><th>Name</th><th>Type</th><th>QR Code</th><th>Algo</th><th>Digits</th><th>Secret</th></tr>\
+             <tr><td>GitHub</td><td>totp</td>\
+             <td><img src=\"data:image/png;base64,{}\"></td>\
+             <td>SHA1</td><td>6</td><td>{IN_THE_COLUMN}</td></tr>\
+             </table>",
+            crate::export::base64(&crate::export::png::encode(&drawn))
+        );
+
+        let report = import_sample(&document);
+        assert!(report.problems.is_empty(), "actual {:?}", report.problems);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(
+            report.entries[0].entry.secret.to_base32(),
+            IN_THE_COLUMN,
+            "the secret is the column's"
+        );
+        assert_eq!(
+            report.entries[0].entry.kind,
+            EntryKind::Totp { period: 90 },
+            "the step is the code's"
+        );
+        assert_eq!(
+            report.dropped.periods_assumed, 0,
+            "a step that was read is not an assumption"
+        );
+    }
+
+    /// A code that cannot be decoded leaves the step assumed, and does not disturb the entry.
+    #[test]
+    fn an_image_that_carries_no_code_leaves_the_step_assumed() {
+        let document = "<table>\
+            <tr><th>Name</th><th>Type</th><th>QR Code</th><th>Algo</th><th>Digits</th><th>Secret</th></tr>\
+            <tr><td>GitHub</td><td>totp</td>\
+            <td><img src=\"data:image/png;base64,iVBORw0KGgo=\"></td>\
+            <td>SHA1</td><td>6</td><td>JBSWY3DPEHPK3PXP</td></tr>\
+            </table>";
+        let report = import_sample(document);
+
+        assert!(report.problems.is_empty(), "the row itself is fine");
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].entry.kind, EntryKind::Totp { period: 30 });
+        assert!(
+            report.entries[0]
+                .notes
+                .contains(&ImportNote::PeriodAssumed { seconds: 30 }),
+            "the default has to be reported when the code could not be read"
+        );
+        assert_eq!(report.dropped.periods_assumed, 1);
+    }
+
+    /// Base64 wrapped at any width decodes, and text that is not base64 is refused.
+    #[test]
+    fn the_image_payload_is_read_through_its_line_breaks() {
+        assert_eq!(
+            super::decode_base64("QUJD\nREVG\n").expect("valid"),
+            b"ABCDEF".to_vec()
+        );
+        assert_eq!(
+            super::decode_base64("").expect("empty is valid"),
+            Vec::<u8>::new()
+        );
+        for bad in ["Q", "Q!==", "QUJD=QUJD", "QQ==="] {
+            assert!(
+                super::decode_base64(bad).is_none(),
+                "{bad} is not base64 and must be refused"
+            );
+        }
+        assert_eq!(
+            super::embedded_png("<img src=\"data:image/png;base64,QUJD\nREVG\">")
+                .expect("the payload is there"),
+            "QUJD\nREVG"
+        );
+        assert!(
+            super::embedded_png("<img src=\"data:image/jpeg;base64,QUJD\">").is_none(),
+            "only a PNG is looked at"
+        );
     }
 
     #[test]
