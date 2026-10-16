@@ -7,9 +7,13 @@ name: CI
 # Core tenet: CI must stop cryptographic code that merely looks right, so besides the
 # usual fmt/clippy/test there are dependency audit and MSRV gates.
 
+# A branch pushed inside this repository starts **two** runs for the same commit: one for
+# the `push` and one for the `pull_request`. Only the second one is about the change under
+# review, so `push` is limited to `master` and every other change arrives through its pull
+# request. Branches in forks never produce a `push` run to begin with.
 on:
   push:
-    branches: ["**"]
+    branches: [master]
   pull_request:
 
 # A new push to the same branch cancels the older run instead of queueing.
