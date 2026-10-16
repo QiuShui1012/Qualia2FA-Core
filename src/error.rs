@@ -164,6 +164,16 @@ pub enum Error {
         len: usize,
     },
 
+    /// The trailing checksum of a 26-byte Yandex OTP secret does not match its contents.
+    ///
+    /// The checksum is a polynomial remainder over the secret (see `yaotp::normalize_secret`),
+    /// and it is a **data-integrity** check, not a cryptographic one: it exists so that a
+    /// mistyped or truncated secret is reported as damaged at import time instead of turning
+    /// into codes that no server will ever accept. It carries no information about the secret
+    /// itself.
+    #[error("Yandex OTP secret checksum does not match its contents")]
+    YandexSecretChecksum,
+
     /// Cryptographic random bytes cannot be obtained from the operating system.
     ///
     /// This is an **unrecoverable** failure: the library deliberately uses no user-space PRNG as

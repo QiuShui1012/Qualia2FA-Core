@@ -47,22 +47,31 @@
 //!    same construction would index out of bounds, so such an entry is rejected by the
 //!    caller rather than computed.
 //!
-//! # Secret forms
+//! # Secret forms and the trailing checksum
 //!
-//! A Yandex secret is either **16 bytes** (what a QR code carries) or **26 bytes**
-//! (16 bytes plus a trailing checksum). Only the first 16 bytes take part in the
-//! computation, see [`normalize_secret`].
+//! A Yandex secret is either **16 bytes** (what a QR code carries) or **26 bytes** (16 bytes
+//! plus a trailing checksum). Only the first 16 bytes take part in the computation.
 //!
-//! # Known gap: the trailing checksum is not verified
+//! The 12-bit checksum of the 26-byte form is a **polynomial remainder** — the construction
+//! a CRC uses — over the first `len * 8 - 12` bits, with these parameters:
 //!
-//! The 26-byte form ends with a 12-bit checksum over the secret. It is **not verified
-//! here**, for a licensing reason rather than a technical one: no specification of that
-//! checksum exists, and the only published descriptions of it are GPL-3.0 implementations,
-//! which cannot be copied into this LGPL-3.0-or-later crate. The effect is that a corrupted
-//! 26-byte secret is accepted and produces codes the server rejects, instead of being
-//! reported as damaged at import time. The first 16 bytes — the part that determines the
-//! code — are used identically either way, so a **valid** secret behaves exactly as it does
-//! in the reference implementation.
+//! | Parameter | Value |
+//! |---|---|
+//! | Polynomial | `0x18F3` (13 bits, normal / most-significant-bit-first form) |
+//! | Initial register | 0 |
+//! | Input reflection | none |
+//! | Output reflection / final xor | none |
+//!
+//! The stored value is the low nibble of the second-to-last byte followed by the last byte.
+//! [`normalize_secret`] rejects a 26-byte secret whose checksum does not match, so a damaged
+//! secret is reported at import time instead of becoming codes that no server accepts.
+//!
+//! There is no specification of this scheme. The polynomial and the parameters above were
+//! determined from the **observable behaviour** of the samples the reference implementation
+//! publishes (three valid secrets and one deliberately corrupted one, all of which the
+//! implementation below reproduces), and the check is written from that mathematical
+//! definition — what a polynomial remainder is, and how it is computed, is textbook material
+//! with no single author.
 //!
 //! # Purity
 //!
@@ -89,6 +98,46 @@ pub const SECRET_FULL_LEN: usize = 26;
 
 /// Size of the code alphabet: `a`-`z`.
 const ALPHABET_LEN: u64 = 26;
+
+/// Width of the secret checksum in bits.
+const CHECKSUM_BITS: usize = 12;
+
+/// Polynomial of the secret checksum, including its implicit leading term.
+///
+/// In the normal (most-significant-bit-first) form used by [`secret_checksum`], the leading
+/// term corresponds to bit [`CHECKSUM_BITS`], and [`CHECKSUM_POLYNOMIAL_LOW`] holds the
+/// remaining terms.
+const CHECKSUM_POLYNOMIAL: u16 = 0x18f3;
+
+/// The polynomial without its implicit leading term, applied on every reduction.
+const CHECKSUM_POLYNOMIAL_LOW: u16 = CHECKSUM_POLYNOMIAL & 0x0fff;
+
+/// Computes the secret checksum: the polynomial remainder of the first `len * 8 - 12` bits.
+///
+/// `secret` must hold a whole number of bytes with at least [`CHECKSUM_BITS`] of them, which
+/// the caller guarantees by passing a 26-byte secret.
+fn secret_checksum(secret: &[u8]) -> u16 {
+    let data_bits = secret.len() * 8 - CHECKSUM_BITS;
+    let mut register = 0_u16;
+    for index in 0..data_bits {
+        let bit = u16::from((secret[index / 8] >> (7 - index % 8)) & 1);
+        let overflow = (register >> (CHECKSUM_BITS - 1)) & 1;
+        register = ((register << 1) | bit) & 0x0fff;
+        if overflow == 1 {
+            register ^= CHECKSUM_POLYNOMIAL_LOW;
+        }
+    }
+    register
+}
+
+/// Reads the checksum as it is stored: the low nibble of the second-to-last byte, then the
+/// last byte.
+///
+/// `secret` must hold at least two bytes, which the caller guarantees by passing a 26-byte
+/// secret.
+fn stored_checksum(secret: &[u8]) -> u16 {
+    (u16::from(secret[secret.len() - 2] & 0x0f) << 8) | u16::from(secret[secret.len() - 1])
+}
 
 /// A Yandex OTP PIN.
 ///
@@ -171,18 +220,25 @@ impl Eq for YandexPin {}
 
 /// Normalises a Yandex secret to the 16 bytes the algorithm uses.
 ///
-/// A 16-byte secret is taken as is. A 26-byte secret keeps its first 16 bytes and drops the
-/// trailing checksum, which is **not verified** — see the module documentation for why, and
-/// for what that means in practice.
+/// A 16-byte secret is taken as is. A 26-byte secret must carry a matching checksum (see the
+/// module documentation for the parameters); its first 16 bytes are returned and the
+/// trailing checksum is dropped.
 ///
 /// # Errors
 ///
-/// Returns [`Error::YandexSecretLength`] for any other length. The length is reported but
-/// the bytes are not: a rejected secret is still secret material.
+/// - [`Error::YandexSecretLength`] for a length other than 16 or 26 bytes. The length is
+///   reported but the bytes are not: a rejected secret is still secret material.
+/// - [`Error::YandexSecretChecksum`] for a 26-byte secret whose trailing checksum does not
+///   match its contents.
 pub fn normalize_secret(secret: &[u8]) -> Result<OtpSecret> {
     match secret.len() {
         SECRET_LEN => OtpSecret::from_bytes(secret.to_vec()),
-        SECRET_FULL_LEN => OtpSecret::from_bytes(secret[..SECRET_LEN].to_vec()),
+        SECRET_FULL_LEN => {
+            if secret_checksum(secret) != stored_checksum(secret) {
+                return Err(Error::YandexSecretChecksum);
+            }
+            OtpSecret::from_bytes(secret[..SECRET_LEN].to_vec())
+        }
         len => Err(Error::YandexSecretLength { len }),
     }
 }
@@ -496,6 +552,75 @@ mod tests {
                     Err(Error::YandexSecretLength { len: reported }) if reported == len
                 ),
                 "length {len} must be rejected"
+            );
+        }
+    }
+
+    /// The four samples the reference implementation publishes for secret validation: a
+    /// 26-byte secret with a valid checksum, a 16-byte one without a checksum, a 26-byte one
+    /// whose first character was changed (so the checksum no longer matches) and one of a
+    /// length that is not a Yandex secret at all.
+    #[test]
+    fn published_secret_samples_are_accepted_or_rejected() {
+        assert_eq!(
+            secret_from_base32("LA2V6KMCGYMWWVEW64RNP3JA3IAAAAAAHTSG4HRZPI").len(),
+            SECRET_LEN
+        );
+        assert_eq!(
+            secret_from_base32("LA2V6KMCGYMWWVEW64RNP3JA3I").len(),
+            SECRET_LEN
+        );
+
+        let corrupted =
+            crate::base32::decode("AA2V6KMCGYMWWVEW64RNP3JA3IAAAAAAHTSG4HRZPI").expect("Base32");
+        assert!(matches!(
+            normalize_secret(corrupted.expose_secret()),
+            Err(Error::YandexSecretChecksum)
+        ));
+
+        let wrong_length = crate::base32::decode("AA2V6KMCGJA3IAAAAAAHTSG4HRZPI").expect("Base32");
+        assert!(matches!(
+            normalize_secret(wrong_length.expose_secret()),
+            Err(Error::YandexSecretLength { len: 18 })
+        ));
+    }
+
+    /// The checksum values the published samples carry.
+    ///
+    /// Pinned so that a change to the polynomial or to the bit order shows up as a value
+    /// change rather than as a puzzling rejection somewhere else.
+    #[test]
+    fn checksum_values_of_the_published_samples() {
+        for (encoded, expected) in [
+            ("LA2V6KMCGYMWWVEW64RNP3JA3IAAAAAAHTSG4HRZPI", 0x097a_u16),
+            ("6SB2IKNM6OBZPAVBVTOHDKS4FAAAAAAADFUTQMBTRY", 0x038e),
+            ("JBGSAU4G7IEZG6OY4UAXX62JU4AAAAAAHTSG4HXU3M", 0x04db),
+        ] {
+            let raw = crate::base32::decode(encoded).expect("Base32");
+            let raw = raw.expose_secret();
+            assert_eq!(raw.len(), SECRET_FULL_LEN, "{encoded}");
+            assert_eq!(secret_checksum(raw), expected, "{encoded}");
+            assert_eq!(stored_checksum(raw), expected, "{encoded}");
+        }
+    }
+
+    /// A polynomial remainder whose polynomial has a non-zero constant term detects **every**
+    /// single-bit error, so no single flipped bit of the secret can slip through the check.
+    #[test]
+    fn every_single_bit_flip_in_the_data_is_detected() {
+        let raw =
+            crate::base32::decode("LA2V6KMCGYMWWVEW64RNP3JA3IAAAAAAHTSG4HRZPI").expect("Base32");
+        let original = raw.expose_secret().to_vec();
+        assert!(normalize_secret(&original).is_ok());
+
+        // Every bit that takes part in the checksum, that is, everything before the trailing
+        // twelve bits.
+        for bit in 0..(original.len() * 8 - CHECKSUM_BITS) {
+            let mut damaged = original.clone();
+            damaged[bit / 8] ^= 1 << (7 - bit % 8);
+            assert!(
+                matches!(normalize_secret(&damaged), Err(Error::YandexSecretChecksum)),
+                "flipping data bit {bit} was not detected"
             );
         }
     }
