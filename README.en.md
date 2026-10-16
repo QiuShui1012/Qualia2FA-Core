@@ -15,7 +15,7 @@ reuse it as an independent project.
 | Item | Value |
 |---|---|
 | Crate name | `qualia2fa-core` |
-| Version | `0.1.1` |
+| Version | `0.2.0` |
 | Type | pure library crate |
 | Edition | 2024 |
 | MSRV | **1.89** |
@@ -24,7 +24,9 @@ reuse it as an independent project.
 
 Implemented: HOTP (RFC 4226), TOTP (RFC 6238), mOTP, Yandex OTP, Steam Guard, Base32
 (RFC 4648, in both lenient and strict modes), URI parsing and serialization (`otpauth://`
-and Aegis's `motp:` form), the encrypted vault (local storage format), recovery keys,
+and Aegis's `motp:` form), the encrypted vault (local storage format), **groups and
+orderings (including their synchronization and conflict adjudication)**, **importing from
+Aegis's JSON / HTML / TEXT exports (encrypted exports included)**, recovery keys,
 challenge-response authentication, device pairing, sync payloads and merging, plus the
 transport-layer protocol.
 
@@ -32,7 +34,7 @@ transport-layer protocol.
 
 ```toml
 [dependencies]
-qualia2fa-core = "0.1"
+qualia2fa-core = "0.2"
 ```
 
 Computing a code:
@@ -124,6 +126,34 @@ A few things worth knowing:
   deliberate trade-off: hiding it would take padding to fixed-size blocks at several times
   the file size.
 
+## Compatibility
+
+**Vault format version: 3.** 0.2.0 always writes version 3, and still reads version 1 and
+version 2 files (the readable set only grows). An older application reading a version 3 file
+gets a clear "unsupported version" error; **the one exception** is the version 1 parser,
+which reports trailing bytes (the 32-byte master key check value looks like extra content to
+it).
+
+**Sync payload version: 3.** A payload only accepts the current version, so **any sync
+between 0.1.x and 0.2.0 fails**, with a version error rather than an authentication failure
+(the version sits in the cleartext header, so it is readable without the key). Both devices
+have to be upgraded together, which is deliberate: without the version bump an older device
+would read an mOTP entry as an ordinary TOTP and silently lose the PIN and the step.
+
+Importing another authenticator's export:
+
+```rust
+use qualia2fa_core::import::{self, ImportFormat};
+
+// Bytes in, a report out: this library does no I/O and reads no clock
+let report = import::import(&bytes, ImportFormat::Json, now, None)?;
+for entry in &report.entries {
+    println!("{}", entry.entry.name);
+}
+// Compared against the vault: what is new, what is already there, what needs a human
+let matches = import::apply::compare(&report, &vault);
+```
+
 ## Design conventions
 
 ### No I/O, no clock
@@ -198,7 +228,7 @@ submodule and no path dependency pointing at an upstream directory is needed.
 
 ```toml
 [dependencies]
-qualia2fa-core = "0.1"
+qualia2fa-core = "0.2"
 ```
 
 > ⚠️ If you use **Gobley + uniffi** for Kotlin bindings, note that Gobley currently

@@ -25,6 +25,34 @@ the release notes and in the commit that fixes the issue.
 
 In scope: the code in this repository, and the way it uses its dependencies.
 
+## Reading an export from another authenticator
+
+The importer takes a file the user picked and treats every byte of it as attacker-controlled:
+lengths, nesting, digit counts, secrets, key derivation parameters. What bounds that surface, and
+what a reader has to hold to:
+
+- **The size is compared before anything is allocated or parsed**, and so is the JSON nesting
+  depth, which is scanned out of the bytes before they reach a parser that recurses. A stack
+  overflow is not a catchable error, so it is refused rather than survived.
+- **Every number that decides a cost is bounded before it is used.** The key derivation
+  parameters come from the file and drive an allocation proportional to them; the memory a file
+  asks for is computed and refused before the derivation runs. The reference implementation of
+  that format does not bound them.
+- **Only password-protected key slots are opened.** This library has no platform key store and no
+  biometric prompt, so an export locked to the device that wrote it is reported as unsupported
+  rather than as a wrong password.
+- **Base64 and hexadecimal are decoded strictly.** A decoder that tolerates extra padding or
+  stray characters turns a modified file into a shorter one, and the result then authenticates as
+  a different message.
+- **Nothing read from the file reaches an error message.** Problem lists carry a position and a
+  phrase; the secret, the PIN and the passphrase never appear in one. That path is
+  `import::mapping::safe_reason`, and it deliberately does not use `Display`, because several of
+  this crate's errors quote the value that was wrong.
+
+`tinyjson` reads the JSON export, `aes-gcm` and `scrypt` open an encrypted one. They are used for
+reading only: the vault and the sync payload keep this project's own constructions, and neither
+dependency appears in anything this library writes.
+
 ## MD5 is used for one thing only
 
 mOTP is defined as `MD5(counter || secret || pin)` truncated to six hexadecimal characters, so

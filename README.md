@@ -13,7 +13,7 @@ Qualia2FA 的核心库。承载双因素认证（2FA）的全部核心逻辑：T
 | 项 | 值 |
 |---|---|
 | Crate 名 | `qualia2fa-core` |
-| 版本 | `0.1.1` |
+| 版本 | `0.2.0` |
 | 类型 | 纯 library crate |
 | Edition | 2024 |
 | MSRV | **1.89** |
@@ -22,14 +22,15 @@ Qualia2FA 的核心库。承载双因素认证（2FA）的全部核心逻辑：T
 
 已实现：HOTP（RFC 4226）、TOTP（RFC 6238）、mOTP、Yandex OTP、Steam Guard、Base32
 （RFC 4648，宽容与严格两种模式）、URI 解析与序列化（`otpauth://` 与 Aegis 的 `motp:`）、
-加密保险库（本地存储格式）、恢复密钥、挑战-应答认证、设备配对、同步载荷与合并，
-以及传输层协议。
+加密保险库（本地存储格式）、**分组与排序（含同步与冲突裁决）**、**从 Aegis 的
+JSON / HTML / TXT 导出导入（加密导出也能开）**、恢复密钥、挑战-应答认证、设备配对、
+同步载荷与合并，以及传输层协议。
 
 ## 用法
 
 ```toml
 [dependencies]
-qualia2fa-core = "0.1"
+qualia2fa-core = "0.2"
 ```
 
 计算验证码：
@@ -112,6 +113,32 @@ for (id, entry) in file.vault().iter() {
 - 密文长度会泄露备注、账号名的**长短**。这是已知的、有意的取舍：掩盖它需要填充
   到定长块，代价是文件变大数倍。
 
+## 兼容性
+
+**保险库文件格式版本：3。** 0.2.0 一律写版本 3，并且仍然能读版本 1 与版本 2 的文件
+（可读版本只增不减）。老版本应用读到版本 3 的文件会得到一个明确的「版本不支持」错误；
+**唯一的例外**是版本 1 的解析器，它报的是文件尾部有多余内容（那 32 字节的主密钥检查值
+在它看来就是多余内容）。
+
+**同步载荷版本：3。** 载荷只接受当前版本，因此 **0.1.x 与 0.2.0 之间的任何同步都会
+失败**，报的是版本错误而不是认证失败（版本号在明文头部，不需要密钥就能读到）。
+两端必须一起升级——这是刻意的：不抬版本号的话，老版本会把 mOTP 条目读成一条普通 TOTP，
+PIN 与步长在往返里静默丢失。
+
+导入另一款认证器的导出：
+
+```rust
+use qualia2fa_core::import::{self, ImportFormat};
+
+// 字节进、报告出：本库不做 I/O，也不读时钟
+let report = import::import(&bytes, ImportFormat::Json, now, None)?;
+for entry in &report.entries {
+    println!("{}", entry.entry.name);
+}
+// 与已有保险库比对：哪些是新的、哪些已经有了、哪些要人来定
+let matches = import::apply::compare(&report, &vault);
+```
+
 ## 设计约定
 
 ### 无 I/O、无时钟
@@ -175,7 +202,7 @@ Unix 秒传入。** 这不是洁癖：只有时间作为参数传入，RFC 6238 
 
 ```toml
 [dependencies]
-qualia2fa-core = "0.1"
+qualia2fa-core = "0.2"
 ```
 
 > ⚠️ 若你用 **Gobley + uniffi** 做 Kotlin 绑定，注意 Gobley 当前强制
