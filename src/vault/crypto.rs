@@ -387,6 +387,12 @@ pub(crate) enum RecordKind {
     Entry,
     /// A tombstone (vault file).
     Tombstone,
+    /// A group with its ordering (vault file).
+    ///
+    /// Added in format version 3. Its identifier occupies the same 16-byte field as an entry
+    /// identifier and takes part in the AAD through this kind byte, so a group record can never
+    /// be read as an entry.
+    Group,
     /// A live entry, found in a **sync payload**.
     SyncEntry,
     /// A tombstone, found in a **sync payload**.
@@ -402,6 +408,7 @@ impl RecordKind {
         match self {
             Self::Entry => 0x01,
             Self::Tombstone => 0x02,
+            Self::Group => 0x03,
             Self::SyncEntry => 0x81,
             Self::SyncTombstone => 0x82,
         }
@@ -420,6 +427,7 @@ impl RecordKind {
         match byte {
             0x01 => Some(Self::Entry),
             0x02 => Some(Self::Tombstone),
+            0x03 => Some(Self::Group),
             _ => None,
         }
     }
@@ -472,10 +480,14 @@ const AAD_LEN: usize = 1 + EntryId::LEN + 1;
 /// The layout is a fixed-length byte string rather than a self-describing encoding, so it
 /// is easy to check byte by byte, and it evolves together with
 /// [`crate::vault::FORMAT_VERSION`].
-pub(crate) fn build_aad(kind: RecordKind, entry_id: &EntryId, format_version: u8) -> [u8; AAD_LEN] {
+pub(crate) fn build_aad(
+    kind: RecordKind,
+    record_id: &[u8; EntryId::LEN],
+    format_version: u8,
+) -> [u8; AAD_LEN] {
     let mut aad = [0_u8; AAD_LEN];
     aad[0] = kind.as_byte();
-    aad[1..1 + EntryId::LEN].copy_from_slice(entry_id.as_bytes());
+    aad[1..1 + EntryId::LEN].copy_from_slice(record_id);
     aad[AAD_LEN - 1] = format_version;
     aad
 }
@@ -495,12 +507,12 @@ pub(crate) fn build_aad(kind: RecordKind, entry_id: &EntryId, format_version: u8
 pub(crate) fn seal(
     master: &MasterKey,
     kind: RecordKind,
-    entry_id: &EntryId,
+    record_id: &[u8; EntryId::LEN],
     format_version: u8,
     plaintext: &[u8],
 ) -> Result<(Nonce, Vec<u8>)> {
     let key = entry_key(master)?;
-    seal_with_key(&key, kind, entry_id, format_version, plaintext)
+    seal_with_key(&key, kind, record_id, format_version, plaintext)
 }
 
 /// Encrypts with a subkey that is **already derived**.
@@ -517,13 +529,13 @@ pub(crate) fn seal(
 pub(crate) fn seal_with_key(
     key: &[u8; 32],
     kind: RecordKind,
-    entry_id: &EntryId,
+    record_id: &[u8; EntryId::LEN],
     format_version: u8,
     plaintext: &[u8],
 ) -> Result<(Nonce, Vec<u8>)> {
     let cipher = XChaCha20Poly1305::new(&Key::from(*key));
     let nonce = random_nonce()?;
-    let aad = build_aad(kind, entry_id, format_version);
+    let aad = build_aad(kind, record_id, format_version);
     let mut buffer = plaintext.to_vec();
     cipher
         .encrypt_in_place(&XNonce::from(nonce), &aad, &mut buffer)
@@ -543,13 +555,13 @@ pub(crate) fn seal_with_key(
 pub(crate) fn open(
     master: &MasterKey,
     kind: RecordKind,
-    entry_id: &EntryId,
+    record_id: &[u8; EntryId::LEN],
     format_version: u8,
     nonce: &Nonce,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>> {
     let key = entry_key(master)?;
-    open_with_key(&key, kind, entry_id, format_version, nonce, ciphertext)
+    open_with_key(&key, kind, record_id, format_version, nonce, ciphertext)
 }
 
 /// Decrypts with a subkey that is **already derived**. Same reasoning as
@@ -562,13 +574,13 @@ pub(crate) fn open(
 pub(crate) fn open_with_key(
     key: &[u8; 32],
     kind: RecordKind,
-    entry_id: &EntryId,
+    record_id: &[u8; EntryId::LEN],
     format_version: u8,
     nonce: &Nonce,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(&Key::from(*key));
-    let aad = build_aad(kind, entry_id, format_version);
+    let aad = build_aad(kind, record_id, format_version);
     let mut buffer = ciphertext.to_vec();
     cipher
         .decrypt_in_place(&XNonce::from(*nonce), &aad, &mut buffer)
@@ -664,7 +676,7 @@ mod tests {
         let plaintext = b"the quick brown fox";
 
         let (nonce, ciphertext) =
-            seal(&k, RecordKind::Entry, &id, 1, plaintext).expect("sealing succeeds");
+            seal(&k, RecordKind::Entry, id.as_bytes(), 1, plaintext).expect("sealing succeeds");
         assert_eq!(ciphertext.len(), plaintext.len() + TAG_LEN);
         assert_ne!(
             &ciphertext[..plaintext.len()],
@@ -672,8 +684,8 @@ mod tests {
             "the ciphertext equals the plaintext"
         );
 
-        let opened =
-            open(&k, RecordKind::Entry, &id, 1, &nonce, &ciphertext).expect("opening succeeds");
+        let opened = open(&k, RecordKind::Entry, id.as_bytes(), 1, &nonce, &ciphertext)
+            .expect("opening succeeds");
         assert_eq!(opened, plaintext);
     }
 
@@ -683,8 +695,10 @@ mod tests {
     fn each_seal_uses_a_fresh_nonce() {
         let k = key();
         let id = EntryId::generate().expect("OS randomness available");
-        let (n1, _) = seal(&k, RecordKind::Entry, &id, 1, b"same").expect("sealing succeeds");
-        let (n2, _) = seal(&k, RecordKind::Entry, &id, 1, b"same").expect("sealing succeeds");
+        let (n1, _) =
+            seal(&k, RecordKind::Entry, id.as_bytes(), 1, b"same").expect("sealing succeeds");
+        let (n2, _) =
+            seal(&k, RecordKind::Entry, id.as_bytes(), 1, b"same").expect("sealing succeeds");
         assert_ne!(n1, n2, "two encryptions reused a nonce");
     }
 
@@ -694,8 +708,10 @@ mod tests {
     fn ciphertext_is_not_deterministic() {
         let k = key();
         let id = EntryId::generate().expect("OS randomness available");
-        let (_, c1) = seal(&k, RecordKind::Entry, &id, 1, b"same").expect("sealing succeeds");
-        let (_, c2) = seal(&k, RecordKind::Entry, &id, 1, b"same").expect("sealing succeeds");
+        let (_, c1) =
+            seal(&k, RecordKind::Entry, id.as_bytes(), 1, b"same").expect("sealing succeeds");
+        let (_, c2) =
+            seal(&k, RecordKind::Entry, id.as_bytes(), 1, b"same").expect("sealing succeeds");
         assert_ne!(c1, c2);
     }
 
@@ -704,8 +720,15 @@ mod tests {
     fn wrong_master_key_fails() {
         let id = EntryId::generate().expect("OS randomness available");
         let (nonce, ciphertext) =
-            seal(&key(), RecordKind::Entry, &id, 1, b"secret").expect("sealing succeeds");
-        let err = open(&key(), RecordKind::Entry, &id, 1, &nonce, &ciphertext);
+            seal(&key(), RecordKind::Entry, id.as_bytes(), 1, b"secret").expect("sealing succeeds");
+        let err = open(
+            &key(),
+            RecordKind::Entry,
+            id.as_bytes(),
+            1,
+            &nonce,
+            &ciphertext,
+        );
         assert!(matches!(err, Err(Error::VaultDecryptionFailed)));
     }
 
@@ -717,11 +740,11 @@ mod tests {
         let a = EntryId::generate().expect("OS randomness available");
         let b = EntryId::generate().expect("OS randomness available");
         let (nonce, ciphertext) =
-            seal(&k, RecordKind::Entry, &a, 1, b"payload").expect("sealing succeeds");
+            seal(&k, RecordKind::Entry, a.as_bytes(), 1, b"payload").expect("sealing succeeds");
 
-        assert!(open(&k, RecordKind::Entry, &a, 1, &nonce, &ciphertext).is_ok());
+        assert!(open(&k, RecordKind::Entry, a.as_bytes(), 1, &nonce, &ciphertext).is_ok());
 
-        let err = open(&k, RecordKind::Entry, &b, 1, &nonce, &ciphertext);
+        let err = open(&k, RecordKind::Entry, b.as_bytes(), 1, &nonce, &ciphertext);
         assert!(
             matches!(err, Err(Error::VaultDecryptionFailed)),
             "the ciphertext was moved to another entry yet still opens"
@@ -736,12 +759,32 @@ mod tests {
         let id = EntryId::generate().expect("OS randomness available");
 
         let (nonce, ciphertext) =
-            seal(&k, RecordKind::Entry, &id, 1, b"payload").expect("sealing succeeds");
-        assert!(open(&k, RecordKind::Tombstone, &id, 1, &nonce, &ciphertext).is_err());
+            seal(&k, RecordKind::Entry, id.as_bytes(), 1, b"payload").expect("sealing succeeds");
+        assert!(
+            open(
+                &k,
+                RecordKind::Tombstone,
+                id.as_bytes(),
+                1,
+                &nonce,
+                &ciphertext
+            )
+            .is_err()
+        );
 
-        let (nonce2, ciphertext2) =
-            seal(&k, RecordKind::Tombstone, &id, 1, b"payload").expect("sealing succeeds");
-        assert!(open(&k, RecordKind::Entry, &id, 1, &nonce2, &ciphertext2).is_err());
+        let (nonce2, ciphertext2) = seal(&k, RecordKind::Tombstone, id.as_bytes(), 1, b"payload")
+            .expect("sealing succeeds");
+        assert!(
+            open(
+                &k,
+                RecordKind::Entry,
+                id.as_bytes(),
+                1,
+                &nonce2,
+                &ciphertext2
+            )
+            .is_err()
+        );
     }
 
     /// Ciphertext must not move between format versions.
@@ -750,8 +793,8 @@ mod tests {
         let k = key();
         let id = EntryId::generate().expect("OS randomness available");
         let (nonce, ciphertext) =
-            seal(&k, RecordKind::Entry, &id, 1, b"payload").expect("sealing succeeds");
-        assert!(open(&k, RecordKind::Entry, &id, 2, &nonce, &ciphertext).is_err());
+            seal(&k, RecordKind::Entry, id.as_bytes(), 1, b"payload").expect("sealing succeeds");
+        assert!(open(&k, RecordKind::Entry, id.as_bytes(), 2, &nonce, &ciphertext).is_err());
     }
 
     /// **Flipping any single byte of the ciphertext, the nonce or the tag must fail.**
@@ -764,12 +807,12 @@ mod tests {
         let id = EntryId::generate().expect("OS randomness available");
         let plaintext = b"0123456789abcdef0123456789abcdef";
         let (nonce, ciphertext) =
-            seal(&k, RecordKind::Entry, &id, 1, plaintext).expect("sealing succeeds");
+            seal(&k, RecordKind::Entry, id.as_bytes(), 1, plaintext).expect("sealing succeeds");
 
         for index in 0..ciphertext.len() {
             let mut tampered = ciphertext.clone();
             tampered[index] ^= 0x01;
-            let err = open(&k, RecordKind::Entry, &id, 1, &nonce, &tampered);
+            let err = open(&k, RecordKind::Entry, id.as_bytes(), 1, &nonce, &tampered);
             assert!(
                 matches!(err, Err(Error::VaultDecryptionFailed)),
                 "ciphertext byte {index} was flipped yet still authenticates"
@@ -779,7 +822,14 @@ mod tests {
         for index in 0..NONCE_LEN {
             let mut tampered = nonce;
             tampered[index] ^= 0x01;
-            let err = open(&k, RecordKind::Entry, &id, 1, &tampered, &ciphertext);
+            let err = open(
+                &k,
+                RecordKind::Entry,
+                id.as_bytes(),
+                1,
+                &tampered,
+                &ciphertext,
+            );
             assert!(
                 matches!(err, Err(Error::VaultDecryptionFailed)),
                 "nonce byte {index} was flipped yet still authenticates"
@@ -792,24 +842,44 @@ mod tests {
     #[test]
     fn aad_layout_is_stable() {
         let id = EntryId::from_bytes([0xAB; EntryId::LEN]);
-        let aad = build_aad(RecordKind::Entry, &id, 1);
+        let aad = build_aad(RecordKind::Entry, id.as_bytes(), 1);
         assert_eq!(aad.len(), AAD_LEN);
         assert_eq!(aad[0], 0x01, "kind byte");
         assert_eq!(&aad[1..17], &[0xAB; 16], "entry_id must follow immediately");
         assert_eq!(aad[17], 1, "the format version must be the last byte");
 
-        assert_eq!(build_aad(RecordKind::Tombstone, &id, 7)[0], 0x02);
-        assert_eq!(build_aad(RecordKind::Tombstone, &id, 7)[17], 7);
+        assert_eq!(build_aad(RecordKind::Tombstone, id.as_bytes(), 7)[0], 0x02);
+        assert_eq!(build_aad(RecordKind::Tombstone, id.as_bytes(), 7)[17], 7);
     }
 
     /// Kind bytes must round-trip and unknown values must be rejected.
+    ///
+    /// The bytes are written out literally: they are part of the AAD, so changing one makes
+    /// every existing ciphertext of that kind undecryptable, and this test has to fail rather
+    /// than follow the constant.
     #[test]
     fn record_kind_byte_roundtrips_and_rejects_unknown() {
-        for kind in [RecordKind::Entry, RecordKind::Tombstone] {
-            assert_eq!(RecordKind::from_byte(kind.as_byte()), Some(kind));
+        for (kind, byte) in [
+            (RecordKind::Entry, 0x01),
+            (RecordKind::Tombstone, 0x02),
+            (RecordKind::Group, 0x03),
+        ] {
+            assert_eq!(
+                kind.as_byte(),
+                byte,
+                "the file-format kind bytes are a contract"
+            );
+            assert_eq!(RecordKind::from_byte(byte), Some(kind));
         }
-        for unknown in [0_u8, 3, 0xFF] {
+        for unknown in [0_u8, 4, 0xFF] {
             assert_eq!(RecordKind::from_byte(unknown), None);
+        }
+        for sync in [RecordKind::SyncEntry, RecordKind::SyncTombstone] {
+            assert_eq!(
+                RecordKind::from_byte(sync.as_byte()),
+                None,
+                "a sync kind must never be accepted inside a vault file"
+            );
         }
     }
 
@@ -819,14 +889,14 @@ mod tests {
         let k = key();
         let id = EntryId::generate().expect("OS randomness available");
         let (nonce, ciphertext) =
-            seal(&k, RecordKind::Entry, &id, 1, b"").expect("sealing succeeds");
+            seal(&k, RecordKind::Entry, id.as_bytes(), 1, b"").expect("sealing succeeds");
         assert_eq!(
             ciphertext.len(),
             TAG_LEN,
             "empty plaintext leaves only the tag"
         );
-        let opened =
-            open(&k, RecordKind::Entry, &id, 1, &nonce, &ciphertext).expect("opening succeeds");
+        let opened = open(&k, RecordKind::Entry, id.as_bytes(), 1, &nonce, &ciphertext)
+            .expect("opening succeeds");
         assert!(opened.is_empty());
     }
 
@@ -836,11 +906,11 @@ mod tests {
         let k = key();
         let id = EntryId::generate().expect("OS randomness available");
         let (nonce, ciphertext) =
-            seal(&k, RecordKind::Entry, &id, 1, b"payload").expect("sealing succeeds");
+            seal(&k, RecordKind::Entry, id.as_bytes(), 1, b"payload").expect("sealing succeeds");
 
         for cut in 1..=ciphertext.len() {
             let truncated = &ciphertext[..ciphertext.len() - cut];
-            let err = open(&k, RecordKind::Entry, &id, 1, &nonce, truncated);
+            let err = open(&k, RecordKind::Entry, id.as_bytes(), 1, &nonce, truncated);
             assert!(
                 matches!(err, Err(Error::VaultDecryptionFailed)),
                 "truncating {cut} bytes still authenticates"

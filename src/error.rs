@@ -457,6 +457,56 @@ pub enum Error {
     #[error("no such entry in the vault")]
     VaultEntryNotFound,
 
+    /// A vault file holds two group records with the same identifier.
+    ///
+    /// Refused rather than treated as an overwrite, for the same reason as
+    /// [`Error::VaultDuplicateEntryId`]: one of the two orderings would be dropped silently, and
+    /// an ordering that disappears takes the user's arrangement with it.
+    #[error("the vault holds two groups with the same identifier")]
+    VaultDuplicateGroupId,
+
+    /// No group with that identifier exists.
+    #[error("no such group in the vault")]
+    VaultGroupNotFound,
+
+    /// An ordering names an entry the vault does not hold.
+    ///
+    /// Rejected when **setting** an ordering: the caller passes identifiers, and one that names
+    /// nothing means the caller is out of step with the vault. When **reading** a file, a
+    /// reference to a missing entry is skipped instead - there the caller is a peer device and
+    /// the entries may simply not have arrived yet.
+    #[error("an ordering names an entry the vault does not hold")]
+    VaultGroupUnknownEntry,
+
+    /// The top group cannot be renamed, removed or reordered.
+    ///
+    /// It is the collection of the entries that belong to no named group: it is pinned at the
+    /// top of the interface and has no name to edit, so every operation that would change what
+    /// it *is* is refused rather than silently ignored. Its contents (the ordering) remain
+    /// editable, which is the whole point of it being a group.
+    #[error("the top group cannot be renamed, removed or reordered")]
+    VaultTopGroupImmutable,
+
+    /// One group holds more identifiers than the format can carry.
+    ///
+    /// The list travels in a single length-prefixed node, so it is bounded by
+    /// [`Error::FieldTooLong`]'s limit divided by the identifier length.
+    #[error("a group holds {actual} entries, at most {limit} fit in the format")]
+    VaultGroupTooManyEntries {
+        /// The maximum the format allows.
+        limit: usize,
+        /// How many were supplied.
+        actual: usize,
+    },
+
+    /// One entry holds two positions in the same ordering.
+    ///
+    /// A list is a **sequence**: the same entry cannot come both before and after another one.
+    /// Two different groups holding the same entry is a different question, and the vault
+    /// answers it by moving the entry instead of refusing.
+    #[error("an entry appears twice in the same ordering")]
+    VaultGroupDuplicateEntry,
+
     /// The plaintext structure of a vault entry contains a duplicated field node.
     ///
     /// Implementations disagree on whether the first or the last occurrence wins: a classic

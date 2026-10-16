@@ -158,7 +158,8 @@ fn seal_plaintext(
     id: &EntryId,
     plaintext: &[u8],
 ) -> Result<Record> {
-    let (nonce, ciphertext) = crypto::seal_with_key(key, kind, id, FORMAT_VERSION, plaintext)?;
+    let (nonce, ciphertext) =
+        crypto::seal_with_key(key, kind, id.as_bytes(), FORMAT_VERSION, plaintext)?;
     Ok(Record {
         entry_id: *id,
         nonce,
@@ -223,7 +224,7 @@ fn try_open_as(key: &[u8; 32], kind: InnerRecordKind, record: &Record) -> Result
     let plaintext = crypto::open_with_key(
         key,
         kind,
-        &record.entry_id,
+        record.entry_id.as_bytes(),
         FORMAT_VERSION,
         &record.nonce,
         &record.ciphertext,

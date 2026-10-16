@@ -32,14 +32,14 @@
 //! is). Hiding it would take padding to fixed-size blocks at several times the file
 //! size. That is not done today: a known, deliberate trade-off.
 //!
-//! # File format v2
+//! # File format v3
 //!
 //! All integers are **big-endian**. Layout:
 //!
 //! ```text
 //! Offset    Length  Content
 //! 0         8       magic "Q2FAVLT\0"
-//! 8         1       format version (currently 2)
+//! 8         1       format version (currently 3)
 //! 9         1       reserved byte (must be 0; a non-zero value is rejected so a
 //!                   future extension cannot be misread as an old file)
 //! 10        4       record count (big-endian u32)
@@ -51,7 +51,7 @@
 //!
 //! ```text
 //! Offset    Length  Content
-//! 0         1       record kind (1 = live entry, 2 = tombstone)
+//! 0         1       record kind (1 = live entry, 2 = tombstone, 3 = group)
 //! 1         16      entry ID
 //! 17        24      XChaCha20-Poly1305 nonce
 //! 41        4       ciphertext length (big-endian u32)
@@ -91,6 +91,22 @@
 //! written by every file this build produces, and a version 3 file that happens to contain
 //! only TOTP/HOTP entries differs from a version 2 file in nothing but that number.
 //!
+//! # Groups and orderings
+//!
+//! A group is a **record of its own** (kind 3) holding a name, a position and the ordered list
+//! of the identifiers it contains. The list *is* the order: the sequence number of an entry is
+//! its index there, so reordering rewrites one record and touches no entry. The entries that
+//! belong to no named group are the **top group**, which is a group like any other with the
+//! reserved identifier [`GroupId::TOP`] - it is what makes "the rest" sortable, and it is why a
+//! file written before groups existed still reads as a definite order (the order its entry
+//! records appear in).
+//!
+//! **Synchronization does not transport group records yet.** Payloads carry entries and
+//! tombstones, so a peer receiving a vault receives the entries and puts them in its own top
+//! group: the grouping and the order stay local to the device that has them. Two devices
+//! therefore converge on **content** and not on arrangement, which the interface must not
+//! present as agreement.
+//!
 //! # Where the key comes from
 //!
 //! The file **does not contain** the master key, but it **does contain a value
@@ -106,12 +122,14 @@
 mod codec;
 pub(crate) mod crypto;
 mod entry;
+mod group;
 
 pub use crypto::{
     KEY_CHECK_LEN, MASTER_KEY_LEN, MasterKey, NONCE_LEN, TAG_LEN, key_check, master_key_to_bytes,
     verify_key_check,
 };
 pub use entry::{Entry, EntryId, EntryKind, Timestamp, entry_from_parsed_uri};
+pub use group::{Group, GroupId};
 
 pub(crate) use crypto::RecordKind;
 
@@ -248,15 +266,23 @@ mod tag {
     pub(super) const MOTP_PIN: u8 = 0x0F;
     /// Yandex OTP PIN (UTF-8 text).
     pub(super) const YANDEX_PIN: u8 = 0x10;
-
-    /// Highest tag this version knows.
+    /// Position of a group among the named groups (u32).
     ///
-    /// A node whose tag is at or below this one is a **known** field, so a repeat is a
-    /// malformed entry rather than forward compatibility; anything above it is skipped, which is
-    /// what lets a newer version add fields. Named here so the duplicate check cannot drift
-    /// away from the tag list above, and kept at 0x10 so it still fits the bitmap of
-    /// [`decode_entry`] without an over-wide shift.
-    pub(super) const KNOWN_TAG_MAX: u8 = YANDEX_PIN;
+    /// Only meaningful inside a **group** record.
+    pub(super) const GROUP_ORDER: u8 = 0x11;
+    /// The ordering of a group: its entry identifiers, concatenated (16 bytes each).
+    pub(super) const ENTRY_IDS: u8 = 0x12;
+
+    /// Highest tag an **entry** may carry that this version knows.
+    ///
+    /// Kept separate from [`tag::GROUP_TAG_MAX`] on purpose: the two record kinds are parsed by
+    /// different functions, and a tag only a group record uses must stay "unknown" to the entry
+    /// parser, so that a future version may repeat it there without an older build refusing the
+    /// file.
+    pub(super) const ENTRY_TAG_MAX: u8 = YANDEX_PIN;
+
+    /// Highest tag a **group** record may carry that this version knows.
+    pub(super) const GROUP_TAG_MAX: u8 = ENTRY_IDS;
 
     /// Value of the algorithm field.
     pub(super) const ALG_SHA1: u8 = 1;
@@ -326,6 +352,11 @@ pub struct Vault {
     entries: BTreeMap<EntryId, VaultEntry>,
     /// Tombstones, ordered by ID.
     tombstones: BTreeMap<EntryId, Tombstone>,
+    /// Groups, ordered by identifier.
+    ///
+    /// Their **display** order is [`Group::group_order`], not the map order; the top group
+    /// ([`GroupId::TOP`]) comes first by definition.
+    groups: BTreeMap<GroupId, Group>,
 }
 
 impl Vault {
@@ -384,6 +415,7 @@ impl Vault {
         let id = EntryId::generate()?;
         self.tombstones.remove(&id);
         self.entries.insert(id, entry);
+        self.top_group_mut().entry_ids.push(id);
         Ok(id)
     }
 
@@ -404,6 +436,34 @@ impl Vault {
             return Err(Error::VaultDuplicateEntryId);
         }
         self.entries.insert(id, entry);
+        self.top_group_mut().entry_ids.push(id);
+        Ok(())
+    }
+
+    /// Inserts an entry **without touching any ordering**.
+    ///
+    /// For the parser only: the group records may come after the entry records in the file, so
+    /// the orderings are decided once everything has been read (see
+    /// `reconcile_groups`); a membership built here would only be undone there.
+    fn insert_parsed(&mut self, id: EntryId, entry: VaultEntry) -> Result<()> {
+        if self.entries.contains_key(&id) {
+            return Err(Error::VaultDuplicateEntryId);
+        }
+        self.entries.insert(id, entry);
+        Ok(())
+    }
+
+    /// Inserts a group under a given identifier. **For parsing an existing vault file only**
+    /// (the counterpart of [`Vault::insert_with_id`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::VaultDuplicateGroupId`] when the identifier is already taken.
+    pub fn insert_group_with_id(&mut self, id: GroupId, group: Group) -> Result<()> {
+        if self.groups.contains_key(&id) {
+            return Err(Error::VaultDuplicateGroupId);
+        }
+        self.groups.insert(id, group);
         Ok(())
     }
 
@@ -456,6 +516,7 @@ impl Vault {
     /// the UI. This library neither decides for it nor keeps it in memory any longer.
     pub fn remove(&mut self, id: &EntryId, now: Timestamp) -> Option<VaultEntry> {
         let removed = self.entries.remove(id)?;
+        self.detach_everywhere(id);
         self.tombstones.entry(*id).or_insert_with(|| Tombstone {
             entry_id: *id,
             deleted_at: now,
@@ -506,6 +567,341 @@ impl Vault {
     /// effect of the other.
     pub fn forget_tombstone(&mut self, id: &EntryId) -> Option<Tombstone> {
         self.tombstones.remove(id)
+    }
+}
+
+/// Groups and orderings.
+///
+/// # The membership invariant
+///
+/// **A live entry appears in at most one group's list.** Two lists naming the same entry would
+/// put it in two places at once, and the interface would have to pick one anyway; this type
+/// keeps the choice here, where it can be tested, instead of leaving it to each caller.
+/// [`Vault::set_ordering`] and [`Vault::assign_to_group`] therefore *move* an entry rather than
+/// copy it, and the parser repairs a file that violates the rule (see
+/// `reconcile_groups`).
+///
+/// # Every entry is somewhere
+///
+/// An entry that belongs to no named group sits in the **top group**, which is why
+/// [`Vault::insert`] appends it there. "In no group at all" is not a state: it would make the
+/// interface silently omit entries that exist.
+impl Vault {
+    /// Iterates the groups in display order: the top group first, then the named ones by
+    /// [`Group::group_order`], ties broken by identifier so that the order is deterministic.
+    pub fn groups(&self) -> impl Iterator<Item = (&GroupId, &Group)> {
+        let mut ordered: Vec<(&GroupId, &Group)> = self.groups.iter().collect();
+        ordered.sort_by_key(|(id, group)| (u8::from(!id.is_top()), group.group_order, **id));
+        ordered.into_iter()
+    }
+
+    /// Number of groups, the top group included when it exists.
+    #[must_use]
+    pub fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Returns a group by identifier.
+    #[must_use]
+    pub fn group(&self, id: &GroupId) -> Option<&Group> {
+        self.groups.get(id)
+    }
+
+    /// Returns the top group, when the vault has one.
+    ///
+    /// An empty vault has none: the group is created by the first insertion or by parsing a
+    /// file that holds entries.
+    #[must_use]
+    pub fn top_group(&self) -> Option<&Group> {
+        self.groups.get(&GroupId::TOP)
+    }
+
+    /// Returns the ordering of a group: the entry identifiers in display order.
+    #[must_use]
+    pub fn ordering(&self, id: &GroupId) -> Option<&[EntryId]> {
+        self.groups.get(id).map(|group| group.entry_ids.as_slice())
+    }
+
+    /// Returns the group an entry belongs to.
+    #[must_use]
+    pub fn group_of(&self, entry: &EntryId) -> Option<&GroupId> {
+        self.groups
+            .iter()
+            .find(|(_, group)| group.entry_ids.contains(entry))
+            .map(|(id, _)| id)
+    }
+
+    /// Iterates the entries of a group, in display order.
+    ///
+    /// Identifiers that name no live entry are skipped: a peer may hold an ordering that
+    /// mentions an entry this device does not have (yet), and the interface must show the rest
+    /// rather than nothing.
+    pub fn entries_in(&self, id: &GroupId) -> impl Iterator<Item = (&EntryId, &VaultEntry)> {
+        self.groups
+            .get(id)
+            .into_iter()
+            .flat_map(|group| group.entry_ids.iter())
+            .filter_map(|entry_id| self.entries.get(entry_id).map(|entry| (entry_id, entry)))
+    }
+
+    /// Creates a named group at the end of the order and returns its identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RandomnessUnavailable`] when the OS random source is unavailable, and
+    /// [`Error::FieldTooLong`] when the name is longer than
+    /// [`Entry::MAX_FIELD_LEN`].
+    pub fn create_group(&mut self, name: String) -> Result<GroupId> {
+        let id = GroupId::generate()?;
+        let order = self.next_group_order();
+        let group = Group::new(name, order, Vec::new())?;
+        self.groups.insert(id, group);
+        Ok(id)
+    }
+
+    /// Renames a group.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::VaultTopGroupImmutable`] for the top group (it has no name to edit),
+    /// [`Error::VaultGroupNotFound`] when there is no such group, and [`Error::FieldTooLong`]
+    /// when the name is too long.
+    pub fn rename_group(&mut self, id: &GroupId, name: String) -> Result<()> {
+        if id.is_top() {
+            return Err(Error::VaultTopGroupImmutable);
+        }
+        if name.len() > Entry::MAX_FIELD_LEN {
+            return Err(Error::FieldTooLong {
+                field: "group name",
+                limit: Entry::MAX_FIELD_LEN,
+                actual: name.len(),
+            });
+        }
+        let group = self.groups.get_mut(id).ok_or(Error::VaultGroupNotFound)?;
+        group.name = name;
+        Ok(())
+    }
+
+    /// Moves a named group to a position among the named groups and renumbers the rest.
+    ///
+    /// The position is clamped to the end, so "move to the bottom" needs no special case. The
+    /// orders are then reassigned as `0..n`, which keeps "the order of a group is the number it
+    /// carries" true instead of merely likely.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::VaultTopGroupImmutable`] for the top group (its position is fixed) and
+    /// [`Error::VaultGroupNotFound`] when there is no such group.
+    pub fn reorder_group(&mut self, id: &GroupId, position: usize) -> Result<()> {
+        if id.is_top() {
+            return Err(Error::VaultTopGroupImmutable);
+        }
+        if !self.groups.contains_key(id) {
+            return Err(Error::VaultGroupNotFound);
+        }
+
+        let mut named = self.named_group_ids();
+        let current = named
+            .iter()
+            .position(|candidate| candidate == id)
+            .ok_or(Error::VaultGroupNotFound)?;
+        let target = position.min(named.len().saturating_sub(1));
+        let moved = named.remove(current);
+        named.insert(target, moved);
+
+        for (order, group_id) in named.iter().enumerate() {
+            if let Some(group) = self.groups.get_mut(group_id) {
+                group.group_order =
+                    u32::try_from(order).map_err(|_| Error::VaultGroupTooManyEntries {
+                        limit: usize::try_from(u32::MAX).unwrap_or(usize::MAX),
+                        actual: order,
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes a group. The entries it held move to the top group, keeping their relative
+    /// order.
+    ///
+    /// They are **not** deleted: deleting entries because a grouping was removed would turn a
+    /// presentation choice into data loss.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::VaultTopGroupImmutable`] for the top group; `Ok(None)` when there is no
+    /// such group.
+    pub fn remove_group(&mut self, id: &GroupId) -> Result<Option<Group>> {
+        if id.is_top() {
+            return Err(Error::VaultTopGroupImmutable);
+        }
+        let Some(removed) = self.groups.remove(id) else {
+            return Ok(None);
+        };
+
+        for entry_id in &removed.entry_ids {
+            if self.entries.contains_key(entry_id) {
+                self.top_group_mut().entry_ids.push(*entry_id);
+            }
+        }
+        self.renumber_named_groups();
+        Ok(Some(removed))
+    }
+
+    /// Replaces the ordering of a group.
+    ///
+    /// The list **is** the order: index 0 comes first. Identifiers that already belong to
+    /// another group are **moved** out of it, and identifiers missing from that other group's
+    /// list are appended to its end, so that the membership invariant survives any caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::VaultGroupNotFound`] when there is no such group,
+    /// [`Error::VaultGroupUnknownEntry`] when the list names an entry the vault does not hold
+    /// (the caller is out of step, unlike a peer's file, where such a reference is skipped),
+    /// [`Error::VaultGroupDuplicateEntry`] when one entry appears twice, and
+    /// [`Error::VaultGroupTooManyEntries`] when the list is longer than the format allows.
+    pub fn set_ordering(&mut self, id: &GroupId, entry_ids: Vec<EntryId>) -> Result<()> {
+        if !self.groups.contains_key(id) {
+            return Err(Error::VaultGroupNotFound);
+        }
+        for entry_id in &entry_ids {
+            if !self.entries.contains_key(entry_id) {
+                return Err(Error::VaultGroupUnknownEntry);
+            }
+        }
+        let replacement = Group::new(String::new(), 0, entry_ids)?.entry_ids;
+
+        for entry_id in &replacement {
+            self.detach_from_other_groups(entry_id, id);
+        }
+        self.groups.get_mut(id).expect("checked above").entry_ids = replacement;
+        Ok(())
+    }
+
+    /// Moves an entry into a group, appending it to that group's ordering.
+    ///
+    /// This is the "move to group" operation: it removes the entry from wherever it was, so the
+    /// membership invariant holds without the caller having to know where the entry came from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::VaultGroupNotFound`] when there is no such group and
+    /// [`Error::VaultEntryNotFound`] when the vault holds no such entry.
+    pub fn assign_to_group(&mut self, entry: &EntryId, group: &GroupId) -> Result<()> {
+        if !self.entries.contains_key(entry) {
+            return Err(Error::VaultEntryNotFound);
+        }
+        if !self.groups.contains_key(group) {
+            return Err(Error::VaultGroupNotFound);
+        }
+        if self.group_of(entry) == Some(group) {
+            return Ok(());
+        }
+        self.detach_from_other_groups(entry, group);
+        self.groups
+            .get_mut(group)
+            .expect("checked above")
+            .entry_ids
+            .push(*entry);
+        Ok(())
+    }
+
+    /// Drops every reference to an entry, so nothing points at an entry that is gone.
+    fn detach_everywhere(&mut self, entry: &EntryId) {
+        for group in self.groups.values_mut() {
+            group.entry_ids.retain(|candidate| candidate != entry);
+        }
+    }
+
+    /// Drops references to an entry from every group **except** `keep`.
+    fn detach_from_other_groups(&mut self, entry: &EntryId, keep: &GroupId) {
+        for (id, group) in &mut self.groups {
+            if id == keep {
+                continue;
+            }
+            group.entry_ids.retain(|candidate| candidate != entry);
+        }
+    }
+
+    /// The top group, created empty when the vault has none.
+    fn top_group_mut(&mut self) -> &mut Group {
+        self.groups
+            .entry(GroupId::TOP)
+            .or_insert_with(Group::top_empty)
+    }
+
+    /// The identifier order of the named groups, top group excluded.
+    fn named_group_ids(&self) -> Vec<GroupId> {
+        let mut named: Vec<(&GroupId, &Group)> =
+            self.groups.iter().filter(|(id, _)| !id.is_top()).collect();
+        named.sort_by_key(|(id, group)| (group.group_order, **id));
+        named.into_iter().map(|(id, _)| *id).collect()
+    }
+
+    /// The order number a newly created group takes: one past the last named group.
+    fn next_group_order(&self) -> u32 {
+        self.groups
+            .iter()
+            .filter(|(id, _)| !id.is_top())
+            .map(|(_, group)| group.group_order)
+            .max()
+            .map_or(0, |order| order.saturating_add(1))
+    }
+
+    /// Renumbers the named groups as `0..n` in their current order.
+    fn renumber_named_groups(&mut self) {
+        for (order, id) in self.named_group_ids().into_iter().enumerate() {
+            if let Some(group) = self.groups.get_mut(&id) {
+                group.group_order = u32::try_from(order).unwrap_or(u32::MAX);
+            }
+        }
+    }
+
+    /// Repairs the group state after parsing records.
+    ///
+    /// Three rules, in this order:
+    ///
+    /// 1. **A reference to an entry the file does not contain is dropped.** A peer may hold an
+    ///    ordering that mentions an entry this device never received; keeping the reference
+    ///    would leave a hole in the interface that no operation can fill.
+    /// 2. **An entry claimed by two lists stays in the first one** (the group order decides
+    ///    which is first) and is removed from the later one. Two lists both naming an entry is
+    ///    a file that says two things at once, and something has to win; fixing it here means
+    ///    the rest of the code can rely on the membership invariant.
+    /// 3. **Every remaining live entry is appended to the top group**, in the order the file
+    ///    listed its records. This is what makes a version 1 or 2 file - which has no group
+    ///    records at all - read as "everything in the top group, in file order", and it is the
+    ///    only definition of order those files have.
+    ///
+    /// `file_entry_order` is the order in which the entry records appeared in the file, and
+    /// `file_group_order` the order in which the group records did - the second decides which
+    /// list "came first" when two of them name the same entry.
+    fn reconcile_groups(&mut self, file_entry_order: &[EntryId], file_group_order: &[GroupId]) {
+        let mut claimed: Vec<EntryId> = Vec::with_capacity(self.entries.len());
+
+        for group_id in file_group_order {
+            let group_id = *group_id;
+            let Some(group) = self.groups.get(&group_id) else {
+                continue;
+            };
+            let mut kept: Vec<EntryId> = Vec::with_capacity(group.entry_ids.len());
+            for entry_id in &group.entry_ids {
+                if self.entries.contains_key(entry_id) && !claimed.contains(entry_id) {
+                    claimed.push(*entry_id);
+                    kept.push(*entry_id);
+                }
+            }
+            if let Some(group) = self.groups.get_mut(&group_id) {
+                group.entry_ids = kept;
+            }
+        }
+
+        for entry_id in file_entry_order {
+            if !claimed.contains(entry_id) {
+                self.top_group_mut().entry_ids.push(*entry_id);
+            }
+        }
     }
 }
 
@@ -599,6 +995,12 @@ impl VaultFile {
 
     /// Serializes to the file bytes.
     ///
+    /// Records are written entries first, then tombstones, then groups. The order of the entry
+    /// records is the order the entries are read back in, which is what defines the top group's
+    /// ordering in a file that has no group records (see [`VaultFile::parse`]); with group
+    /// records
+    /// present the orderings come from the group records and the entry order no longer matters.
+    ///
     /// # Errors
     ///
     /// Returns the corresponding error when an entry field exceeds what the format can
@@ -610,6 +1012,7 @@ impl VaultFile {
             .entries
             .len()
             .checked_add(self.vault.tombstones.len())
+            .and_then(|total| total.checked_add(self.vault.groups.len()))
             .ok_or(Error::VaultTooManyRecords)?;
         if total > MAX_RECORDS {
             return Err(Error::VaultTooManyRecords);
@@ -633,7 +1036,7 @@ impl VaultFile {
                 &self.master,
                 FORMAT_VERSION,
                 RecordKind::Entry,
-                id,
+                id.as_bytes(),
                 &plaintext,
             )?;
         }
@@ -644,7 +1047,19 @@ impl VaultFile {
                 &self.master,
                 FORMAT_VERSION,
                 RecordKind::Tombstone,
-                id,
+                id.as_bytes(),
+                &plaintext,
+            )?;
+        }
+
+        for (id, group) in self.vault.groups() {
+            let plaintext = encode_group(group)?;
+            write_record(
+                &mut out,
+                &self.master,
+                FORMAT_VERSION,
+                RecordKind::Group,
+                id.as_bytes(),
                 &plaintext,
             )?;
         }
@@ -707,6 +1122,8 @@ impl VaultFile {
         }
 
         let mut vault = Vault::new();
+        let mut file_entry_order: Vec<EntryId> = Vec::new();
+        let mut file_group_order: Vec<GroupId> = Vec::new();
         for _ in 0..count {
             let kind_byte = reader.u8().ok_or(Error::VaultTruncated)?;
             let kind = RecordKind::from_byte(kind_byte)
@@ -722,21 +1139,31 @@ impl VaultFile {
             }
             let ciphertext = reader.take(len).ok_or(Error::VaultTruncated)?;
 
-            let plaintext = crypto::open(&master, kind, &id, version, &nonce, ciphertext)?;
+            let plaintext =
+                crypto::open(&master, kind, id.as_bytes(), version, &nonce, ciphertext)?;
             match kind {
                 RecordKind::Entry => {
                     let entry = decode_entry(&plaintext)?;
-                    vault.insert_with_id(id, entry)?;
+                    vault.insert_parsed(id, entry)?;
+                    file_entry_order.push(id);
                 }
                 RecordKind::Tombstone => {
                     let tombstone = decode_tombstone(id, &plaintext)?;
                     vault.record_tombstone(tombstone);
+                }
+                RecordKind::Group => {
+                    let group = decode_group(&plaintext)?;
+                    let group_id = GroupId::from_bytes(*id.as_bytes());
+                    vault.insert_group_with_id(group_id, group)?;
+                    file_group_order.push(group_id);
                 }
                 RecordKind::SyncEntry | RecordKind::SyncTombstone => {
                     return Err(Error::VaultUnknownRecordKind { value: kind_byte });
                 }
             }
         }
+
+        vault.reconcile_groups(&file_entry_order, &file_group_order);
 
         if version >= 2 {
             let stored = reader
@@ -765,12 +1192,12 @@ fn write_record(
     master: &MasterKey,
     format_version: u8,
     kind: RecordKind,
-    id: &EntryId,
+    record_id: &[u8; EntryId::LEN],
     plaintext: &[u8],
 ) -> Result<()> {
-    let (nonce, ciphertext) = crypto::seal(master, kind, id, format_version, plaintext)?;
+    let (nonce, ciphertext) = crypto::seal(master, kind, record_id, format_version, plaintext)?;
     out.push(kind.as_byte());
-    out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(record_id);
     out.extend_from_slice(&nonce);
     put_bytes(out, &ciphertext);
     Ok(())
@@ -847,6 +1274,105 @@ fn put_node(out: &mut Vec<u8>, tag: u8, payload: &[u8]) {
     put_bytes(out, payload);
 }
 
+/// Serializes the plaintext of a group.
+///
+/// Three nodes: the name (empty for the top group), the position among the named groups, and the
+/// ordering as the concatenation of its 16-byte identifiers. The list is the order - the entry
+/// at index `i` is the `i`-th identifier - so there is nothing else to write and nothing that
+/// could disagree with the list.
+///
+/// # Errors
+///
+/// Returns [`Error::VaultGroupTooManyEntries`] when the ordering does not fit in one node. The
+/// check is here rather than only in [`Group::new`] because the list is public and a caller may
+/// have grown it in place.
+pub(crate) fn encode_group(group: &Group) -> Result<Vec<u8>> {
+    if group.entry_ids.len() > Group::MAX_ENTRIES {
+        return Err(Error::VaultGroupTooManyEntries {
+            limit: Group::MAX_ENTRIES,
+            actual: group.entry_ids.len(),
+        });
+    }
+
+    let mut out = Vec::new();
+    put_node(&mut out, tag::NAME, group.name.as_bytes());
+    put_node(&mut out, tag::GROUP_ORDER, &group.group_order.to_be_bytes());
+
+    let mut ids = Vec::with_capacity(group.entry_ids.len() * EntryId::LEN);
+    for entry_id in &group.entry_ids {
+        ids.extend_from_slice(entry_id.as_bytes());
+    }
+    put_node(&mut out, tag::ENTRY_IDS, &ids);
+
+    Ok(out)
+}
+
+/// Parses the plaintext of a group.
+///
+/// A repeated known node is rejected as [`Error::VaultDuplicateField`] (see [`tag::GROUP_TAG_MAX`]);
+/// unknown nodes are skipped by their length. The name is optional and defaults to empty - that
+/// is the top group - while a missing ordering or position is [`Error::VaultCorrupt`]:
+/// a group without an ordering is not a group.
+pub(crate) fn decode_group(data: &[u8]) -> Result<Group> {
+    let mut reader = Reader::new(data);
+    let mut name = String::new();
+    let mut group_order = None;
+    let mut entry_ids = None;
+    let mut seen: u32 = 0;
+
+    let mut guard = data.len() + 1;
+    while !reader.is_empty() {
+        guard = guard.checked_sub(1).ok_or(Error::VaultCorrupt)?;
+        let node_tag = reader.u8().ok_or(Error::VaultTruncated)?;
+        let len = reader.u32().ok_or(Error::VaultTruncated)? as usize;
+        if len > Entry::MAX_FIELD_LEN {
+            return Err(Error::FieldTooLong {
+                field: "group node",
+                limit: Entry::MAX_FIELD_LEN,
+                actual: len,
+            });
+        }
+        let payload = reader.take(len).ok_or(Error::VaultTruncated)?;
+
+        if node_tag <= tag::GROUP_TAG_MAX {
+            let bit = 1_u32 << node_tag;
+            if seen & bit != 0 {
+                return Err(Error::VaultDuplicateField { tag: node_tag });
+            }
+            seen |= bit;
+        }
+
+        match node_tag {
+            tag::NAME => name = utf8(payload)?,
+            tag::GROUP_ORDER => {
+                let bytes: [u8; 4] = payload.try_into().map_err(|_| Error::VaultCorrupt)?;
+                group_order = Some(u32::from_be_bytes(bytes));
+            }
+            tag::ENTRY_IDS => {
+                if !payload.len().is_multiple_of(EntryId::LEN) {
+                    return Err(Error::VaultCorrupt);
+                }
+                let mut ids = Vec::with_capacity(payload.len() / EntryId::LEN);
+                for start in (0..payload.len()).step_by(EntryId::LEN) {
+                    let end = start.checked_add(EntryId::LEN).ok_or(Error::VaultCorrupt)?;
+                    let chunk = payload.get(start..end).ok_or(Error::VaultCorrupt)?;
+                    let bytes: [u8; EntryId::LEN] =
+                        chunk.try_into().map_err(|_| Error::VaultCorrupt)?;
+                    ids.push(EntryId::from_bytes(bytes));
+                }
+                entry_ids = Some(ids);
+            }
+            _ => {}
+        }
+    }
+
+    Group::new(
+        name,
+        group_order.ok_or(Error::VaultCorrupt)?,
+        entry_ids.ok_or(Error::VaultCorrupt)?,
+    )
+}
+
 /// Serializes the plaintext of a tombstone.
 ///
 /// Same node encoding as an entry, so unknown nodes are skipped here too.
@@ -903,7 +1429,7 @@ struct Fields {
 
 /// Parses the plaintext of an entry.
 ///
-/// A node whose tag is at or below [`tag::KNOWN_TAG_MAX`] that appears twice is rejected as
+/// A node whose tag is at or below [`tag::ENTRY_TAG_MAX`] that appears twice is rejected as
 /// [`Error::VaultDuplicateField`]; unknown tags are skipped by their length, and several nodes
 /// sharing an unknown tag are tolerated, since a newer version may write them legitimately.
 ///
@@ -936,7 +1462,7 @@ pub(crate) fn decode_entry(data: &[u8]) -> Result<VaultEntry> {
         }
         let payload = reader.take(len).ok_or(Error::VaultTruncated)?;
 
-        if node_tag <= tag::KNOWN_TAG_MAX {
+        if node_tag <= tag::ENTRY_TAG_MAX {
             let bit = 1_u32 << node_tag;
             if seen & bit != 0 {
                 return Err(Error::VaultDuplicateField { tag: node_tag });
@@ -1748,7 +2274,8 @@ mod tests {
         let entry = sample_entry("old-format");
         let plaintext = encode_entry(&entry).expect("encoding succeeds");
         let (nonce, ciphertext) =
-            crypto::seal(&master, RecordKind::Entry, &id, 1, &plaintext).expect("sealing succeeds");
+            crypto::seal(&master, RecordKind::Entry, id.as_bytes(), 1, &plaintext)
+                .expect("sealing succeeds");
 
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
@@ -1831,7 +2358,8 @@ mod tests {
         let id = EntryId::generate().expect("OS randomness available");
         let plaintext = version_2_plaintext(false);
         let (nonce, ciphertext) =
-            crypto::seal(&master, RecordKind::Entry, &id, 2, &plaintext).expect("sealing succeeds");
+            crypto::seal(&master, RecordKind::Entry, id.as_bytes(), 2, &plaintext)
+                .expect("sealing succeeds");
 
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
@@ -2418,5 +2946,498 @@ mod tests {
         bytes.extend_from_slice(&[0x33; 32]);
         let err = VaultFile::parse(key, &bytes);
         assert!(matches!(err, Err(Error::VaultDecryptionFailed)));
+    }
+
+    /// Writes a file from hand-built records.
+    ///
+    /// The record list is written in the order given, which is what decides the top group's
+    /// ordering in a file that has no group records - so a test that cares about that order
+    /// passes the records in the order it means.
+    fn file_from_records(
+        master: &MasterKey,
+        records: &[(RecordKind, [u8; EntryId::LEN], Vec<u8>)],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.push(FORMAT_VERSION);
+        out.push(0);
+        put_u32(
+            &mut out,
+            u32::try_from(records.len()).expect("the test writes a handful of records"),
+        );
+        for (kind, id, plaintext) in records {
+            write_record(&mut out, master, FORMAT_VERSION, *kind, id, plaintext)
+                .expect("sealing succeeds");
+        }
+        out.extend_from_slice(&crypto::key_check(master));
+        out
+    }
+
+    /// A copy of the master key, since `MasterKey` is deliberately not `Clone`.
+    fn copy_key(master: &MasterKey) -> MasterKey {
+        MasterKey::from_bytes(master_key_to_bytes(master)).expect("the length is correct")
+    }
+
+    /// Reads the record count out of a file header.
+    fn record_count(filedata: &[u8]) -> u32 {
+        let bytes: [u8; 4] = filedata[10..14].try_into().expect("the header is 14 bytes");
+        u32::from_be_bytes(bytes)
+    }
+
+    /// An entry record for a hand-built file.
+    fn entry_record(
+        master: &MasterKey,
+        id: EntryId,
+        name: &str,
+    ) -> (RecordKind, [u8; 16], Vec<u8>) {
+        let plaintext = encode_entry(&sample_entry(name)).expect("encoding succeeds");
+        let _ = master;
+        (RecordKind::Entry, *id.as_bytes(), plaintext)
+    }
+
+    /// The plan's byte-level requirement: a version 1 or 2 file has **no** group records, and
+    /// reading it puts every entry in the top group in the order the file listed them - then
+    /// writing it back produces group records.
+    #[test]
+    fn a_file_without_group_records_reads_as_one_top_group_in_file_order() {
+        let master = MasterKey::generate().expect("OS randomness available");
+        let first = EntryId::generate().expect("OS randomness available");
+        let second = EntryId::generate().expect("OS randomness available");
+        let third = EntryId::generate().expect("OS randomness available");
+
+        let bytes = file_from_records(
+            &master,
+            &[
+                entry_record(&master, first, "first"),
+                entry_record(&master, second, "second"),
+                entry_record(&master, third, "third"),
+            ],
+        );
+        assert_eq!(record_count(&bytes), 3, "three records, no group record");
+
+        let parsed = VaultFile::parse(copy_key(&master), &bytes).expect("it parses");
+        assert_eq!(
+            parsed.vault().group_count(),
+            1,
+            "the top group is synthesized"
+        );
+        let top = parsed.vault().top_group().expect("a top group exists");
+        assert_eq!(
+            top.entry_ids,
+            vec![first, second, third],
+            "reconciliation fills the top group from the file order, since no record said otherwise"
+        );
+        let ordering: Vec<EntryId> = parsed
+            .vault()
+            .entries_in(&GroupId::TOP)
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            ordering,
+            vec![first, second, third],
+            "the file order is the only order such a file has"
+        );
+        assert_eq!(
+            parsed.vault().group_of(&second),
+            Some(&GroupId::TOP),
+            "every entry is in the top group"
+        );
+
+        // Writing it back adds the group record: the file now says what was previously implied.
+        let rewritten = parsed.serialize().expect("it serializes");
+        assert_eq!(record_count(&rewritten), 4, "three entries and one group");
+
+        let reparsed = VaultFile::parse(copy_key(&master), &rewritten).expect("it parses");
+        let ordering: Vec<EntryId> = reparsed
+            .vault()
+            .entries_in(&GroupId::TOP)
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(ordering, vec![first, second, third], "the order survives");
+    }
+
+    /// A group survives the file: its name, its position and its ordering.
+    #[test]
+    fn a_group_round_trips_with_its_ordering() {
+        let mut file = VaultFile::create().expect("OS randomness available");
+        let first = file
+            .vault_mut()
+            .insert(sample_entry("work-1"))
+            .expect("insertion succeeds");
+        let second = file
+            .vault_mut()
+            .insert(sample_entry("work-2"))
+            .expect("insertion succeeds");
+        let work = file
+            .vault_mut()
+            .create_group("Work".to_owned())
+            .expect("group creation succeeds");
+        file.vault_mut()
+            .create_group("Private".to_owned())
+            .expect("group creation succeeds");
+
+        // The list is the order: second before first.
+        file.vault_mut()
+            .set_ordering(&work, vec![second, first])
+            .expect("the ordering is valid");
+
+        let bytes = file.serialize().expect("serialization succeeds");
+        let parsed = VaultFile::parse(copy_key(file.master_key()), &bytes).expect("it parses back");
+
+        let restored = parsed.vault().group(&work).expect("the group exists");
+        assert_eq!(restored.name, "Work");
+        assert_eq!(restored.group_order, 0, "it is the first named group");
+        assert_eq!(restored.entry_ids, vec![second, first]);
+
+        let ordering: Vec<EntryId> = parsed
+            .vault()
+            .entries_in(&work)
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            ordering,
+            vec![second, first],
+            "the list is read back in its own order"
+        );
+        assert_eq!(
+            parsed.vault().group_count(),
+            3,
+            "two named groups and the top group"
+        );
+
+        let groups: Vec<&str> = parsed
+            .vault()
+            .groups()
+            .map(|(_, group)| group.name.as_str())
+            .collect();
+        assert_eq!(
+            groups,
+            vec!["", "Work", "Private"],
+            "the top group comes first, then the named ones in their order"
+        );
+    }
+
+    /// A reference to an entry the file does not contain is dropped instead of leaving a hole.
+    #[test]
+    fn a_dangling_reference_is_skipped() {
+        let master = MasterKey::generate().expect("OS randomness available");
+        let present = EntryId::generate().expect("OS randomness available");
+        let missing = EntryId::generate().expect("OS randomness available");
+        let group_id = GroupId::generate().expect("OS randomness available");
+
+        let group = Group::new("Work".to_owned(), 0, vec![missing, present])
+            .expect("a valid group; two different lists are what the vault checks");
+        let bytes = file_from_records(
+            &master,
+            &[
+                entry_record(&master, present, "present"),
+                (
+                    RecordKind::Group,
+                    *group_id.as_bytes(),
+                    encode_group(&group).expect("it encodes"),
+                ),
+            ],
+        );
+
+        let parsed = VaultFile::parse(copy_key(&master), &bytes).expect("it parses");
+        assert_eq!(
+            parsed.vault().ordering(&group_id),
+            Some([present].as_slice()),
+            "the reference to a missing entry is skipped, the rest is kept"
+        );
+    }
+
+    /// When two lists name the same entry, the one whose record came **first** keeps it and the
+    /// later one loses the reference.
+    ///
+    /// A file that says two things at once has to be resolved somewhere; resolving it here means
+    /// every other part of the library can rely on "an entry is in at most one group".
+    #[test]
+    fn the_first_list_wins_a_shared_entry() {
+        let master = MasterKey::generate().expect("OS randomness available");
+        let shared = EntryId::generate().expect("OS randomness available");
+        let first_group = GroupId::generate().expect("OS randomness available");
+        let second_group = GroupId::generate().expect("OS randomness available");
+
+        let first = Group::new("First".to_owned(), 0, vec![shared]).expect("valid group");
+        let second = Group::new("Second".to_owned(), 1, vec![shared]).expect("valid group");
+        let bytes = file_from_records(
+            &master,
+            &[
+                (
+                    RecordKind::Group,
+                    *second_group.as_bytes(),
+                    encode_group(&second).expect("encodes"),
+                ),
+                entry_record(&master, shared, "shared"),
+                (
+                    RecordKind::Group,
+                    *first_group.as_bytes(),
+                    encode_group(&first).expect("encodes"),
+                ),
+            ],
+        );
+
+        let parsed = VaultFile::parse(copy_key(&master), &bytes).expect("it parses");
+        assert_eq!(
+            parsed.vault().ordering(&second_group),
+            Some([shared].as_slice()),
+            "the second record came first, so its claim stands"
+        );
+        assert_eq!(
+            parsed.vault().ordering(&first_group),
+            Some([].as_slice()),
+            "the later list loses the reference"
+        );
+        assert_eq!(parsed.vault().group_of(&shared), Some(&second_group));
+    }
+
+    /// An entry no list names is appended to the top group, in file order.
+    #[test]
+    fn an_entry_no_list_names_lands_in_the_top_group() {
+        let master = MasterKey::generate().expect("OS randomness available");
+        let listed = EntryId::generate().expect("OS randomness available");
+        let unlisted = EntryId::generate().expect("OS randomness available");
+        let group_id = GroupId::generate().expect("OS randomness available");
+
+        let group = Group::new("Work".to_owned(), 0, vec![listed]).expect("valid group");
+        let bytes = file_from_records(
+            &master,
+            &[
+                entry_record(&master, unlisted, "unlisted"),
+                entry_record(&master, listed, "listed"),
+                (
+                    RecordKind::Group,
+                    *group_id.as_bytes(),
+                    encode_group(&group).expect("encodes"),
+                ),
+            ],
+        );
+
+        let parsed = VaultFile::parse(copy_key(&master), &bytes).expect("it parses");
+        assert_eq!(
+            parsed.vault().ordering(&group_id),
+            Some([listed].as_slice())
+        );
+        assert_eq!(
+            parsed.vault().ordering(&GroupId::TOP),
+            Some([unlisted].as_slice()),
+            "what no list claims belongs to the top group"
+        );
+    }
+
+    /// The top group cannot be renamed, removed or reordered; its contents stay editable.
+    #[test]
+    fn the_top_group_cannot_be_renamed_removed_or_reordered() {
+        let mut vault = Vault::new();
+        let id = vault.insert(sample_entry("x")).expect("insertion succeeds");
+
+        assert!(matches!(
+            vault.rename_group(&GroupId::TOP, "Home".to_owned()),
+            Err(Error::VaultTopGroupImmutable)
+        ));
+        assert!(matches!(
+            vault.remove_group(&GroupId::TOP),
+            Err(Error::VaultTopGroupImmutable)
+        ));
+        assert!(matches!(
+            vault.reorder_group(&GroupId::TOP, 3),
+            Err(Error::VaultTopGroupImmutable)
+        ));
+
+        vault
+            .set_ordering(&GroupId::TOP, vec![id])
+            .expect("the ordering of the top group is what it is for");
+        assert_eq!(vault.ordering(&GroupId::TOP), Some([id].as_slice()));
+    }
+
+    /// Insertion puts an entry in the top group, and deleting it leaves no reference behind.
+    #[test]
+    fn insertion_and_deletion_keep_the_top_group_consistent() {
+        let mut vault = Vault::new();
+        let first = vault.insert(sample_entry("a")).expect("insertion succeeds");
+        let second = vault.insert(sample_entry("b")).expect("insertion succeeds");
+        assert_eq!(
+            vault.ordering(&GroupId::TOP),
+            Some([first, second].as_slice()),
+            "insertion appends"
+        );
+
+        vault.remove(&first, 1_700_000_000);
+        assert_eq!(
+            vault.ordering(&GroupId::TOP),
+            Some([second].as_slice()),
+            "a deleted entry must not stay in the ordering"
+        );
+        assert!(vault.group_of(&first).is_none());
+    }
+
+    /// Moving an entry between groups takes it out of the old one, and a second move out of the
+    /// top group does too.
+    #[test]
+    fn moving_an_entry_between_groups_leaves_one_reference() {
+        let mut vault = Vault::new();
+        let entry = vault.insert(sample_entry("x")).expect("insertion succeeds");
+        let work = vault
+            .create_group("Work".to_owned())
+            .expect("creation succeeds");
+        let private = vault
+            .create_group("Private".to_owned())
+            .expect("creation succeeds");
+
+        vault
+            .assign_to_group(&entry, &work)
+            .expect("the move succeeds");
+        assert_eq!(vault.ordering(&work), Some([entry].as_slice()));
+        assert_eq!(
+            vault.ordering(&GroupId::TOP),
+            Some([].as_slice()),
+            "it left the top group"
+        );
+
+        vault
+            .assign_to_group(&entry, &private)
+            .expect("the second move succeeds");
+        assert_eq!(vault.ordering(&private), Some([entry].as_slice()));
+        assert_eq!(vault.ordering(&work), Some([].as_slice()));
+
+        vault
+            .assign_to_group(&entry, &work)
+            .expect("moving back succeeds");
+        assert_eq!(vault.ordering(&work), Some([entry].as_slice()));
+        assert_eq!(vault.ordering(&private), Some([].as_slice()));
+        assert_eq!(vault.group_of(&entry), Some(&work));
+    }
+
+    /// Setting an ordering refuses what the vault cannot represent: an unknown entry, a repeated
+    /// entry, an unknown group.
+    #[test]
+    fn setting_an_ordering_validates_its_input() {
+        let mut vault = Vault::new();
+        let entry = vault.insert(sample_entry("x")).expect("insertion succeeds");
+        let group = vault
+            .create_group("Work".to_owned())
+            .expect("creation succeeds");
+        let missing = EntryId::generate().expect("OS randomness available");
+
+        assert!(matches!(
+            vault.set_ordering(&group, vec![missing]),
+            Err(Error::VaultGroupUnknownEntry)
+        ));
+        assert!(matches!(
+            vault.set_ordering(&group, vec![entry, entry]),
+            Err(Error::VaultGroupDuplicateEntry)
+        ));
+        assert!(matches!(
+            vault.set_ordering(&missing_group_id(), vec![]),
+            Err(Error::VaultGroupNotFound)
+        ));
+        assert!(matches!(
+            vault.assign_to_group(&missing, &group),
+            Err(Error::VaultEntryNotFound)
+        ));
+        assert!(matches!(
+            vault.assign_to_group(&entry, &missing_group_id()),
+            Err(Error::VaultGroupNotFound)
+        ));
+        assert_eq!(
+            vault.ordering(&group),
+            Some([].as_slice()),
+            "a refused call must not have changed anything"
+        );
+    }
+
+    /// Removing a group moves its entries to the top group instead of deleting them.
+    #[test]
+    fn removing_a_group_keeps_its_entries() {
+        let mut vault = Vault::new();
+        let first = vault.insert(sample_entry("a")).expect("insertion succeeds");
+        let second = vault.insert(sample_entry("b")).expect("insertion succeeds");
+        let work = vault
+            .create_group("Work".to_owned())
+            .expect("creation succeeds");
+        let private = vault
+            .create_group("Private".to_owned())
+            .expect("creation succeeds");
+        vault
+            .set_ordering(&work, vec![second, first])
+            .expect("valid ordering");
+
+        let removed = vault
+            .remove_group(&work)
+            .expect("removal succeeds")
+            .expect("the group existed");
+        assert_eq!(removed.name, "Work");
+        assert_eq!(vault.len(), 2, "the entries are still there");
+        assert_eq!(
+            vault.ordering(&GroupId::TOP),
+            Some([second, first].as_slice()),
+            "they moved to the top group, keeping their order"
+        );
+        assert_eq!(
+            vault.group(&private).map(|group| group.group_order),
+            Some(0),
+            "the remaining named group is renumbered"
+        );
+        assert!(
+            vault
+                .remove_group(&private)
+                .expect("removal succeeds")
+                .is_some()
+        );
+        assert!(
+            vault
+                .remove_group(&private)
+                .expect("removal succeeds")
+                .is_none()
+        );
+    }
+
+    /// Reordering a named group renumbers the rest, so the numbers stay a sequence.
+    #[test]
+    fn reordering_groups_renumbers_them() {
+        let mut vault = Vault::new();
+        let first = vault
+            .create_group("A".to_owned())
+            .expect("creation succeeds");
+        let second = vault
+            .create_group("B".to_owned())
+            .expect("creation succeeds");
+        let third = vault
+            .create_group("C".to_owned())
+            .expect("creation succeeds");
+        assert_eq!(vault.group(&third).map(|g| g.group_order), Some(2));
+
+        vault.reorder_group(&third, 0).expect("reordering succeeds");
+        let order: Vec<(&str, u32)> = vault
+            .groups()
+            .map(|(_, group)| (group.name.as_str(), group.group_order))
+            .collect();
+        // No entry has been inserted, so there is no top group to list yet: it appears with the
+        // first entry, not with the first group.
+        assert_eq!(order, vec![("C", 0), ("A", 1), ("B", 2)]);
+
+        vault
+            .reorder_group(&first, 99)
+            .expect("it clamps to the end");
+        let order: Vec<&str> = vault
+            .groups()
+            .map(|(_, group)| group.name.as_str())
+            .collect();
+        assert_eq!(order, vec!["C", "B", "A"]);
+
+        assert!(
+            vault.reorder_group(&second, 0).is_ok(),
+            "an existing group can be moved"
+        );
+        assert!(matches!(
+            vault.reorder_group(&missing_group_id(), 0),
+            Err(Error::VaultGroupNotFound)
+        ));
+    }
+
+    /// A group identifier that is not in the vault.
+    fn missing_group_id() -> GroupId {
+        GroupId::from_bytes([0xAB; GroupId::LEN])
     }
 }
