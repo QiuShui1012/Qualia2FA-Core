@@ -170,7 +170,11 @@ qualia-dik = "0.1"
 # grayscale plane this expects). Decoding a file format is where the historical
 # vulnerabilities live; here the input is a base64 blob inside a document that was
 # already bounded before it was decoded.
-qualia-transport = { version = "0.1.3", default-features = false, features = ["scan-image"] }
+#
+# 0.1.4 is the version that added `qr::encode_text`, which the HTML export needs: the
+# code it draws is another application's text and must not go through this project's own
+# QR envelope. 0.1.3 and earlier would not compile.
+qualia-transport = { version = "0.1.4", default-features = false, features = ["scan-image"] }
 
 # Secret-material containers (`SecretBox` / `SecretSlice` / `SecretString` /
 # `ExposeSecret`). Dependency audit, checked item by item (cargo-deny does not judge

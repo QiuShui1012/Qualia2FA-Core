@@ -601,6 +601,51 @@ pub enum Error {
         reason: &'static str,
     },
 
+    /// An encrypted export was asked for without a password.
+    ///
+    /// The caller decides this before calling [`crate::export::export`] with
+    /// [`crate::export::ExportFormat::needs_password`]; reaching this error means the decision
+    /// was made wrongly, and the alternative - writing an unencrypted file because no password
+    /// arrived - would be a silent downgrade of something the user asked to protect.
+    #[error("an encrypted export needs a password")]
+    ExportPasswordRequired,
+
+    /// The password given for an encrypted export is empty.
+    ///
+    /// Refused rather than accepted: an empty password is one anybody can guess by trying
+    /// nothing at all, and the file holds every secret in the vault.
+    #[error("an encrypted export needs a password that is not empty")]
+    ExportPasswordEmpty,
+
+    /// An entry's URI does not fit a QR code, so the HTML export cannot draw it.
+    ///
+    /// Reported with the entry's **position** and nothing else: an error message ends up in a
+    /// log, and the entry's name and issuer are the user's own account data.
+    #[error("the URI of the entry at position {position} does not fit a QR code")]
+    ExportQrTooLong {
+        /// Where in the export the entry was, counting from 1.
+        position: usize,
+    },
+
+    /// The vault is larger than the container of an encrypted export.
+    ///
+    /// AES-256-GCM caps a message at 2^36 - 32 bytes, and the whole database goes into one
+    /// message. A vault would have to hold tens of gigabytes of entries to reach it.
+    #[error("the vault is larger than one encrypted message can hold")]
+    ExportTooLarge,
+
+    /// A fixed parameter of an export format was refused by the code that implements it.
+    ///
+    /// Unreachable in practice: the parameters are constants of the format, and a test pins that
+    /// the implementations accept them. It is an error rather than a panic because this library
+    /// does not panic, and rather than an `unwrap` because an unwrap in a library is a crash
+    /// waiting for the one build where the constant was edited.
+    #[error("the export could not be written: a fixed parameter was refused ({parameter})")]
+    ExportParameterRefused {
+        /// Which parameter, in one phrase.
+        parameter: &'static str,
+    },
+
     /// The plaintext structure of a vault entry contains a duplicated field node.
     ///
     /// Implementations disagree on whether the first or the last occurrence wins: a classic

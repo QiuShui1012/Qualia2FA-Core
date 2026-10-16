@@ -60,6 +60,7 @@
 pub mod auth;
 pub mod base32;
 mod error;
+pub mod export;
 pub mod flow;
 pub mod import;
 pub mod motp;
