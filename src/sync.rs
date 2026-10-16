@@ -107,12 +107,23 @@ pub const MAGIC: &[u8; 8] = b"Q2FASYNC";
 /// Version 2 states this explicitly in [`PayloadKind`] and binds it into the AAD: the kind is
 /// therefore **authenticated** and a third party cannot change it.
 ///
+/// # Version 2 → 3: entries may carry fields the older format could not express
+///
+/// Version 3 payloads transport entries whose plaintext may contain node tags an older
+/// version does not know: the entry kind (TOTP / HOTP / mOTP / Yandex OTP / Steam Guard) and
+/// the two PIN fields. An older peer would skip those nodes by their length and store a
+/// **mis-typed entry** — an mOTP entry silently becoming TOTP, with a code that never
+/// works — so mixing versions is refused rather than tolerated.
+///
+/// Nothing else about the payload layout changed: the only difference is the number, which
+/// takes part in both the outer and the inner AAD.
+///
 /// # It also takes part in the **inner** record AAD
 ///
 /// Changing it makes the inner records of existing payloads unopenable. That is what stops
 /// cross-version transplanting: an inner record of an older version must not be moved into a
 /// newer payload.
-pub const FORMAT_VERSION: u8 = 2;
+pub const FORMAT_VERSION: u8 = 3;
 
 /// Payload version number used only by version 1.
 ///
@@ -1090,7 +1101,7 @@ mod tests {
         assert_eq!(&HKDF_SALT_SYNC, b"Qualia2FA sync salt v1 (records)");
         assert_eq!(HKDF_SALT_SYNC.len(), 32);
         assert_eq!(MAGIC, b"Q2FASYNC");
-        assert_eq!(FORMAT_VERSION, 2);
+        assert_eq!(FORMAT_VERSION, 3);
         assert!(
             crate::vault::READABLE_VERSIONS.contains(&crate::vault::FORMAT_VERSION),
             "the version a file format declares must be in its own readable version list"

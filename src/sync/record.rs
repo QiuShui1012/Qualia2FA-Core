@@ -554,7 +554,7 @@ mod tests {
             0x82,
             "the sync tombstone kind byte changed"
         );
-        assert_eq!(FORMAT_VERSION, 2, "the payload format version changed");
+        assert_eq!(FORMAT_VERSION, 3, "the payload format version changed");
     }
 
     /// **The record kind bytes of the two domains must not overlap, and each parser must refuse the

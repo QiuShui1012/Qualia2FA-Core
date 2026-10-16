@@ -69,18 +69,27 @@
 //! (1 byte), the entry ID (16 bytes) and the format version (1 byte). The tag covers
 //! those bytes together with the ciphertext.
 //!
-//! ## Version 1 files remain readable
+//! ## Versions 1 and 2 remain readable
 //!
 //! Version 1 has no trailing 32 bytes; parsing simply skips the check-value step,
-//! everything else is identical. This is deliberate: after upgrading the
-//! application, an existing file must still open.
+//! everything else is identical. Version 2 adds that check value and is otherwise the
+//! same layout. Reading is driven by the version the file declares, so both keep working
+//! unchanged: after upgrading the application, an existing file must still open.
 //!
-//! **The converse does not hold.** A version 1 parser rejects a version 2 file,
+//! **The converse does not hold.** A version 1 parser rejects a version 2 (or 3) file,
 //! because it carries a "reject any trailing bytes" check and those 32 bytes look
 //! like trailing content to it. Repairing that would mean relaxing the check, which
 //! would also make "the file had content appended" disappear silently - a higher
 //! price than "an old version cannot open a new file". Users on the old version see
 //! a clear error, not garbled data.
+//!
+//! ## What version 3 is for
+//!
+//! An entry's plaintext gained the **entry kind** node, so a version 2 parser reading a
+//! version 3 file would skip it and fall back to "counter present means HOTP", turning an
+//! mOTP entry into a plausible TOTP entry with codes that never work. Version 3 is therefore
+//! written by every file this build produces, and a version 3 file that happens to contain
+//! only TOTP/HOTP entries differs from a version 2 file in nothing but that number.
 //!
 //! # Where the key comes from
 //!
@@ -116,7 +125,9 @@ use entry::Entry as VaultEntry;
 /// File magic. 8 bytes; the trailing NUL makes it recognizable in a hex editor.
 pub const MAGIC: &[u8; 8] = b"Q2FAVLT\0";
 
-/// Format version currently written: 2.
+/// Format version currently written: 3.
+///
+/// # Version 1 → 2: the master key check value
 ///
 /// Version 2 differs from version 1 in exactly one place: the master key check value
 /// at the end of the file, which lets "which master key wrote this file" be decided
@@ -125,6 +136,20 @@ pub const MAGIC: &[u8; 8] = b"Q2FAVLT\0";
 /// key** - a mis-stored key surfaced only once the first entry was added, long after
 /// the UI had shown "opened successfully".
 ///
+/// # Version 2 → 3: richer entry plaintext
+///
+/// Version 3 exists because an entry's plaintext can now carry node tags a version 2
+/// parser does not know: the **entry kind** (TOTP / HOTP / mOTP / Yandex OTP / Steam
+/// Guard) and the PIN fields of the two PIN-based schemes. A version 2 parser skips unknown
+/// nodes by their length and then decides the type from whether a counter node is present,
+/// which turns an mOTP entry into a plausible-looking TOTP entry whose code never works.
+///
+/// A version 3 file containing only TOTP/HOTP entries is byte-identical to a version 2 file
+/// apart from this number, but the number is still written unconditionally: deciding the
+/// version from the contents would make "which version is this?" a branch that itself needs
+/// independent verification, and the two versions are not worth keeping compatible -
+/// nothing was lost between them.
+///
 /// # This constant is **also** the version number in the record AAD
 ///
 /// It therefore cannot merely describe a layout: change the number in the AAD and
@@ -132,18 +157,23 @@ pub const MAGIC: &[u8; 8] = b"Q2FAVLT\0";
 /// the file being parsed**, never this constant; otherwise reading a version 1 file
 /// fails authentication on every record. See `version` in [`VaultFile::parse`].
 ///
-/// # Version 1 is still readable
+/// # Versions 1 and 2 are still readable
 ///
 /// A version 1 file has no check value, so `parse` skips that step and behaves as
-/// before (including the known limitation). The converse **does not hold**: a version
-/// 1 parser rejects a version 2 file over the extra trailing bytes (it carries a
-/// "reject any trailing bytes" check) and reports [`Error::VaultTrailingBytes`]
-/// rather than an unsupported version. That follows directly from version 1 having no
-/// skip path for richer future versions, and it cannot be repaired without relaxing
-/// that check - which would make "the file had content appended" disappear silently.
-pub const FORMAT_VERSION: u8 = 2;
+/// before (including the known limitation); a version 2 file is read exactly as it was
+/// written, including the check value. The converse **does not hold**: a version 1 parser
+/// rejects a version 2 or 3 file over the extra trailing bytes (it carries a "reject any
+/// trailing bytes" check) and reports [`Error::VaultTrailingBytes`] rather than an
+/// unsupported version. That follows directly from version 1 having no skip path for richer
+/// future versions, and it cannot be repaired without relaxing that check - which would make
+/// "the file had content appended" disappear silently.
+pub const FORMAT_VERSION: u8 = 3;
 
-/// Format versions that can be parsed: 1 and the current [`FORMAT_VERSION`].
+/// Format versions that can be parsed: 1, 2 and the current [`FORMAT_VERSION`].
+///
+/// Listed explicitly rather than derived from [`FORMAT_VERSION`]: `&[1, FORMAT_VERSION]`
+/// silently dropped version 2 the moment the constant moved to 3, which would have made every
+/// existing user file unopenable with an error suggesting the file is broken.
 ///
 /// Only added to, never removed: dropping a version would suddenly make an old file
 /// unopenable, and the error message ("unsupported version") would suggest the file
@@ -152,7 +182,7 @@ pub const FORMAT_VERSION: u8 = 2;
 /// Public so that the "old versions stay readable" promise is pinned by tests
 /// directly, instead of a test restating the version number - where both sides would
 /// change together and never fail.
-pub const READABLE_VERSIONS: &[u8] = &[1, FORMAT_VERSION];
+pub const READABLE_VERSIONS: &[u8] = &[1, 2, FORMAT_VERSION];
 
 /// Upper bound on the ciphertext length of a single record: 1 MiB.
 ///
@@ -1523,8 +1553,8 @@ mod tests {
     }
 
     /// A version 1 file is still readable: version byte 1, no trailing check value, record
-    /// AAD version 1. Built by hand because serialization always writes version 2 now; the
-    /// property pinned here is the byte layout itself.
+    /// AAD version 1. Built by hand because serialization always writes the current version
+    /// now; the property pinned here is the byte layout itself.
     #[test]
     fn version_1_files_are_still_readable() {
         let master = MasterKey::generate().expect("OS randomness available");
@@ -1564,6 +1594,95 @@ mod tests {
             VaultFile::parse(wrong, &out).is_err(),
             "a version 1 file with content must fail under the wrong key"
         );
+    }
+
+    /// A version 2 file is still readable: version byte 2, the trailing master key check
+    /// value, record AAD version 2. Built by hand because serialization always writes the
+    /// current version now; the property pinned here is the byte layout itself.
+    #[test]
+    fn version_2_files_are_still_readable() {
+        let master = MasterKey::generate().expect("OS randomness available");
+        let id = EntryId::generate().expect("OS randomness available");
+        let entry = sample_entry("version-2-format");
+        let plaintext = encode_entry(&entry).expect("encoding succeeds");
+        let (nonce, ciphertext) =
+            crypto::seal(&master, RecordKind::Entry, &id, 2, &plaintext).expect("sealing succeeds");
+
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.push(2);
+        out.push(0);
+        put_u32(&mut out, 1);
+        out.push(RecordKind::Entry.as_byte());
+        out.extend_from_slice(id.as_bytes());
+        out.extend_from_slice(&nonce);
+        put_u32(
+            &mut out,
+            u32::try_from(ciphertext.len()).expect("the test data is far below u32::MAX"),
+        );
+        out.extend_from_slice(&ciphertext);
+        out.extend_from_slice(&crypto::key_check(&master));
+
+        let reopened = VaultFile::parse(
+            MasterKey::from_bytes(master_key_to_bytes(&master)).expect("correct length"),
+            &out,
+        )
+        .expect("a version 2 file must still parse");
+        assert_eq!(reopened.vault().len(), 1, "the entry must be read back");
+        assert_eq!(
+            reopened.vault().iter().next().expect("one entry").1.name,
+            "version-2-format"
+        );
+
+        // Unlike version 1, the check value refuses a wrong key before any record is read.
+        let wrong = MasterKey::generate().expect("OS randomness available");
+        assert!(
+            VaultFile::parse(wrong, &out).is_err(),
+            "a version 2 file must fail under the wrong key"
+        );
+    }
+
+    /// The "old files stay readable" promise, pinned against the list itself.
+    ///
+    /// The versions are named literally: deriving them from [`FORMAT_VERSION`] is exactly the
+    /// mistake this catches (`&[1, FORMAT_VERSION]` silently dropped version 2).
+    #[test]
+    fn every_previous_format_version_stays_readable() {
+        assert!(READABLE_VERSIONS.contains(&1), "version 1 was dropped");
+        assert!(READABLE_VERSIONS.contains(&2), "version 2 was dropped");
+        assert!(
+            READABLE_VERSIONS.contains(&FORMAT_VERSION),
+            "the current version is not in the readable list"
+        );
+    }
+
+    /// Every file this build writes declares the current version, whatever it contains.
+    ///
+    /// The version is decided unconditionally rather than derived from the contents: a
+    /// content-derived version would be a branch that itself needs independent verification,
+    /// and nothing was lost between versions 2 and 3, so there is no reason to keep writing
+    /// the older number.
+    #[test]
+    fn serialization_always_writes_the_current_version() {
+        let empty = VaultFile::create().expect("OS randomness available");
+        let bytes = empty.serialize().expect("serialization succeeds");
+        assert_eq!(bytes[8], FORMAT_VERSION, "an empty vault");
+        assert_eq!(bytes[8], 3, "the format version changed");
+
+        let mut totp_only = VaultFile::create().expect("OS randomness available");
+        totp_only
+            .vault_mut()
+            .insert(sample_entry("totp"))
+            .expect("insertion succeeds");
+        let bytes = totp_only.serialize().expect("serialization succeeds");
+        assert_eq!(bytes[8], 3, "a vault holding only a TOTP entry");
+
+        let mut hotp = VaultFile::create().expect("OS randomness available");
+        hotp.vault_mut()
+            .insert(sample_hotp_entry())
+            .expect("insertion succeeds");
+        let bytes = hotp.serialize().expect("serialization succeeds");
+        assert_eq!(bytes[8], 3, "a vault holding only an HOTP entry");
     }
 
     /// A version 1 file with zero records parses under any key: it has no check value.
