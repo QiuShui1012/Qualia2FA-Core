@@ -136,6 +136,34 @@ pub enum Error {
     #[error("TOTP period must not be 0")]
     InvalidPeriod,
 
+    /// A code was requested from an algorithm that mixes a user-entered PIN into the
+    /// computation, but no PIN is set.
+    ///
+    /// mOTP and Yandex OTP both fold a PIN into the code. Without one the algorithm has **no
+    /// defined output**: the reference implementation raises an error rather than substituting
+    /// an empty string. This is deliberately an error and not a default — a code computed with
+    /// an empty PIN looks perfectly plausible and no server will ever accept it, which is the
+    /// hardest kind of failure for a user to diagnose.
+    ///
+    /// An **empty** PIN is a different thing and is accepted: it means the user's PIN *is* the
+    /// empty string, which the algorithm handles like any other value.
+    #[error("{otp_type} requires a PIN before a code can be generated")]
+    PinRequired {
+        /// Which algorithm needs it (`"mOTP"` or `"Yandex OTP"`).
+        otp_type: &'static str,
+    },
+
+    /// A Yandex OTP secret is neither 16 nor 26 bytes long.
+    ///
+    /// The scheme has exactly two secret forms: 16 bytes (what a QR code carries) and 26 bytes
+    /// (16 bytes plus a trailing checksum). Any other length is not a Yandex secret, so it is
+    /// rejected instead of being truncated to something plausible.
+    #[error("Yandex OTP secret must be 16 or 26 bytes, got {len}")]
+    YandexSecretLength {
+        /// Actual length in bytes. The length itself is not a secret.
+        len: usize,
+    },
+
     /// Cryptographic random bytes cannot be obtained from the operating system.
     ///
     /// This is an **unrecoverable** failure: the library deliberately uses no user-space PRNG as

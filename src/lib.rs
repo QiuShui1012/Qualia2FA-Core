@@ -32,8 +32,9 @@
 //!
 //! # Status
 //!
-//! The Base32 layer is implemented. HOTP / TOTP computation, `otpauth://` parsing,
-//! vault management, and device pairing and sync are in progress.
+//! Implemented: Base32 (RFC 4648), HOTP (RFC 4226), TOTP (RFC 6238), Steam Guard, mOTP,
+//! Yandex OTP, `otpauth://` parsing, the encrypted vault, recovery files, device pairing,
+//! and the sync protocol.
 //!
 //! # Usage
 //!
@@ -60,6 +61,7 @@ pub mod auth;
 pub mod base32;
 mod error;
 pub mod flow;
+pub mod motp;
 pub mod otp;
 pub mod pairing;
 pub mod recovery;
@@ -68,6 +70,7 @@ pub mod sync;
 pub mod transport;
 pub mod uri;
 pub mod vault;
+pub mod yaotp;
 
 pub use auth::{Responder, Verified, Verifier};
 pub use error::{Error, Result};

@@ -172,6 +172,22 @@ qualia-dik = "0.1"
 secrecy = "0.10.3"
 sha1 = "0.11"
 sha2 = "0.11"
+
+# ── mOTP (Mobile-OTP) code generation ─────────────────────────────────────
+# MD5 is required by the mOTP algorithm itself, not chosen here: the code is
+# `lowerhex(md5(decimal_counter || lowerhex(secret) || pin))[0..6]`, where the counter is
+# `floor(unix_seconds / 10)`. There is no specification document for mOTP, so the
+# definition used is the one Aegis ships; see `src/motp.rs` for the vectors and their
+# source.
+#
+# The constraint this dependency carries: **MD5 is used for nothing else**. It takes no
+# part in AEAD, in any KDF, in signatures, or in any integrity or freshness decision
+# this library makes — it produces mOTP codes and stops there.
+#
+# It shares the existing `digest 0.11` generation with `sha1`/`sha2`, so no second hash
+# implementation enters the tree: `cargo tree` still shows exactly one `digest` and one
+# `const-oid` (verified when the dependency was audited).
+md-5 = "0.11.0"
 subtle = "2.6"
 
 # The library's public API uses thiserror for all error types; `anyhow` must not appear
