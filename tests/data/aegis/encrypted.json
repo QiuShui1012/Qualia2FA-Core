@@ -1,0 +1,27 @@
+{
+    "version": 1,
+    "header": {
+        "slots": [
+            {
+                "type": 1,
+                "uuid": "8c7b6660-fec5-462b-bc97-672da51bd771",
+                "key": "8e0af00f90070c160850b2cf64b2af4743d864b047098b57d311906c38566ecf",
+                "key_params": {
+                    "nonce": "a4572d99ab4922cb1fdef20a",
+                    "tag": "dcc5ebc9a7409e8c2c45914b042796a3"
+                },
+                "n": 32768,
+                "r": 8,
+                "p": 1,
+                "salt": "b91409327cb7a617ce543b4f8e09ee32c48e55b364aca509a14c235ec0762b0a",
+                "repaired": true,
+                "is_backup": false
+            }
+        ],
+        "params": {
+            "nonce": "f80b7f2e47101508fe37ba02",
+            "tag": "28a5792742fe416914e663558953d00d"
+        }
+    },
+    "db": "H6zZ24TeCDaLGFcPoBHme4Jr8hHi03N92+1Rw6ZVaMlNu9GbrS\/5FLa\/bveqQfaJF5JTiCafp8ITN5gtOYHfzOkFSjg9pMobVp0tg+ShVYAQdrClQ1nTPFWZwf8l5t5ogA6i4TEBqvhFZd2axP00Y2oK0dpUYItBYiGeeef6xg49FHWMkOXI6HKxfjgiTR1CHE8ly\/Ne0pJamHZNvtLXMFJbbq2gxx1EG9g85uWw6bdxP6Weu\/qFY2GffBwds1uGBlk1te92VlvLeIVNjRIa8x55VFOug5pQU7CepmA0d4E3eSk6eSN3Txh0a8JvSroMdlJ3+rdB673sEJJI6mMjYY9ezfEPuT1V79StzWsD\/QCPVK6z9Q2PFcIkI\/WBmdN8zNI6BDyhn7TB9V9BgWi\/2AG3z7yuJETIiDU18ZsIHcqYSuE5Sk3MtwZ3wSTAIevCFBeHA3hsUxvsC1plPYuE6Lgs558fe4X+Q0LVHTobu+w8rf8f8HdE3y+kjIbHgBKhaqzJvsoDanoLMCSxzmiaYmcRAU4jpJYUzYmAqoD7Z\/tfVXk5pIoF51J40iRBaUrVZoVSwB6FKdSnZLiol5KluXw7TtNlXmld7JGlv7C9HljBgg+WZj5gpYu2HhFY9\/kFUjp48rtS71q7uFtXm3LqJbbGplyLn483FkcHtGFqYKnCCcIWYHCYKVHUvAC\/BtGiEUH5feqxFMvUXM0Gcrtus47hs3siPU3z7cJrKh1Nd\/Cw4jllblWivgtTvTjfHFxWY2CPvIgLZe76pW\/3+ae4a1x59JA07CZslWP2yPJyJd15TYA5f97ZYjYt9m7tJNx0Zzqm978V7DheRsRK\/q8rHsjs3oWX6s1jBPz\/N5xBWfTX\/gB4zmMUHTPP8lquCg0nCw8TdQUL1zIq2fYTzkMwDARRsyQl0hU6DIWhM+hi7vPSq7izOsx\/FmAXUiyyyzhUiwj2sOv6NLUUnvpls8qs99qlpfHNHItWHMWot6CyLrWbEux\/gW1eGaWpiV49yML7ijHnIMYuQ9HEU5T\/iarSKud4ff2dUsbUMDRGB1ats9WzejbNx2KrDUm6vtOjATANKSojj8PDa\/BgtAm\/EsqJu48quWBcpW9QcG\/bcNlJOVAIV2SkyA\/b16F96LzcIoTFmgy9HdIFu\/Oo0QNzshamcsAI5rpecHW42b1QBP\/nBUmujhZ9YcIEFvrm8IVpX7EtugvEXIf\/tNIJosCRPm4+C53FmWQ\/quXcoitcjv14mUn6QdHToxeG0ZRr+ZtaVv\/wkWmXL61bun1Jy1Borp2imhcUsGgU3v0uciq1RYmCe0KQ0eIBbVI6GL1Dn0GeGkxNPK6D2lLVZcVxvLGJuKtdSVmy\/m8JAMHlgII1Olq3NSYJx0btOv3DmywhE30BPx7PPdfG"
+}

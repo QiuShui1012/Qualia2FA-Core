@@ -1,0 +1,46 @@
+{
+    "version": 1,
+    "header": {
+        "slots": null,
+        "params": null
+    },
+    "db": {
+        "version": 3,
+        "entries": [
+            {
+                "type": "totp",
+                "uuid": "498e74c2-fc7f-4b1e-87da-c220dec9e2e5",
+                "name": "tester824@spotify.com",
+                "issuer": "Spotify",
+                "note": "",
+                "favorite": false,
+                "icon": null,
+                "info": {
+                    "secret": "5PQWN42WEPEVENOZIJIAGSSYXNQGJFGO",
+                    "algo": "SHA256",
+                    "digits": 8,
+                    "period": 60
+                },
+                "groups": []
+            },
+            {
+                "type": "totp",
+                "uuid": "32bf34a7-4255-43c6-84d0-4bcd54b49b26",
+                "name": "tester68@logrocket.com",
+                "issuer": "LogRocket",
+                "note": "",
+                "favorite": false,
+                "icon": null,
+                "info": {
+                    "secret": "DPWFXTHUU6OVRB43MVY35COVUWTZPST2",
+                    "algo": "SHA1",
+                    "digits": 6,
+                    "period": 30
+                },
+                "groups": []
+            }
+        ],
+        "groups": [],
+        "icons_optimized": true
+    }
+}
