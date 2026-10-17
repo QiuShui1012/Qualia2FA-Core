@@ -112,9 +112,9 @@ A few things worth knowing:
 
 - **Losing the master key means the data can never be decrypted.** There is no server and
   no account password, so there is no recovery route either. Storing the master key in the
-  platform hardware key store (Windows TPM, Android Keystore, iOS Secure Enclave) is the
-  planned approach, but that belongs to the upper layer; this library only generates,
-  derives and holds it.
+  platform hardware key store (Windows TPM, Android Keystore) is available, but that belongs
+  to the upper layer (`qualia-dik` and the application); this library only generates, derives
+  and holds it. The Secure Enclave on iOS and macOS is still planned.
 - **The file can be rewritten freely by an attacker.** Flipping any single byte makes
   decryption fail, rather than quietly yielding tampered data. Your own storage layer
   should behave the same way.

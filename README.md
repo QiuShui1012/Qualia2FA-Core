@@ -102,8 +102,9 @@ for (id, entry) in file.vault().iter() {
 几件需要知道的事：
 
 - **主密钥丢失 = 数据永久无法解密。** 没有服务端、没有账号密码，也就没有找回
-  途径。把主密钥存进平台硬件密钥库（Windows TPM、Android Keystore、iOS Secure
-  Enclave）是计划中的做法，但那属于上层；本库只负责生成、派生与保管它。
+  途径。把主密钥存进平台硬件密钥库（Windows TPM、Android Keystore）已经可用，但那是
+  上层（`qualia-dik` 与端侧应用）的事；本库只负责生成、派生与保管它。iOS 与 macOS 的
+  Secure Enclave 仍在计划中。
 - **文件可以被攻击者随意改写。** 任何一个字节被改动都会导致解密失败，而不是
   悄悄解出一份被篡改的数据。你自己实现存储层时也应当如此。
 - **落盘请用 `write_file_atomically`。** 直接 `fs::write` 在断电时可能留下一个
