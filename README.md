@@ -1,30 +1,59 @@
+<div align="center" style="align-items: center">
+
 # Qualia2FA-Core
 
-English version: [README.en.md](README.en.md).
+简体中文 | [English](README.en.md)
 
-Qualia2FA 的核心库。承载双因素认证（2FA）的全部核心逻辑：TOTP/HOTP 计算、
-`otpauth://` 解析、加密保险库、设备配对与同步合并。
+Qualia2FA 的核心库。
+
+承载 Qualia2FA 的全部核心逻辑：验证码计算、URI 解析、加密保险库、设备配对与同步合并。
+
+[![License](https://img.shields.io/github/license/Qualia2FA/Qualia2FA-Core?label=License)][License]
+[![Releases](https://img.shields.io/github/downloads/Qualia2FA/Qualia2FA-Core/total?logo=github&label=Downloads)][Releases]
+[![crates.io](https://img.shields.io/crates/d/qualia2fa-core?logo=crates.io&label=crates.io+Downloads)][crates.io]
+
+[License]: LICENSE
+
+[Releases]: https://github.com/Qualia2FA/Qualia2FA-Core/releases
+
+[crates.io]: https://crates.io/crates/qualia2fa-core
+
+</div>
+
+---
 
 **刻意不含任何界面或命令行入口**，也不做任何 I/O 与时钟读取——以便 Windows
-桌面端、Android、iOS 各自作为独立项目复用它。
+、Android 等平台各自作为独立项目复用它。
 
 ## 状态
 
-| 项 | 值 |
-|---|---|
-| Crate 名 | `qualia2fa-core` |
-| 版本 | `0.2.2` |
-| 类型 | 纯 library crate |
-| Edition | 2024 |
-| MSRV | **1.89** |
+| 项         | 值                                        |
+|------------|-------------------------------------------|
+| Crate 名   | `qualia2fa-core`                          |
+| 版本       | `0.2.2`                                   |
+| 类型       | 纯 library crate                          |
+| Edition    | 2024                                      |
+| MSRV       | **1.89**                                  |
 | 开发工具链 | `stable`（由 `rust-toolchain.toml` 固定） |
-| 许可证 | `LGPL-3.0-or-later` |
+| 许可证     | `LGPL-3.0-or-later`                       |
 
-已实现：HOTP（RFC 4226）、TOTP（RFC 6238）、mOTP、Yandex OTP、Steam Guard、Base32
-（RFC 4648，宽容与严格两种模式）、URI 解析与序列化（`otpauth://` 与 Aegis 的 `motp:`）、
-加密保险库（本地存储格式）、**分组与排序（含同步与冲突裁决）**、**从 Aegis 的
-JSON / HTML / TXT 导出导入（加密导出也能开）**、**导出成同样四种格式（含加密 JSON）**、
-恢复密钥、挑战-应答认证、设备配对、同步载荷与合并，以及传输层协议。
+支持以下功能：
+- **2FA 验证码计算**：
+  - HOTP（RFC 4226）
+  - TOTP（RFC 6238）
+  - mOTP
+  - Yandex OTP
+  - Steam Guard
+- Base32（RFC 4648，宽容与严格两种模式）
+- URI 解析与序列化（`otpauth://` 与 Aegis 的 `motp:`） 
+- 加密保险库（本地存储格式）
+- **分组与排序（含同步与冲突裁决）**
+- **从 Aegis 的 JSON / HTML / TXT 导出导入（加密导出也能开）**
+- 恢复密钥
+- 挑战-应答认证
+- 设备配对
+- 同步载荷与合并
+- 传输层协议
 
 ## 用法
 
@@ -101,8 +130,8 @@ for (id, entry) in file.vault().iter() {
 
 几件需要知道的事：
 
-- **主密钥丢失 = 数据永久无法解密。** 没有服务端、没有账号密码，也就没有找回
-  途径。把主密钥存进平台硬件密钥库（Windows TPM、Android Keystore）已经可用，但那是
+- **主密钥丢失 = 数据永久无法解密。** 没有服务端、没有账号密码，也就没有找回途径。
+  把主密钥存进平台硬件密钥库（Windows TPM、Android Keystore）已经可用，但那是
   上层（`qualia-dik` 与端侧应用）的事；本库只负责生成、派生与保管它。iOS 与 macOS 的
   Secure Enclave 仍在计划中。
 - **文件可以被攻击者随意改写。** 任何一个字节被改动都会导致解密失败，而不是
@@ -126,7 +155,7 @@ for (id, entry) in file.vault().iter() {
 两端必须一起升级——这是刻意的：不抬版本号的话，老版本会把 mOTP 条目读成一条普通 TOTP，
 PIN 与步长在往返里静默丢失。
 
-导入另一款认证器的导出：
+导入 Aegis 认证器的导出：
 
 ```rust
 use qualia2fa_core::import::{self, ImportFormat};
@@ -171,12 +200,12 @@ Unix 秒传入。** 这不是洁癖：只有时间作为参数传入，RFC 6238 
 库内所有秘密（OTP 种子、保险库主密钥、会话密钥）一律用 [`secrecy`] 的类型承载，
 **不用裸 `Vec<u8>` / `String`**，使「这是秘密」在类型上可见：
 
-| 用途 | 类型 |
-|---|---|
+| 用途                              | 类型                                 |
+|-----------------------------------|--------------------------------------|
 | 任意字节秘密（种子、密钥、nonce） | `SecretBytes`（= `SecretSlice<u8>`） |
-| 文本秘密（口令、恢复短语） | `SecretString` |
-| 定长 / 其它秘密 | `SecretBox` |
-| 取用明文 | `ExposeSecret` / `ExposeSecretMut` |
+| 文本秘密（口令、恢复短语）        | `SecretString`                       |
+| 定长 / 其它秘密                   | `SecretBox`                          |
+| 取用明文                          | `ExposeSecret` / `ExposeSecretMut`   |
 
 以上类型全部由本库再导出，调用方**不需要**直接依赖 `secrecy`。
 

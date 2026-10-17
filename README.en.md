@@ -1,14 +1,31 @@
+<div align="center" style="align-items: center">
+
 # Qualia2FA-Core
 
-中文版见 [README.md](README.md).
+[简体中文](README.md) | English
 
-The core library of Qualia2FA. It carries all of the core two-factor authentication (2FA)
-logic: TOTP/HOTP computation, `otpauth://` parsing, the encrypted vault, and device
-pairing and sync merging.
+The core library of Qualia2FA.
+
+It carries all of Qualia2FA's core logic: code computation, URI parsing, the encrypted vault,
+and device pairing and sync merging.
+
+[![License](https://img.shields.io/github/license/Qualia2FA/Qualia2FA-Core?label=License)][License]
+[![Releases](https://img.shields.io/github/downloads/Qualia2FA/Qualia2FA-Core/total?logo=github&label=Downloads)][Releases]
+[![crates.io](https://img.shields.io/crates/d/qualia2fa-core?logo=crates.io&label=crates.io+Downloads)][crates.io]
+
+[License]: LICENSE
+
+[Releases]: https://github.com/Qualia2FA/Qualia2FA-Core/releases
+
+[crates.io]: https://crates.io/crates/qualia2fa-core
+
+</div>
+
+---
 
 It **deliberately contains no user interface or command-line entry point**, and performs
-no I/O and no clock reads — so that the Windows desktop app, Android and iOS can each
-reuse it as an independent project.
+no I/O and no clock reads — so that Windows, Android and other platforms can each reuse it
+as an independent project.
 
 ## Status
 
@@ -22,14 +39,24 @@ reuse it as an independent project.
 | Development toolchain | `stable` (pinned by `rust-toolchain.toml`) |
 | License | `LGPL-3.0-or-later` |
 
-Implemented: HOTP (RFC 4226), TOTP (RFC 6238), mOTP, Yandex OTP, Steam Guard, Base32
-(RFC 4648, in both lenient and strict modes), URI parsing and serialization (`otpauth://`
-and Aegis's `motp:` form), the encrypted vault (local storage format), **groups and
-orderings (including their synchronization and conflict adjudication)**, **importing from
-Aegis's JSON / HTML / TEXT exports (encrypted exports included)**, **exporting to those
-same four forms (encrypted JSON included)**, recovery keys, challenge-response
-authentication, device pairing, sync payloads and merging, plus the transport-layer
-protocol.
+The following features are supported:
+
+- **2FA code computation**:
+  - HOTP (RFC 4226)
+  - TOTP (RFC 6238)
+  - mOTP
+  - Yandex OTP
+  - Steam Guard
+- Base32 (RFC 4648, in both lenient and strict modes)
+- URI parsing and serialization (`otpauth://` and Aegis's `motp:` form)
+- The encrypted vault (local storage format)
+- **Groups and orderings (including their synchronization and conflict adjudication)**
+- **Importing from Aegis's JSON / HTML / TXT exports (encrypted exports included)**
+- Recovery keys
+- Challenge-response authentication
+- Device pairing
+- Sync payloads and merging
+- The transport-layer protocol
 
 ## Usage
 
@@ -141,7 +168,7 @@ between 0.1.x and 0.2.0 fails**, with a version error rather than an authenticat
 have to be upgraded together, which is deliberate: without the version bump an older device
 would read an mOTP entry as an ordinary TOTP and silently lose the PIN and the step.
 
-Importing another authenticator's export:
+Importing an Aegis export:
 
 ```rust
 use qualia2fa_core::import::{self, ImportFormat};
